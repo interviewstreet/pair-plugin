@@ -90,10 +90,10 @@ PR7_KEY = "acme__demo__7__aaaaaaaabbbb"  # first 12 chars of PR7_HEAD
 
 def test_build_meta_carries_the_six_identifying_fields(prepared):
     meta = build_meta(prepared)
-    assert set(meta) == {"key", "repo", "pr", "title", "merge_base", "head_sha"}
+    assert set(meta) == {"key", "repo", "pr", "title", "base_sha", "head_sha"}
     assert meta["repo"] == "acme/demo" and meta["pr"] == 7
     assert meta["head_sha"] == PR7_HEAD
-    assert len(meta["merge_base"]) == 40
+    assert len(meta["base_sha"]) == 40
     assert meta["key"] == PR7_KEY
 
 

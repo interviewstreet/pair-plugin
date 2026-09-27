@@ -9,7 +9,7 @@ server from here, and we never call Claude from the plugin.
 The archive follows the frozen bundle contract at `contract/docs/bundle.md`:
 
 * Members are regular files. No absolute paths, no `..`, no backslashes, no symlinks.
-* `meta.json` carries just the six identifying fields the service needs to key the run.
+* `meta.json` carries `key`, `repo`, `pr`, `title`, `base_sha`, and `head_sha`.
 * Session JSONL is namespaced under `sessions/<agent>/...` so subagent files and repeats
   never collide with each other, and never leak the caller's absolute paths.
 """
@@ -101,7 +101,7 @@ def build_meta(prepared: dict) -> dict:
         "repo": repo,
         "pr": number,
         "title": str(basics.get("title") or ""),
-        "merge_base": str(basics.get("merge_base") or ""),
+        "base_sha": str(basics.get("merge_base") or ""),
         "head_sha": head_sha,
     }
 
