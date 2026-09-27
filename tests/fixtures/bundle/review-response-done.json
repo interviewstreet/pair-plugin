@@ -1,0 +1,20 @@
+{
+  "manifest": {
+    "schema_version": 1,
+    "key": "interviewstreet__pair-be__62__3453326da379",
+    "repo": "interviewstreet/pair-be",
+    "pr": 62,
+    "title": "Move the review build off the laptop and onto the workspace VM",
+    "base_sha": "9f2c41ab77d3e6058b1c4a9de20f3b7c6d815e4a",
+    "head_sha": "3453326da3791b0f4c8e2d5a6079bb31e4c7f8a2",
+    "status": "done",
+    "sections": {
+      "summary": {"status": "done", "updated_at": "2026-09-28T00:13:28Z", "error": null},
+      "look_first": {"status": "done", "updated_at": "2026-09-28T00:13:28Z", "error": null},
+      "plan_vs_result": {"status": "done", "updated_at": "2026-09-28T00:12:41Z", "error": null},
+      "pushback": {"status": "done", "updated_at": "2026-09-28T00:12:55Z", "error": null},
+      "side_effects": {"status": "done", "updated_at": "2026-09-28T00:12:33Z", "error": null}
+    }
+  },
+  "bundle_url": "https://storage.googleapis.com/pair-poc-reviews/reviews/interviewstreet__pair-be__62__3453326da379/bundle.tar.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=pair-review%40pair-poc.iam.gserviceaccount.com%2F20260928%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260928T001334Z&X-Goog-Expires=900&X-Goog-SignedHeaders=host&X-Goog-Signature=4f1b8c0d5e2a7936bb41c8d70e6f253a9c4d18b7e05f3a26c9d84b17f602ae3d"
+}
