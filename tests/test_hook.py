@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -20,31 +19,50 @@ def event(command: str, stdout: str = "", **resp) -> dict:
             "tool_use_id": "toolu_1"}
 
 
-def run(ev, env_extra: dict | None = None, python: str = sys.executable, tmp: Path | None = None):
+def run(ev, env_extra: dict | None = None, python: str = sys.executable, tmp: Path | None = None,
+        plugin_root: str = "/plugins/pair"):
     env = {k: v for k, v in os.environ.items() if k not in ("PAIR_RUN", "PAIR_HOOK_DISABLE")}
-    env.update(PAIR_HOOK_DRY_RUN="1", CLAUDE_PLUGIN_ROOT="/plugins/pair")
+    env.update(PAIR_HOOK_DRY_RUN="1", CLAUDE_PLUGIN_ROOT=plugin_root, PAIR_HOOK_SUBMIT_DELAY_S="0")
     if tmp:
         env.update(PAIR_HOME=str(tmp / "pair-home"), PAIR_CONFIG=str(tmp / "none.toml"))
     env.update(env_extra or {})
     p = subprocess.run([python, str(HOOK)], input=ev if isinstance(ev, str) else json.dumps(ev), text=True,
-                       capture_output=True, env=env, timeout=10)
+                       capture_output=True, env=env, timeout=15)
     assert p.returncode == 0, p.stderr
     return json.loads(p.stdout) if p.stdout.strip() else None
 
 
 @pytest.mark.parametrize("python", PYTHONS)
-def test_pr_create_starts_pair(python, tmp_path):
+def test_pr_create_launches_pair_brief_submit(python, tmp_path):
     out = run(event("git push -u origin HEAD && gh pr create --fill --base main",
                     f"Creating pull request for feat into main\n\n{URL}\n"), python=python, tmp=tmp_path)
     plan = out["plan"]
     assert plan["key"] == "five-sh__awt__12"
-    assert plan["cmd"][1:4] == ["-p", "/pair five-sh/awt#12", "--plugin-dir"] and plan["cmd"][4] == "/plugins/pair"
-    assert "--no-session-persistence" in plan["cmd"] and "Bash(pair-brief *)" in plan["cmd"]
-    assert plan["cmd"][plan["cmd"].index("--setting-sources") + 1] == "project" and "--strict-mcp-config" in plan["cmd"]
+    assert plan["repo"] == "five-sh/awt" and plan["pr"] == 12
+    # argv, never a shell string. `submit` is a plain subcommand of pair-brief.
+    assert plan["argv"] == ["/plugins/pair/bin/pair-brief", "submit", "five-sh/awt#12"]
+    # The runner sleeps, then execs argv. Delay is 0 in tests, 10 by default in production.
+    assert plan["delay_s"] == 0.0
+    # The runner is invoked with the same python that ran the hook (its own sys.executable).
+    # macOS `/usr/bin/python3` is a shim over Xcode's Python that resolves to the framework path,
+    # so we just check the runner points at *some* python executable and uses `-c`.
+    assert Path(plan["runner"][0]).name.startswith("python") and plan["runner"][1] == "-c"
+    assert "time.sleep(float(sys.argv[1]))" in plan["runner"][2]
+    assert "os.execvp(sys.argv[2], sys.argv[2:])" in plan["runner"][2]
+    # Delay and argv follow the runner code, in that order.
+    assert plan["runner"][3] == "0" and plan["runner"][4:] == plan["argv"]
     assert plan["cwd"] == str(tmp_path / "pair-home")
     assert plan["url"] == "http://127.0.0.1:7788/review/?key=five-sh__awt__12"
     assert "five-sh/awt#12" in out["systemMessage"]
     assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+
+def test_default_delay_is_about_ten_seconds(tmp_path):
+    # Drop PAIR_HOOK_SUBMIT_DELAY_S so the hook falls back to its production default.
+    env = {"PAIR_HOOK_SUBMIT_DELAY_S": ""}
+    out = run(event("gh pr create --fill", f"{URL}\n"), env_extra=env, tmp=tmp_path)
+    assert out["plan"]["delay_s"] == 10.0
+    assert out["plan"]["runner"][3] == "10"
 
 
 @pytest.mark.parametrize("ev", [
@@ -71,27 +89,51 @@ def test_config_port(tmp_path):
     assert out["plan"]["url"].startswith("http://127.0.0.1:7900/review/")
 
 
-def test_launch_detaches_with_clean_env(tmp_path):
-    """Real launch path, with a fake `claude` on PATH that records how it was called."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+def test_launch_detaches_and_execs_pair_brief(tmp_path):
+    """Real launch path: the runner exec's a fake `pair-brief` that records how it was called."""
+    plugin_root = tmp_path / "plugin"
+    (plugin_root / "bin").mkdir(parents=True)
+    fake = plugin_root / "bin" / "pair-brief"
     record = tmp_path / "called.json"
-    fake = bin_dir / "claude"
+    # Fake pair-brief: dump argv + cwd + a scrubbed env so we can assert on all of it.
     fake.write_text(f"#!{sys.executable}\nimport json, os, sys\n"
                     f"json.dump({{'argv': sys.argv[1:], 'cwd': os.getcwd(), 'env': dict(os.environ)}}, "
                     f"open({str(record)!r}, 'w'))\n")
     fake.chmod(0o755)
-    env = {"PAIR_HOOK_DRY_RUN": "0", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-           "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}
-    out = run(event("gh pr create --fill", f"{URL}\n"), env, tmp=tmp_path)
-    assert "plan" not in out and "being built" in out["hookSpecificOutput"]["additionalContext"]
+    env = {"PAIR_HOOK_DRY_RUN": "0", "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli",
+           "PAIR_HOOK_SUBMIT_DELAY_S": "0"}
+    out = run(event("gh pr create --fill", f"{URL}\n"), env, tmp=tmp_path, plugin_root=str(plugin_root))
+    assert "plan" not in out and "background" in out["hookSpecificOutput"]["additionalContext"]
     deadline = time.time() + 5
     while not record.exists() and time.time() < deadline:
         time.sleep(0.05)
     called = json.loads(record.read_text())
-    assert called["argv"][:2] == ["-p", "/pair five-sh/awt#12"]
+    assert called["argv"] == ["submit", "five-sh/awt#12"]
     assert Path(called["cwd"]).resolve() == (tmp_path / "pair-home").resolve()
-    assert called["env"]["MAX_THINKING_TOKENS"] == "0" and called["env"]["PAIR_RUN"] == "1"
+    assert called["env"]["PAIR_RUN"] == "1"
     assert "CLAUDECODE" not in called["env"] and "CLAUDE_CODE_ENTRYPOINT" not in called["env"]
     assert list((tmp_path / "pair-home" / "logs").glob("pair-five-sh__awt__12-*.log"))
-    shutil.rmtree(bin_dir)
+
+
+def test_delay_is_actually_awaited(tmp_path):
+    """A non-zero delay defers the launch. Use 1s so the test stays fast."""
+    plugin_root = tmp_path / "plugin"
+    (plugin_root / "bin").mkdir(parents=True)
+    fake = plugin_root / "bin" / "pair-brief"
+    record = tmp_path / "called.json"
+    fake.write_text(f"#!{sys.executable}\nimport json, sys, time\n"
+                    f"json.dump({{'argv': sys.argv[1:], 'launched_at': time.time()}}, "
+                    f"open({str(record)!r}, 'w'))\n")
+    fake.chmod(0o755)
+    env = {"PAIR_HOOK_DRY_RUN": "0", "PAIR_HOOK_SUBMIT_DELAY_S": "1"}
+    started = time.time()
+    out = run(event("gh pr create --fill", f"{URL}\n"), env, tmp=tmp_path, plugin_root=str(plugin_root))
+    hook_returned = time.time()
+    # The hook itself never blocks for the full delay: it just spawns and returns.
+    assert hook_returned - started < 1.0
+    assert out is not None
+    deadline = time.time() + 5
+    while not record.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    launched_at = json.loads(record.read_text())["launched_at"]
+    assert launched_at - started >= 0.9

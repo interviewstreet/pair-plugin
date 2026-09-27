@@ -47,6 +47,9 @@ class Config:
     pair_agent_model: str = "sonnet"
     host: str = "127.0.0.1"
     port: int = 7788
+    # The pair review service the plugin submits briefs to. Empty means submit is not configured.
+    service_url: str = ""
+    service_token: str = ""
     allowed_repos: list[str] = field(default_factory=lambda: ["five-sh/awt"])
     github_accounts: dict[str, str] = field(
         default_factory=lambda: {"five-sh": "five-sh", "interviewstreet": "kousik-sh"})
@@ -71,9 +74,17 @@ def load_config(path: Path | None = None) -> Config:
     # Configs written before the rename name the model reviewer_model.
     if "reviewer_model" in data:
         data.setdefault("pair_agent_model", data["reviewer_model"])
-    for key in ("anthropic_api_key_env", "pair_agent_model", "host"):
+    for key in ("anthropic_api_key_env", "pair_agent_model", "host", "service_url", "service_token"):
         if key in data:
             setattr(cfg, key, str(data[key]))
+    # Support a nested [service] table too so tokens can live in a section of their own.
+    service = data.get("service") or {}
+    if "url" in service:
+        cfg.service_url = str(service["url"])
+    if "token" in service:
+        cfg.service_token = str(service["token"])
+    if "token_env" in service and os.environ.get(str(service["token_env"])):
+        cfg.service_token = os.environ[str(service["token_env"])]
     if "port" in data:
         cfg.port = int(data["port"])
     if "allowed_repos" in (data.get("post_comments") or {}):

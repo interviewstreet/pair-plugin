@@ -46,10 +46,14 @@ def pr7():
 
     diff = (FIXTURES / "pr7.diff").read_text()
     files = [{"path": f.path, "additions": f.additions, "deletions": f.deletions} for f in parse_diff(diff)]
+    # Full 40-char hex SHAs so submit_key(head_sha[:12]) has a valid prefix.
+    head = "aaaaaaaabbbbbbbbccccccccdddddddd11112222"
+    base = "0000111122223333444455556666777788889999"
+    mbase = "9999888877776666555544443333222211110000"
     return PR("acme/demo", 7, "https://github.com/acme/demo/pull/7", "Add login", PR7_BODY, "OPEN", "me",
-              "feature/login-flow", "main", "headsha7", "basesha7", files,
+              "feature/login-flow", "main", head, base, files,
               [{"oid": "c1", "authoredDate": "2026-09-20T09:00:00Z", "committedDate": "2026-09-20T10:06:00Z"}],
-              "mergebase7", ts("2026-09-19T00:00:00Z"), diff)
+              mbase, ts("2026-09-19T00:00:00Z"), diff)
 
 
 @pytest.fixture

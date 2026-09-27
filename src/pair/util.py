@@ -62,6 +62,7 @@ def parse_pr_spec(spec: str) -> tuple[str, int]:
 
 
 def review_key(repo: str, number: int) -> str:
+    """Local-brief key (no head SHA). Existing brief directories still use this."""
     return f"{repo.replace('/', '__')}__{number}"
 
 
@@ -70,3 +71,48 @@ def parse_review_key(key: str) -> tuple[str, int]:
     if not m:
         raise ValueError(f"bad review key: {key!r}")
     return f"{m[1]}/{m[2]}".lower(), int(m[3])
+
+
+# The contract requires each of owner and repo to contain at most a single underscore, so a submit
+# key always splits on `__` into exactly four parts (owner, repo, PR number, head SHA prefix).
+_KEY_NAME_RX = re.compile(r"[A-Za-z0-9._-]+")
+_KEY_SHA_RX = re.compile(r"[0-9a-f]{12}")
+
+
+def submit_key(repo: str, number: int, head_sha: str) -> str:
+    """Service-side review key: <owner>__<repo>__<n>__<head_sha[:12]> (12 lowercase hex chars)."""
+    sha = (head_sha or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{12,}", sha):
+        raise ValueError(f"head_sha must be at least 12 hex chars: {head_sha!r}")
+    if "/" not in repo:
+        raise ValueError(f"repo must be owner/name: {repo!r}")
+    owner, name = repo.split("/", 1)
+    for part in (owner, name):
+        if "__" in part or not _KEY_NAME_RX.fullmatch(part):
+            raise ValueError(f"owner/repo name is not key-safe: {part!r}")
+    if number <= 0:
+        raise ValueError(f"PR number must be positive: {number!r}")
+    return f"{owner}__{name}__{number}__{sha[:12]}"
+
+
+def parse_submit_key(key: str) -> tuple[str, int, str]:
+    """Split a submit key on `__` into exactly four parts, per the frozen contract."""
+    parts = key.split("__")
+    if len(parts) != 4:
+        raise ValueError(f"bad submit key (expected 4 __-separated parts): {key!r}")
+    owner, name, num_s, sha = parts
+    if not (_KEY_NAME_RX.fullmatch(owner) and _KEY_NAME_RX.fullmatch(name)):
+        raise ValueError(f"bad owner/repo in key: {key!r}")
+    if not re.fullmatch(r"[0-9]+", num_s) or num_s.startswith("0") and num_s != "0":
+        raise ValueError(f"bad PR number in key: {key!r}")
+    if not _KEY_SHA_RX.fullmatch(sha):
+        raise ValueError(f"bad head SHA in key: {key!r}")
+    return f"{owner}/{name}".lower(), int(num_s), sha
+
+
+def is_submit_key(s: str) -> bool:
+    try:
+        parse_submit_key(s)
+        return True
+    except ValueError:
+        return False

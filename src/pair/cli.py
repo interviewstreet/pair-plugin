@@ -80,29 +80,34 @@ def cmd_save(args) -> int:
     return 0
 
 
-def cmd_hook_save(args) -> int:
-    """PostToolUse hook on Write: save a writer's output file, and report back to the subagent that wrote it."""
-    from pathlib import Path
+def cmd_submit(args) -> int:
+    """Pack the brief for `pr` into a tar.gz and POST it to the review service."""
+    from pair.config import load_config
+    from pair.github import GhError
+    from pair.submit import SubmitError, submit
 
-    from pair.brief import LIMITS, SaveError, save_output
-    from pair.config import briefs_dir
+    cfg = load_config()
+    try:
+        result = submit(args.pr, cfg, force=args.force)
+    except (GhError, SubmitError, ValueError) as e:
+        print(json.dumps({"status": "error", "error": str(e)}))
+        return 1
+    print(json.dumps(result, indent=1))
+    return 0
 
+
+def cmd_status(args) -> int:
+    """Fetch the manifest for a submit key (or resolve one from `owner/repo#N`)."""
+    from pair.config import load_config
+    from pair.submit import SubmitError, status
+
+    cfg = load_config()
     try:
-        event = json.load(sys.stdin)
-        path = Path((event.get("tool_input") or {}).get("file_path") or "").resolve()
-    except (json.JSONDecodeError, AttributeError, OSError):
-        return 0
-    root = briefs_dir().resolve()
-    if path.suffix != ".json" or path.parent.name != "out" or path.stem not in LIMITS \
-            or path.parent.parent.parent.parent != root:
-        return 0
-    try:
-        report = save_output(path.parent.parent, path.stem)
-    except SaveError as e:
-        print(f"pair-brief save failed: {e} Fix it and write {path} again.", file=sys.stderr)
-        return 2
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext":
-                      "pair-brief save: " + json.dumps({"ok": True, **report})}}))
+        result = status(args.arg, cfg)
+    except (SubmitError, ValueError) as e:
+        print(json.dumps({"status": "error", "error": str(e)}))
+        return 1
+    print(json.dumps(result, indent=1))
     return 0
 
 
@@ -151,8 +156,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--empty", action="store_true", help="Save an empty section so the page stops waiting for it")
     s.set_defaults(func=cmd_save)
 
-    h = sub.add_parser("hook-save", help="PostToolUse hook: save a section when a writer writes out/<section>.json")
-    h.set_defaults(func=cmd_hook_save)
+    up = sub.add_parser("submit", help="Prepare the brief and POST the payload to the review service")
+    up.add_argument("pr", help="owner/repo#N or a PR URL")
+    up.add_argument("--force", action="store_true", help="Ask the service to rebuild even if this key is done")
+    up.set_defaults(func=cmd_submit)
+
+    st = sub.add_parser("status", help="Get the manifest of a submitted review (key or owner/repo#N)")
+    st.add_argument("arg", help="Submit key <owner>__<repo>__<n>__<sha12> or owner/repo#N")
+    st.set_defaults(func=cmd_status)
 
     i = sub.add_parser("input", help="Print the path of a section writer's input (rebuilds the summary input)")
     i.add_argument("dir")

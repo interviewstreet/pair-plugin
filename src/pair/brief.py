@@ -185,15 +185,18 @@ def prepare(spec: str, cfg: Config, force: bool = False) -> dict:
     t = mark("gh", t0)
     marks.update({f"gh_{k}": v for k, v in pr.timings.items()})
     d = brief_dir(pr.repo, pr.number, pr.head_oid)
-    base = {"key": key, "dir": str(d), "url": review_url(cfg, key), "head_sha": pr.head_oid}
+    pr_basics = pr.basics()
+    base = {"key": key, "dir": str(d), "url": review_url(cfg, key), "head_sha": pr.head_oid,
+            "pr_basics": pr_basics}
 
     existing = load_json(d / "brief.json")
     if existing and not force:
         age = time.time() - (d / "brief.json").stat().st_mtime
+        cached = {**base, "session_files": _session_files_from_dir(d)}
         if not existing.get("pending"):
-            return {**base, "status": "ready", "write": [], "pending": []}
+            return {**cached, "status": "ready", "write": [], "pending": []}
         if age < STALE_RUN_SECONDS:
-            return {**base, "status": "in_progress", "write": [], "pending": existing["pending"]}
+            return {**cached, "status": "in_progress", "write": [], "pending": existing["pending"]}
 
     paths = discover(pr.window_start)
     sessions = parse_all(paths)
@@ -206,6 +209,7 @@ def prepare(spec: str, cfg: Config, force: bool = False) -> dict:
     t = mark("extract", t)
 
     kept = [m for m in matches if m.kept]
+    session_files = sorted({p.path for m in kept for p in m.parts if p.path})
     diff_files = {f.path: f for f in files}
     file_list = [{"path": f["path"], "additions": f["additions"], "deletions": f["deletions"]} for f in pr.files]
     file_list += [{"path": p, "additions": f.additions, "deletions": f.deletions}
@@ -247,7 +251,13 @@ def prepare(spec: str, cfg: Config, force: bool = False) -> dict:
             "agents": {s: WRITERS[s] for s in pending if s in WRITERS}, "inputs": input_paths,
             "outputs": {s: str(output_path(d, s)) for s in pending}, "pending": pending,
             "sessions": len(kept), "discussion_only": sum(1 for m in kept if m.role == "discussion"),
-            "related": len(matches) - len(kept), "timings_s": marks}
+            "related": len(matches) - len(kept), "session_files": session_files, "timings_s": marks}
+
+
+def _session_files_from_dir(d: Path) -> list[str]:
+    """Rebuild the kept-session file list from a prepared brief dir, for cache hits."""
+    ev = load_json(d / "evidence.json") or {}
+    return sorted({p for s in ev.get("sessions", []) for p in s.get("paths") or []})
 
 
 # ---------------------------------------------------------------- save

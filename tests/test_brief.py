@@ -1,5 +1,4 @@
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -91,16 +90,24 @@ def test_prepare_writes_brief(prepared):
     assert {s["id"] for s in b["sessions"]} == {"sess-main-1", "sess-sed", "cdx-1", "sess-talk"}
     push_text = Path(out["inputs"]["pushback"]).read_text()
     assert "allowed_refs:" in push_text and "- asks about testing" in push_text
+    # Submit needs pr_basics and the exact list of session files to pack.
+    assert out["pr_basics"]["repo"] == "acme/demo" and out["pr_basics"]["number"] == 7
+    assert len(out["pr_basics"]["head_sha"]) == 40 and out["pr_basics"]["merge_base"]
+    assert out["session_files"] and all(p.endswith(".jsonl") for p in out["session_files"])
 
 
 def test_prepare_reuses_finished_brief(prepared, pr7):
     out, d = prepared
     again = prepare("acme/demo#7", load_config())
     assert again["status"] == "in_progress"
+    # Cached returns still know the session files, from evidence.json.
+    assert again["session_files"] == out["session_files"]
+    assert again["pr_basics"]["repo"] == "acme/demo"
     b = json.loads((d / "brief.json").read_text())
     b["pending"] = []
     (d / "brief.json").write_text(json.dumps(b))
-    assert prepare("acme/demo#7", load_config())["status"] == "ready"
+    ready = prepare("acme/demo#7", load_config())
+    assert ready["status"] == "ready" and ready["session_files"] == out["session_files"]
     assert prepare("acme/demo#7", load_config(), force=True)["status"] == "started"
 
 
@@ -130,54 +137,6 @@ def test_cli_save_reads_output_file(prepared, capsys):
     assert main(["save", str(d), "pushback", "--empty"]) == 0
     b = json.loads((d / "brief.json").read_text())
     assert b["sections"]["pushback"] == [] and "pushback" not in b["pending"]
-
-
-def _write_event(path) -> str:
-    return json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Write",
-                       "tool_input": {"file_path": str(path), "content": "..."}, "tool_response": {}})
-
-
-def test_hook_save(prepared, monkeypatch, capsys):
-    import io
-
-    from pair.cli import main
-
-    out, d = prepared
-
-    def hook(path, content=None):
-        if content is not None:
-            Path(path).write_text(content)
-        monkeypatch.setattr("sys.stdin", io.StringIO(_write_event(path)))
-        code = main(["hook-save"])
-        return code, capsys.readouterr()
-
-    code, cap = hook(out["outputs"]["pushback"], json.dumps([{"text": '"do it again"', "refs": ["pr:body"]}]))
-    assert code == 0
-    ctx = json.loads(cap.out)["hookSpecificOutput"]["additionalContext"]
-    assert ctx.startswith("pair-brief save: ") and json.loads(ctx.split(": ", 1)[1])["kept"] == 1
-    code, cap = hook(out["outputs"]["look_first"], json.dumps([{"text": "x", "refs": ["pr:body"]}]))
-    assert code == 2 and "hunk: ref" in cap.err and not cap.out
-    assert not Path(out["outputs"]["look_first"]).exists()
-    other = d.parent.parent.parent / "elsewhere" / "k" / "sha" / "out" / "pushback.json"
-    other.parent.mkdir(parents=True)
-    assert hook(other, "[]") == (0, capsys.readouterr()) and other.exists()
-    assert hook(d / "out" / "ask.json", "[]")[0] == 0 and (d / "out" / "ask.json").exists()
-
-
-def test_save_on_write_filter(prepared):
-    import subprocess
-
-    out, _ = prepared
-    script = Path(__file__).resolve().parent.parent / "hooks" / "save_on_write.sh"
-    run = lambda ev: subprocess.run([str(script)], input=ev, text=True, capture_output=True, timeout=60)
-    t = time.perf_counter()
-    skip = run(_write_event("/Users/x/project/app.py"))
-    assert skip.returncode == 0 and skip.stdout == "" and time.perf_counter() - t < 0.5
-    Path(out["outputs"]["side_effects"]).write_text(json.dumps([{"text": "Kills by pid.",
-                                                                  "refs": ["hunk:app/cleanup.py:1"]}]))
-    saved = run(_write_event(out["outputs"]["side_effects"]))
-    assert saved.returncode == 0, saved.stderr
-    assert '"kept": 1' in json.loads(saved.stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_save_errors(prepared):

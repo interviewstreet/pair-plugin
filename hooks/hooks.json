@@ -10,16 +10,6 @@
             "timeout": 5
           }
         ]
-      },
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/save_on_write.sh\"",
-            "timeout": 30
-          }
-        ]
       }
     ]
   }
