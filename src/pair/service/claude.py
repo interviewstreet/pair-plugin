@@ -131,12 +131,23 @@ class SubprocessRunner:
 
 
 def default_login_check() -> bool:
-    """A best-effort check that ``claude`` is on PATH and answers to ``--version``."""
+    """Return true only when Claude Code reports an authenticated profile."""
     try:
-        proc = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=5)
+        proc = subprocess.run(
+            ["claude", "auth", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
-    return proc.returncode == 0
+    if proc.returncode != 0:
+        return False
+    try:
+        status = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return status.get("loggedIn") is True
 
 
 FakeRunner = Callable[[str, str], str]
