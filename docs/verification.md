@@ -71,7 +71,7 @@ Decision: the reviewer passes the key from the env var named by `anthropic_api_k
 
 # Found while building (M4 to M8)
 
-## 9. Subagents can't pass JSON through Bash, so a Write hook saves each section
+## 9. Subagents can't pass JSON through Bash, which is why the writers moved to the service
 
 The plan had each writer subagent use Read and Bash, piping its JSON list into `pair-brief save`. In the first M5 run that took over 300 s, because Claude Code's Bash safety checks block every way of doing it:
 
@@ -81,13 +81,13 @@ The plan had each writer subagent use Read and Bash, piping its JSON list into `
 
 Asking for Write and Bash in one message didn't help either: Sonnet waits for the Write result before it sends the Bash call.
 
-What shipped instead:
+M4 to M8 worked around this with a `PostToolUse` hook on `Write` (`hooks/save_on_write.sh`, `pair-brief hook-save`) that caught each subagent's output file and saved the section. PoC2 removed the hook, the `out/<section>.json` files, and the `hook-save` subcommand along with it, because the writers no longer run inside the user's session at all. What ships now:
 
-- The writer subagents have only **Read and Write**. Each writes its JSON list to `<brief dir>/out/<section>.json` (the path comes from `prepare`'s `outputs`).
-- A `PostToolUse` hook on `Write` (`hooks/save_on_write.sh`) runs `pair-brief hook-save`. It ignores every path that isn't a brief output file, validates and saves the section, and moves the file aside so a retry writes a fresh one.
-- On success the hook returns `hookSpecificOutput.additionalContext` (`pair-brief save: {"ok": true, ...}`), which the subagent sees. On failure it exits 2, and the model sees stderr (`pair-brief save failed: <reason>`) and fixes the file once.
-- `PostToolUse` hooks fire for subagent tool calls too, so one hook covers all four writers.
-- Taking Bash away also stopped a stray `find /` from the side-effects writer.
+- `/pair` makes one call, `pair-brief submit <pr>` (`skills/pair/SKILL.md`, `src/pair/submit.py`). It packs `meta.json`, the brief directory, and the raw session JSONL into a `tar.gz` and POSTs it to `{service_url}/submit`. Nothing else runs on the builder: no local review server, no Claude call.
+- The service runs each writer itself with `claude -p … --tools "" --output-format json` (`src/pair/service/claude.py`). With no tools there is no Write to catch, so the reply *is* the JSON list and the prompt says so.
+- `src/pair/service/jobs.py` parses and validates that reply through the same `pair.brief.save`, and on a `SaveError` retries the call once with the error as a hint. The section's status and any final error land in `manifest.json` instead of in a hook's stderr.
+- The summary writer produces `summary` and `look_first` in one call, so without a Write tool it replies with one object holding both lists.
+- Taking Bash away in M5 also stopped a stray `find /` from the side-effects writer; the service keeps the tool list empty for the same reason.
 
 ## 10. Skill frontmatter and the Agent tool
 

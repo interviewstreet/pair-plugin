@@ -1,0 +1,15 @@
+# The service image only needs pyproject.toml, uv.lock, src/, and agents/.
+# Everything else is kept out of the build context; .venv alone is ~300 MB and
+# would be a local, wrong-platform virtualenv inside the image anyway.
+.venv/
+.git/
+.pytest_cache/
+__pycache__/
+*.pyc
+web/
+tests/
+docs/
+skills/
+hooks/
+bin/
+.claude-plugin/

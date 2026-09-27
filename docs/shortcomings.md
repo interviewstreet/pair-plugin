@@ -12,10 +12,13 @@ What the backend gets wrong or can't do yet, found by reading the code and check
 
 ## Runs on the user's Claude Code
 
-- **The `/pair` skill runs a Sonnet agent just to start subagents.** It adds 10 to 18 s, often prints a status line before the URL, and when the account hits its session limit the `--empty` fallback never runs, so the brief stays pending. Fix: the skill makes one `pair-brief submit` call, and the service runs the writers.
-- **Writers are Claude Code subagents that save through a Write hook** (`hooks/save_on_write.sh`, `cmd_hook_save`), because Claude Code's Bash checks block piping JSON. Fix: the service calls the LLM API directly with JSON schema output, checks the result in code, and retries once with the error.
-- **The PR-created hook starts `claude -p "/pair …"`** (`hooks/hook_pr_created.py`). Fix: call `pair-brief submit` directly.
+The first three items here are **fixed** in PoC2 and are kept as a record of what changed.
+
+- ~~**The `/pair` skill runs a Sonnet agent just to start subagents.**~~ Fixed: the skill makes one `pair-brief submit` call and replies with the key and status (`skills/pair/SKILL.md`). It no longer starts subagents, reads transcripts, or waits on the brief.
+- ~~**Writers are Claude Code subagents that save through a Write hook**~~ (`hooks/save_on_write.sh`, `cmd_hook_save`), because Claude Code's Bash checks block piping JSON. Fixed: the hook and the `hook-save` subcommand are gone. The service runs each writer with `claude -p --tools ""` so the reply is the JSON list itself, validates it in code through `pair.brief.save`, and retries once with the error as a hint (`src/pair/service/claude.py`, `src/pair/service/jobs.py`). Still to do: a direct LLM API call with schema-enforced output, instead of the CLI on a logged-in profile.
+- ~~**The PR-created hook starts `claude -p "/pair …"`**~~ Fixed: `hooks/hook_pr_created.py` now execs `pair-brief submit <owner/repo>#<n>` directly, as an argv list, ten seconds after `gh pr create` returns.
 - **The chat runs the Claude Code CLI through `claude_agent_sdk`**, and quietly uses the user's Claude Code login when no API key is set (`pair_agent.py`). Fix: the chat moves to the pi agents on the VM.
+- **The service still runs the writers on a Claude Code login**, now on its own host rather than the user's laptop (`SubprocessRunner`, `default_login_check`, `/health`). The session limit moved; it didn't go away.
 
 ## Reaches back to the builder machine
 
@@ -79,7 +82,7 @@ What the backend gets wrong or can't do yet, found by reading the code and check
 
 ## Reliability and operations
 
-- **Job state is a pending list plus a 15-minute timer.** Fix: a status for each section (queued, running, done, failed, timed out) with its error, attempts, timings, tokens, and cost in `manifest.json`, and failures shown on the page.
+- ~~**Job state is a pending list plus a 15-minute timer.**~~ Partly fixed: `reviews/<key>/manifest.json` carries `queued`, `running`, `done`, or `failed` per section with an `updated_at` and an `error` (`src/pair/service/manifest.py`). The builder's local brief dir still uses the `pending` list and the 15-minute timer. Still to do: `timed out` as its own status, and attempts, timings, tokens, and cost per section.
 - **Two runs can start at once**, because `prepare` checks for an existing run outside the lock. Fix: a lease in the service, and dedupe by PR, head SHA, and payload hash.
 - **The hook only sees `gh pr create` inside Claude Code.** PRs from Codex, the GitHub UI, or a push followed by the web form are missed. Fix: add a Codex hook, poll open PRs, or build the brief on first open.
 - **Briefs go stale after new pushes**, and the reviewer can't trigger a new gather. Fix: resubmit on each push, and show "brief is for SHA X, PR is now at Y".

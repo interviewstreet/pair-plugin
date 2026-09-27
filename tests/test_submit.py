@@ -97,6 +97,27 @@ def test_build_meta_carries_the_six_identifying_fields(prepared):
     assert meta["key"] == PR7_KEY
 
 
+def test_build_meta_orders_the_fields_as_the_contract_lists_them(prepared):
+    # The service rejects anything but these six, in this shape.
+    assert list(build_meta(prepared)) == ["key", "repo", "pr", "title", "base_sha", "head_sha"]
+
+
+def test_build_meta_base_sha_is_the_merge_base_not_the_base_branch_tip(prepared, pr7):
+    meta = build_meta(prepared)
+    assert meta["base_sha"] == pr7.merge_base
+    assert meta["base_sha"] != pr7.base_oid
+
+
+@pytest.mark.parametrize("field", ["head_sha", "merge_base"])
+@pytest.mark.parametrize("bad", ["", "aaaaaaaabbbb", "AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDD11112222"])
+def test_build_meta_rejects_shas_that_are_not_40_lowercase_hex(prepared, field, bad):
+    """Fail on the builder rather than ship a payload /submit has to reject."""
+    # The top-level head_sha is the fallback build_meta reads, so break both.
+    broken = {**prepared, "head_sha": bad, "pr_basics": {**prepared["pr_basics"], field: bad}}
+    with pytest.raises(SubmitError, match="40 lowercase hex"):
+        build_meta(broken)
+
+
 def test_build_payload_bundles_meta_brief_and_sessions(prepared):
     gz, meta = build_payload(prepared)
     names = [m.name for m in _members(gz)]
@@ -239,6 +260,35 @@ def test_submit_raises_on_http_error(prepared):
     with pytest.raises(SubmitError, match="HTTP 401"):
         submit("acme/demo#7", _cfg(),
                prepare_fn=lambda spec, cfg, force: prepared, opener=opener)
+
+
+def test_submit_never_starts_the_local_server_or_calls_claude(prepared, monkeypatch):
+    """The builder's job ends at the POST.
+
+    Before PoC2, building a brief started `pair.server` on the laptop and ran
+    the writers there through the Claude CLI. Both are process spawns, so
+    banning `subprocess` for the duration of the call covers them together,
+    and `ensure_server` is stubbed as well in case it ever stops shelling out.
+    """
+    import subprocess
+
+    import pair.server
+
+    def boom(*args, **kwargs):
+        raise AssertionError(f"submit spawned a process: {args!r}")
+
+    monkeypatch.setattr(pair.server, "ensure_server", boom)
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    monkeypatch.setattr(subprocess, "check_output", boom)
+
+    opener = _RecordingOpener([(202, {"key": PR7_KEY})])
+    result = submit("acme/demo#7", _cfg(),
+                    prepare_fn=lambda spec, cfg, force: prepared, opener=opener)
+    assert result["status"] == "queued"
+    # One request, and nothing in the reply points at a local server.
+    assert len(opener.requests) == 1
+    assert "server" not in result and "url" not in result
 
 
 def test_submit_propagates_prepare_error():

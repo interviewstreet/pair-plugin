@@ -6,7 +6,7 @@ into a `tar.gz`, and hand that blob to the service at `{service_url}/submit`. Th
 owns everything downstream (queueing, rendering, bundling). We never start a local review
 server from here, and we never call Claude from the plugin.
 
-The archive follows the frozen bundle contract at `contract/docs/bundle.md`:
+The archive follows the frozen bundle contract at `docs/bundle.md`:
 
 * Members are regular files. No absolute paths, no `..`, no backslashes, no symlinks.
 * `meta.json` carries `key`, `repo`, `pr`, `title`, `base_sha`, and `head_sha`.
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import tarfile
 import time
 import urllib.error
@@ -31,6 +32,8 @@ from pair.util import is_submit_key, parse_pr_spec, review_key, submit_key
 # Files the prepare step writes into the brief directory. `brief.md` is listed for
 # forward compatibility; today it isn't produced, and the archive just skips it.
 BUNDLE_FILES = ("brief.json", "brief.md", "evidence.json", "diff.patch", "risky_hunks.json")
+
+SHA40 = re.compile(r"^[0-9a-f]{40}$")
 
 
 class SubmitError(Exception):
@@ -91,17 +94,26 @@ def _session_arcname(path: Path, claude_root: Path, codex_root: Path, used: set[
 
 
 def build_meta(prepared: dict) -> dict:
-    """The `meta.json` object: just the six identifying fields the service keys on."""
+    """The `meta.json` object: exactly the six identifying fields the service keys on.
+
+    `base_sha` is the PR's merge base, not its base branch tip: the service copies
+    both SHAs straight into `manifest.json`, where the contract requires 40 lowercase
+    hex, so they are checked here instead of being rejected at `/submit`.
+    """
     basics = prepared.get("pr_basics") or {}
     repo = basics.get("repo") or ""
     number = int(basics.get("number") or 0)
     head_sha = str(basics.get("head_sha") or prepared.get("head_sha") or "")
+    base_sha = str(basics.get("merge_base") or "")
+    for name, sha in (("head_sha", head_sha), ("base_sha", base_sha)):
+        if not SHA40.match(sha):
+            raise SubmitError(f"{name} must be 40 lowercase hex characters, got {sha!r}")
     return {
         "key": submit_key(repo, number, head_sha),
         "repo": repo,
         "pr": number,
         "title": str(basics.get("title") or ""),
-        "base_sha": str(basics.get("merge_base") or ""),
+        "base_sha": base_sha,
         "head_sha": head_sha,
     }
 
