@@ -1,0 +1,3 @@
+{"type":"fork-context-ref","parentSessionId":"sess-main-1"}
+{"type":"user","isSidechain":true,"agentId":"abc123","message":{"role":"user","content":"Write the session helper"},"uuid":"s1","timestamp":"2026-09-20T10:02:10Z","sessionId":"sess-main-1","cwd":"__REPO__","gitBranch":"feature/login-flow"}
+{"type":"assistant","isSidechain":true,"agentId":"abc123","message":{"role":"assistant","content":[{"type":"tool_use","id":"stu1","name":"Write","input":{"file_path":"__REPO__/app/session.py","content":"def create_session(user):\n    return {'user_id': user.id}"}}]},"uuid":"s2","timestamp":"2026-09-20T10:02:20Z","sessionId":"sess-main-1","cwd":"__REPO__","gitBranch":"feature/login-flow"}

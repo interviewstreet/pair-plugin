@@ -1,0 +1,11 @@
+{
+  "name": "pair-local",
+  "owner": {"name": "five-sh"},
+  "plugins": [
+    {
+      "name": "pair",
+      "source": "./",
+      "description": "Review a GitHub PR with the context of the Claude and Codex sessions that built it."
+    }
+  ]
+}

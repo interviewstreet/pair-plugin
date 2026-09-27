@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"refactor the login helpers"},"uuid":"b1","timestamp":"2026-09-20T09:30:00Z","sessionId":"sess-sibling","cwd":"__REPO__","gitBranch":"other-branch"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"btu1","name":"Edit","input":{"file_path":"__REPO__/app/login.py","old_string":"pass","new_string":"def unrelated_helper_function():\n    return compute_something_else()"}}]},"uuid":"b2","timestamp":"2026-09-20T09:30:10Z","sessionId":"sess-sibling","cwd":"__REPO__","gitBranch":"other-branch"}

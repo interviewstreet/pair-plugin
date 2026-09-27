@@ -1,0 +1,27 @@
+{
+  "pr": {
+    "repo": "acme/widgets",
+    "number": 42,
+    "title": "Add a loud greeting",
+    "url": "https://github.com/acme/widgets/pull/42",
+    "head_branch": "feat/loud",
+    "base_branch": "main",
+    "body": ""
+  },
+  "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+  "sessions": [],
+  "sections": {
+    "ask": [
+      {
+        "text": "Make the greeting optionally loud.",
+        "refs": ["claude:11111111-aaaa-bbbb-cccc-000000000001:u-1"],
+        "session": "claude:11111111",
+        "at": "2026-01-02T10:00:00+00:00"
+      }
+    ],
+    "verification": [
+      { "text": "pytest", "status": "passed", "runs": 2, "last_run": "2026-01-02T10:30:00+00:00", "command": "pytest -q", "refs": [] }
+    ]
+  },
+  "pending": ["summary", "look_first", "decisions", "pushback"]
+}

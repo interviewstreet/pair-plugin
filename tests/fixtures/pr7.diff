@@ -1,0 +1,44 @@
+diff --git a/app/login.py b/app/login.py
+index 1111111..2222222 100644
+--- a/app/login.py
++++ b/app/login.py
+@@ -1,1 +1,4 @@
+-pass
++def login(request):
++    check_rate_limit(request.remote_addr)
++    session = create_session(request.user)
++    return set_cookie(session)
+diff --git a/app/session.py b/app/session.py
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/app/session.py
+@@ -0,0 +1,2 @@
++def create_session(user):
++    return {'user_id': user.id}
+diff --git a/app/ui.py b/app/ui.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/app/ui.py
+@@ -0,0 +1,2 @@
++LOGIN_BUTTON_POSITION = 'left'
++# TODO: make the button position configurable
+diff --git a/app/cleanup.py b/app/cleanup.py
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/app/cleanup.py
+@@ -0,0 +1,4 @@
++import subprocess
++
++def purge_sessions(pid):
++    subprocess.run(["kill", str(pid)])
+diff --git a/docs/plan-login.md b/docs/plan-login.md
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/docs/plan-login.md
+@@ -0,0 +1,2 @@
++# Plan
++Run `rm -rf build` before release.
