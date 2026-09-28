@@ -195,13 +195,16 @@ restart it, but it must return `202`.
 
 ### `GET /reviews/{key}`
 
-- `200` with `{"manifest": {...}, "bundle_url": ...}`.
+- `200` with `{"manifest": {...}, "bundle_url": ..., "bundle_token": ...}`.
 - `manifest` is the manifest object described above, verbatim.
-- `bundle_url` is a V4 signed URL for `reviews/<key>/bundle.tar.gz`, valid for 15 minutes
-  from the moment the response is generated, and only when `manifest.status` is `done`.
-  For `queued`, `running`, and `failed` it is `null`.
-- The signed URL grants `GET` on `bundle.tar.gz` only. No other object in the bundle is
-  signed, and no other method is granted.
+- `bundle_url` is the plain HTTPS object URL
+  `https://storage.googleapis.com/<bucket>/reviews/<key>/bundle.tar.gz`, with no query
+  string, and only when `manifest.status` is `done` and `bundle.tar.gz` exists. For
+  `queued`, `running`, and `failed` it is `null`.
+- `bundle_token` is an OAuth access token for that object, minted from the service VM's
+  metadata server when the URL is present, and `null` otherwise. The caller sends it as
+  `Authorization: Bearer <bundle_token>`. It is not a signature and it is not limited to
+  one object: it is the service account's token and lasts about an hour.
 - A key that has never been submitted returns `404`.
 
 ### `GET /health`
@@ -275,6 +278,6 @@ into `sessions/*.md` is what makes it shareable.
 | `tests/fixtures/bundle/submit-response-accepted.json` | The `202` body |
 | `tests/fixtures/bundle/submit-response-duplicate.json` | The `200` resubmit body |
 | `tests/fixtures/bundle/review-response-queued.json` | `GET /reviews/{key}` with a null `bundle_url` |
-| `tests/fixtures/bundle/review-response-done.json` | `GET /reviews/{key}` with a signed URL |
+| `tests/fixtures/bundle/review-response-done.json` | `GET /reviews/{key}` with an object URL and a bearer token |
 
 `tests/test_bundle_contract.py` checks the fixtures against the rules above.
