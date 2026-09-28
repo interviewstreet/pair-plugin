@@ -22,9 +22,7 @@ from .helpers import (
 
 @pytest.fixture
 def storage() -> InMemoryStorage:
-    return InMemoryStorage(
-        signer=lambda p, ttl: f"https://signed.test.invalid/{p}?exp={ttl}"
-    )
+    return InMemoryStorage()
 
 
 @pytest.fixture
@@ -53,6 +51,7 @@ def app_client(manager):
         manager=manager,
         config=ServiceConfig(bearer_token=TEST_TOKEN),
         login_check=manager.login_check,
+        access_token=lambda: "ya29.test-token",
     )
     with TestClient(app) as client:
         yield client

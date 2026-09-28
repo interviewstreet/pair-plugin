@@ -236,18 +236,21 @@ def test_review_running_returns_null_bundle_url(app_client, manager, storage):
     # The response's manifest matches the queued fixture verbatim.
     assert body["manifest"] == expected["manifest"]
     assert body["bundle_url"] is None
+    assert body["bundle_token"] is None
 
 
-def test_review_done_returns_signed_url_only_when_done(app_client, manager, storage):
+def test_review_done_returns_object_url_and_token(app_client, manager, storage):
     _submit(app_client, build_payload())
     run_and_wait(manager, TEST_KEY)
     r = app_client.get(f"/reviews/{TEST_KEY}", headers=auth_headers())
     assert r.status_code == 200
     body = r.json()
     assert body["manifest"]["status"] == "done"
-    assert body["bundle_url"] is not None
-    assert "reviews/" + TEST_KEY + "/bundle.tar.gz" in body["bundle_url"]
-    assert "exp=900" in body["bundle_url"]  # 15-minute TTL
+    assert body["bundle_url"] == (
+        "https://storage.googleapis.com/memory/reviews/" + TEST_KEY + "/bundle.tar.gz"
+    )
+    assert "?" not in body["bundle_url"]
+    assert body["bundle_token"] == "ya29.test-token"
 
 
 def test_review_running_before_bundle_returns_null_url(app_client, storage):
@@ -259,6 +262,7 @@ def test_review_running_before_bundle_returns_null_url(app_client, storage):
     r = app_client.get(f"/reviews/{key}", headers=auth_headers())
     assert r.status_code == 200
     assert r.json()["bundle_url"] is None
+    assert r.json()["bundle_token"] is None
 
 
 def test_review_done_but_no_bundle_returns_null_url(app_client, storage):
@@ -271,3 +275,4 @@ def test_review_done_but_no_bundle_returns_null_url(app_client, storage):
     r = app_client.get(f"/reviews/{key}", headers=auth_headers())
     assert r.status_code == 200
     assert r.json()["bundle_url"] is None
+    assert r.json()["bundle_token"] is None

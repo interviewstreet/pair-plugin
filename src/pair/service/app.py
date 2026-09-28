@@ -27,7 +27,7 @@ from pair.service.archive import (
 from pair.service.claude import LoginCheck
 from pair.service.jobs import JobManager
 from pair.service.keys import BadKey, parse_key
-from pair.service.storage import bundle_path, manifest_path
+from pair.service.storage import bundle_path, gce_access_token, manifest_path
 
 log = logging.getLogger("pair.service.app")
 
@@ -140,11 +140,12 @@ def create_app(
     manager: JobManager,
     config: ServiceConfig,
     login_check: LoginCheck | Callable[[], bool] | None = None,
+    access_token: Callable[[], str] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="pair-review", version="0.1.0")
     login = login_check or manager.login_check
     token = config.bearer_token
-    ttl = config.signed_url_ttl_seconds
+    mint_bundle_token = access_token or gce_access_token
 
     @app.exception_handler(HTTPException)
     async def _http_exc(request: Request, exc: HTTPException):
@@ -232,8 +233,17 @@ def create_app(
                 status_code=500, detail={"error": f"manifest is corrupt: {exc}"}
             ) from exc
         bundle_url = None
+        bundle_token = None
         if manifest.get("status") == "done" and manager.storage.exists(bundle_path(key)):
-            bundle_url = manager.storage.signed_url(bundle_path(key), ttl)
-        return {"manifest": manifest, "bundle_url": bundle_url}
+            bundle_url = manager.storage.object_url(bundle_path(key))
+            try:
+                bundle_token = mint_bundle_token()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503, detail={"error": "bundle token unavailable"}
+                ) from exc
+            if not bundle_token:
+                raise HTTPException(status_code=503, detail={"error": "bundle token unavailable"})
+        return {"manifest": manifest, "bundle_url": bundle_url, "bundle_token": bundle_token}
 
     return app

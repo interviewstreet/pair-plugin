@@ -111,7 +111,7 @@ def plugin_payload(demo, pr7, monkeypatch):
 @pytest.fixture
 def service(monkeypatch):
     """App + manager over in-memory storage, a fake writer, and a fake login."""
-    storage = InMemoryStorage(signer=lambda p, ttl: f"https://signed.test.invalid/{p}?exp={ttl}")
+    storage = InMemoryStorage()
     runner = EchoRunner()
     manager = JobManager(
         storage=storage,
@@ -124,6 +124,7 @@ def service(monkeypatch):
         manager=manager,
         config=ServiceConfig(bearer_token=TEST_TOKEN),
         login_check=manager.login_check,
+        access_token=lambda: "ya29.test-token",
     )
     with TestClient(app) as client:
         yield {"client": client, "manager": manager, "storage": storage, "runner": runner}
@@ -199,7 +200,8 @@ def test_real_payload_is_accepted_and_produces_a_done_manifest_and_bundle(finish
 
     review = finished["client"].get(f"/reviews/{finished['key']}", headers=auth_headers())
     assert review.status_code == 200
-    assert review.json()["bundle_url"], "a done review must carry a signed bundle URL"
+    assert review.json()["bundle_url"].startswith("https://storage.googleapis.com/")
+    assert review.json()["bundle_token"] == "ya29.test-token"
 
 
 # --------------------------------------------------------------------------- #

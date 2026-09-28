@@ -90,7 +90,7 @@ def test_every_fixture_uses_the_same_key():
 @pytest.mark.parametrize("name", REVIEWS)
 def test_review_response_shape(name):
     r = load(name)
-    assert set(r) == {"manifest", "bundle_url"}
+    assert set(r) == {"manifest", "bundle_url", "bundle_token"}
     check_manifest(r["manifest"])
 
 
@@ -98,15 +98,17 @@ def test_bundle_url_only_when_done():
     done = load("review-response-done.json")
     assert done["manifest"]["status"] == "done"
     url = done["bundle_url"]
-    assert url.endswith(
-        "X-Goog-Signature=4f1b8c0d5e2a7936bb41c8d70e6f253a9c4d18b7e05f3a26c9d84b17f602ae3d")
-    assert f"/reviews/{done['manifest']['key']}/bundle.tar.gz?" in url
-    assert "X-Goog-Algorithm=GOOG4-RSA-SHA256" in url  # V4 signing
-    assert "X-Goog-Expires=900" in url  # 15 minutes
+    assert url == (
+        "https://storage.googleapis.com/pair-poc2-reviews/reviews/"
+        f"{done['manifest']['key']}/bundle.tar.gz"
+    )
+    assert "?" not in url
+    assert done["bundle_token"] == "ya29.example-access-token"
 
     queued = load("review-response-queued.json")
     assert queued["manifest"]["status"] == "queued"
     assert queued["bundle_url"] is None
+    assert queued["bundle_token"] is None
 
 
 def test_submit_responses():

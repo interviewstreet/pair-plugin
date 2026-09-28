@@ -1,8 +1,9 @@
-"""Object storage abstraction with an injectable signer.
+"""Object storage abstraction.
 
 The service writes payloads, per-key manifests, and the final bundle through
-this interface. Tests use ``InMemoryStorage`` and pass a fake signer so no GCP
-credentials, no key file, and no network access are required.
+this interface. Tests use ``InMemoryStorage``. Downloads use a plain HTTPS
+object URL plus a bearer token from the VM metadata server, so the service
+never signs a URL.
 
 Path layout matches ``docs/bundle.md``: rendered files live under
 ``reviews/<key>/`` and archived submits under ``payloads/<key>/<ts>.tar.gz``.
@@ -11,11 +12,8 @@ Path layout matches ``docs/bundle.md``: rendered files live under
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Callable, Protocol
-
-
-Signer = Callable[[str, int], str]  # (path, ttl_seconds) -> URL
+from datetime import datetime, timezone
+from typing import Protocol
 
 
 class ObjectMissing(KeyError):
@@ -28,14 +26,13 @@ class Storage(Protocol):
     def put_bytes(self, path: str, data: bytes) -> None: ...
     def get_bytes(self, path: str) -> bytes: ...
     def exists(self, path: str) -> bool: ...
-    def signed_url(self, path: str, ttl_seconds: int) -> str: ...
+    def object_url(self, path: str) -> str: ...
 
 
 @dataclass
 class InMemoryStorage:
-    """A dict-backed backend for tests. The signer defaults to a stub URL."""
+    """A dict-backed backend for tests."""
 
-    signer: Signer | None = None
     blobs: dict[str, bytes] = field(default_factory=dict)
     # Ordered log of writes, useful when tests need to assert write order.
     writes: list[str] = field(default_factory=list)
@@ -52,19 +49,17 @@ class InMemoryStorage:
     def exists(self, path: str) -> bool:
         return path in self.blobs
 
-    def signed_url(self, path: str, ttl_seconds: int) -> str:
+    def object_url(self, path: str) -> str:
         if not self.exists(path):
             raise ObjectMissing(path)
-        sign = self.signer or (lambda p, t: f"https://storage.example.invalid/{p}?exp={t}")
-        return sign(path, ttl_seconds)
+        return f"https://storage.googleapis.com/memory/{path}"
 
 
 class GCSStorage:
     """Wraps a ``google.cloud.storage.Bucket``. Not imported unless used."""
 
-    def __init__(self, bucket, signer: Signer | None = None) -> None:
+    def __init__(self, bucket) -> None:
         self.bucket = bucket
-        self._signer = signer
 
     def put_bytes(self, path: str, data: bytes) -> None:
         blob = self.bucket.blob(path)
@@ -79,15 +74,12 @@ class GCSStorage:
     def exists(self, path: str) -> bool:
         return self.bucket.blob(path).exists()
 
-    def signed_url(self, path: str, ttl_seconds: int) -> str:
-        if self._signer is not None:
-            return self._signer(path, ttl_seconds)
-        blob = self.bucket.blob(path)
-        return blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(seconds=ttl_seconds),
-            method="GET",
-        )
+    def object_url(self, path: str) -> str:
+        """HTTPS URL for one object. The caller supplies the bearer token."""
+        from urllib.parse import quote
+
+        name = getattr(self.bucket, "name", None) or "bucket"
+        return "https://storage.googleapis.com/" + quote(name, safe="") + "/" + quote(path, safe="/")
 
 
 # --- Path helpers ------------------------------------------------------------
@@ -149,3 +141,24 @@ def next_payload_path(storage: Storage, key: str, now: datetime | None = None) -
     while storage.exists(f"{base}-{n}.tar.gz"):
         n += 1
     return f"{base}-{n}.tar.gz"
+
+
+def gce_access_token() -> str:
+    """Access token from the GCE metadata server.
+
+    The attached service account can read the review bucket. The token lasts
+    about an hour and is not limited to one object.
+    """
+    import json
+    import urllib.request
+
+    request = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        body = json.load(response)
+    token = body.get("access_token") if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("metadata server returned no access token")
+    return token

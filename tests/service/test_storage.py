@@ -36,8 +36,9 @@ def test_next_payload_path_adds_counter_on_collision():
     assert third == "payloads/k/20260928T001200Z-3.tar.gz"
 
 
-def test_in_memory_signed_url_needs_object():
+def test_in_memory_object_url_needs_object():
     store = InMemoryStorage()
     store.put_bytes("reviews/k/bundle.tar.gz", b"hi")
-    url = store.signed_url("reviews/k/bundle.tar.gz", 900)
-    assert "reviews/k/bundle.tar.gz" in url and "900" in url
+    url = store.object_url("reviews/k/bundle.tar.gz")
+    assert url == "https://storage.googleapis.com/memory/reviews/k/bundle.tar.gz"
+    assert "?" not in url
