@@ -5,9 +5,11 @@ from types import SimpleNamespace
 from pair.service.claude import (
     REPLY_INSTRUCTION,
     SUMMARY_REPLY_INSTRUCTION,
+    adapt_agent_prompt,
     build_command,
     build_prompt,
     default_login_check,
+    load_agent_prompt,
 )
 
 
@@ -34,6 +36,47 @@ def test_build_prompt_appends_object_instruction_for_summary():
     p = build_prompt("agent body", "input text", section="summary")
     assert p.endswith(SUMMARY_REPLY_INSTRUCTION)
     assert '"summary"' in p and '"look_first"' in p
+
+
+PLUGIN_PROMPT = """---
+name: pair-side-effects
+tools: Read, Write
+---
+
+You write the side-effects section.
+
+## Steps
+
+1. Read the input file named in your prompt.
+2. Use the Write tool to write the JSON list to the output path.
+3. If a tool call is denied, stop and reply `denied:` followed by the tool and the reason.
+
+## Rules
+
+- Each item is `{"text": "...", "refs": ["<ref>"]}`.
+- If nothing qualifies, write `[]`.
+"""
+
+
+def test_adapt_agent_prompt_drops_plugin_file_steps():
+    adapted = adapt_agent_prompt(PLUGIN_PROMPT)
+    assert "## Steps" not in adapted
+    assert "Write tool" not in adapted
+    assert "denied:" not in adapted
+    assert "Each item is" in adapted
+    assert "included inline below" in adapted
+
+
+def test_load_agent_prompt_adapts_real_writer(tmp_path):
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "pair-side-effects.md").write_text(PLUGIN_PROMPT)
+    loaded = load_agent_prompt(agents, "side_effects")
+    prompt = build_prompt(loaded, "hunk input")
+    assert "Write tool" not in prompt
+    assert "denied:" not in prompt
+    assert prompt.endswith(REPLY_INSTRUCTION)
+    assert "## Input" in prompt and "hunk input" in prompt
 
 
 def test_retry_hint_shows_up_in_prompt():

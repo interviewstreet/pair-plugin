@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,11 +48,37 @@ def strip_frontmatter(md: str) -> str:
     return md
 
 
+# Plugin agents read an input file and save with the Write tool. The service
+# inlines the input and runs Claude with ``--tools ""``, so those steps make
+# Claude refuse instead of returning JSON. Drop them at load time.
+_STEPS_SECTION = re.compile(r"\n## Steps\b.*?(?=\n## |\Z)", re.DOTALL)
+
+INLINE_INPUT_NOTE = (
+    "## How to reply\n\n"
+    "The section input is included inline below, under \"## Input\". "
+    "Do not read files, write files, or call tools. "
+    "Apply the rules to that input, then reply with only the JSON "
+    "described at the end of this prompt."
+)
+
+
+def adapt_agent_prompt(md: str) -> str:
+    """Turn a plugin writer prompt into a tools-off, inline-input prompt."""
+    text = strip_frontmatter(md).strip()
+    adapted, count = _STEPS_SECTION.subn("\n\n" + INLINE_INPUT_NOTE + "\n", text, count=1)
+    if count == 0:
+        adapted = f"{text}\n\n{INLINE_INPUT_NOTE}"
+    return adapted.strip()
+
+
 def load_agent_prompt(agents_dir: Path, section: str) -> str:
-    """Return the writer agent's prompt body (no frontmatter) for ``section``."""
+    """Return the service prompt for ``section``.
+
+    Frontmatter and the plugin's file-tool steps are removed. The rules stay.
+    """
     writer = WRITERS[section]
     body = (agents_dir / f"{writer}.md").read_text()
-    return strip_frontmatter(body).strip()
+    return adapt_agent_prompt(body)
 
 
 def _prompt_body(agent_body: str, input_text: str, retry_hint: str | None) -> list[str]:
