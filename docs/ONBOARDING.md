@@ -1,0 +1,52 @@
+# Pair CLI onboarding
+
+Pair never starts installation solely because a pull request was created. The
+first eligible `gh pr create` hook displays an approval command. Running that
+command is the one-time opt-in for the harness that created the pull request.
+
+## What approval does
+
+Approval downloads the checksum-verified `paircli` binary for the current
+platform, installs a Pair hook for **only** the approved harness, and opens
+Pair device login if no valid credential exists. A later pull request checks
+for a verified CLI update and re-installs that same harness hook.
+
+Pair CLI reads local session data for an approved harness when it builds Pair
+review data. Device login contacts the Pair backend. The current Codex flow
+does not upload a PR artifact yet; its hook reports that limitation directly.
+
+## Status and recovery
+
+The hook prints the current onboarding status and log path. A failed setup is
+reported on the next PR instead of silently retrying. The lock includes a PID
+and timestamp, and is reclaimed after its owner exits or after 30 minutes.
+
+To retry a failed setup, run the approval command printed by the hook again.
+Enterprise users can point bootstrap at an approved HTTPS mirror or pinned
+manifest with `PAIRCLI_RELEASE_MANIFEST_URL`; paircli updates use
+`PAIRCLI_UPDATE_MANIFEST_URL` for the same purpose.
+
+## Remove Pair
+
+Find the installed binary in the `binary` field of the plugin's
+`onboarding.json`, then run the one-command teardown:
+
+```sh
+python3 /path/to/paircli_onboarding.py uninstall --harness codex
+```
+
+Replace `codex` with `claude-code` or `pi` if that is the harness you approved.
+The command removes that harness's hook, logs out, and deletes the downloaded
+binary and consent metadata. Finally remove the plugin through Codex. If its
+plugin data remains, delete the directory that contains `onboarding.json` and
+`auth.json`.
+
+## Release endpoint requirements
+
+The release endpoint must return `application/json` at:
+
+`https://downloads.pair.sh/paircli/latest.json`
+
+It must not redirect to another origin. The manifest's binary URLs must use
+HTTPS and return the checksum declared in the manifest. A release is not ready
+until those public URLs are live and verified.

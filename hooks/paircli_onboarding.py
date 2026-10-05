@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -25,6 +25,12 @@ COMMON_TOOL_DIRECTORIES = ("/opt/homebrew/bin", "/usr/local/bin")
 MAX_BINARY_SIZE_BYTES = 100 * 1024 * 1024
 RELEASE_MANIFEST_ENV = "PAIRCLI_RELEASE_MANIFEST_URL"
 DEVELOPMENT_BUILD_ENV = "PAIRCLI_DEV_BUILD"
+SUPPORTED_HARNESSES = {"claude-code", "codex", "pi"}
+COMMAND_TIMEOUT_SECONDS = 120
+LOGIN_TIMEOUT_SECONDS = 16 * 60
+LOCK_STALE_AFTER_SECONDS = 30 * 60
+CONSENT_VERSION = "1"
+PLUGIN_VERSION = "0.1.0"
 
 
 def plugin_data_home() -> Path | None:
@@ -51,6 +57,10 @@ def source_path(home: Path) -> Path:
 
 def release_metadata_path(home: Path) -> Path:
     return home / "release.json"
+
+
+def consent_path(home: Path) -> Path:
+    return home / "consent.json"
 
 
 def auth_file() -> Path:
@@ -94,6 +104,34 @@ def write_status(home: Path, status: str, **details: str) -> None:
     temporary = status_path(home).with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n")
     temporary.replace(status_path(home))
+
+
+def read_consent(home: Path) -> dict[str, str]:
+    try:
+        value = json.loads(consent_path(home).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {key: item for key, item in value.items() if isinstance(key, str) and isinstance(item, str)}
+
+
+def has_consent(home: Path, harness: str) -> bool:
+    consent = read_consent(home)
+    return consent.get("version") == CONSENT_VERSION and consent.get("harness") == harness
+
+
+def grant_consent(home: Path, harness: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    temporary = consent_path(home).with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {"version": CONSENT_VERSION, "harness": harness, "approved_at": datetime.now(timezone.utc).isoformat()},
+            indent=2,
+        )
+        + "\n"
+    )
+    temporary.replace(consent_path(home))
 
 
 def has_active_login() -> bool:
@@ -171,11 +209,29 @@ def require_https_url(value: str, *, label: str) -> str:
     return value
 
 
+def verify_response_origin(response, requested_url: str, *, label: str) -> None:
+    """Reject redirects that leave the HTTPS origin selected by the manifest."""
+    final_url = response.geturl() if hasattr(response, "geturl") else requested_url
+    requested = urlparse(requested_url)
+    final = urlparse(final_url)
+    if (final.scheme, final.netloc) != (requested.scheme, requested.netloc):
+        raise RuntimeError(f"{label} redirected to a different origin")
+
+
+def verify_json_response(response, requested_url: str) -> None:
+    verify_response_origin(response, requested_url, label="paircli release manifest")
+    headers = getattr(response, "headers", None)
+    content_type = headers.get_content_type() if headers is not None and hasattr(headers, "get_content_type") else ""
+    if content_type != "application/json":
+        raise RuntimeError(f"paircli release manifest expected application/json, got {content_type or 'unknown'}")
+
+
 def fetch_json(url: str) -> dict[str, Any]:
     """Fetch a JSON release document from the configured CDN endpoint."""
     request = Request(require_https_url(url, label="paircli release manifest URL"), headers={"User-Agent": "pair-plugin"})
     try:
         with urlopen(request, timeout=15) as response:
+            verify_json_response(response, url)
             payload = response.read(MAX_BINARY_SIZE_BYTES)
     except OSError as error:
         raise RuntimeError(f"could not fetch paircli release manifest: {error}") from error
@@ -206,6 +262,24 @@ def release_artifact(manifest: dict[str, Any], target: str) -> tuple[str, str, s
     return version, require_https_url(url, label="paircli binary URL"), checksum.lower()
 
 
+def version_at_least(actual: str, required: str) -> bool:
+    """Compare stable three-part versions used by the plugin release contract."""
+    try:
+        actual_parts = tuple(int(part) for part in actual.split("+", 1)[0].split("-", 1)[0].split("."))
+        required_parts = tuple(int(part) for part in required.split("+", 1)[0].split("-", 1)[0].split("."))
+    except ValueError:
+        return False
+    return len(actual_parts) == len(required_parts) == 3 and actual_parts >= required_parts
+
+
+def verify_plugin_compatibility(manifest: dict[str, Any]) -> None:
+    required = manifest.get("min_plugin_version")
+    if required is None:
+        return
+    if not isinstance(required, str) or not version_at_least(PLUGIN_VERSION, required):
+        raise RuntimeError(f"paircli release requires Pair plugin {required} or newer")
+
+
 def read_release_metadata(home: Path) -> dict[str, str]:
     try:
         value = json.loads(release_metadata_path(home).read_text())
@@ -217,9 +291,11 @@ def read_release_metadata(home: Path) -> dict[str, str]:
 
 
 def write_release_metadata(home: Path, *, version: str, target: str, checksum: str) -> None:
-    release_metadata_path(home).write_text(
+    temporary = release_metadata_path(home).with_suffix(".tmp")
+    temporary.write_text(
         json.dumps({"version": version, "platform": target, "sha256": checksum}, indent=2) + "\n"
     )
+    temporary.replace(release_metadata_path(home))
 
 
 def download_binary(url: str, destination: Path, checksum: str) -> None:
@@ -233,6 +309,7 @@ def download_binary(url: str, destination: Path, checksum: str) -> None:
         with os.fdopen(descriptor, "wb") as output:
             request = Request(url, headers={"User-Agent": "pair-plugin"})
             with urlopen(request, timeout=30) as response:
+                verify_response_origin(response, url, label="paircli binary")
                 while chunk := response.read(64 * 1024):
                     total += len(chunk)
                     if total > MAX_BINARY_SIZE_BYTES:
@@ -249,8 +326,13 @@ def download_binary(url: str, destination: Path, checksum: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def run_command(command: list[str], *, cwd: Path, log) -> None:
-    completed = subprocess.run(command, cwd=str(cwd), env=clean_environment(), stdout=log, stderr=subprocess.STDOUT)
+def run_command(command: list[str], *, cwd: Path, log, timeout: int = COMMAND_TIMEOUT_SECONDS) -> None:
+    try:
+        completed = subprocess.run(
+            command, cwd=str(cwd), env=clean_environment(), stdout=log, stderr=subprocess.STDOUT, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"command timed out after {timeout}s: {' '.join(command)}") from error
     if completed.returncode != 0:
         raise RuntimeError(f"command exited {completed.returncode}: {' '.join(command)}")
 
@@ -285,17 +367,13 @@ def ensure_paircli(home: Path, log) -> Path:
     if os.environ.get(DEVELOPMENT_BUILD_ENV) == "1":
         return build_paircli_from_source(home, log)
 
-    manifest_url = os.environ.get(RELEASE_MANIFEST_ENV, DEFAULT_RELEASE_MANIFEST_URL)
-    target = platform_key()
-    version, url, checksum = release_artifact(fetch_json(manifest_url), target)
     binary = binary_path(home)
-    installed = read_release_metadata(home)
-    if (
-        binary.is_file()
-        and os.access(binary, os.X_OK)
-        and installed == {"version": version, "platform": target, "sha256": checksum}
-    ):
+    if binary.is_file() and os.access(binary, os.X_OK):
         return binary
+    manifest = fetch_json(os.environ.get(RELEASE_MANIFEST_ENV, DEFAULT_RELEASE_MANIFEST_URL))
+    verify_plugin_compatibility(manifest)
+    target = platform_key()
+    version, url, checksum = release_artifact(manifest, target)
     output = log if log is not None else sys.stderr
     output.write(f"downloading paircli {version} for {target}\n")
     download_binary(url, binary, checksum)
@@ -303,14 +381,46 @@ def ensure_paircli(home: Path, log) -> Path:
     return binary
 
 
+def lock_is_stale(home: Path) -> bool:
+    try:
+        value = json.loads(lock_path(home).read_text())
+    except (OSError, ValueError):
+        return True
+    if not isinstance(value, dict):
+        return True
+    created_at = value.get("created_at")
+    pid = value.get("pid")
+    try:
+        created = parse_expiry(created_at) if isinstance(created_at, str) else None
+    except ValueError:
+        created = None
+    if created is None or datetime.now(timezone.utc) - created > timedelta(seconds=LOCK_STALE_AFTER_SECONDS):
+        return True
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
 def acquire_lock(home: Path) -> bool:
     home.mkdir(parents=True, exist_ok=True)
     try:
         descriptor = os.open(lock_path(home), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        return False
+        if not lock_is_stale(home):
+            return False
+        try:
+            lock_path(home).unlink()
+        except FileNotFoundError:
+            pass
+        return acquire_lock(home)
     with os.fdopen(descriptor, "w") as lock:
-        lock.write(f"{os.getpid()}\n")
+        json.dump({"pid": os.getpid(), "created_at": datetime.now(timezone.utc).isoformat()}, lock)
     return True
 
 
@@ -327,24 +437,38 @@ def log_file(home: Path) -> Path:
     return directory / f"onboarding-{time.strftime('%Y%m%d-%H%M%S')}.log"
 
 
-def start(dry_run: bool = False) -> dict[str, str]:
+def approval_command(harness: str) -> str:
+    return f"{sys.executable} {Path(__file__).resolve()} approve --harness {harness}"
+
+
+def start(harness: str, dry_run: bool = False) -> dict[str, str]:
     if os.environ.get("PAIRCLI_ONBOARDING_DISABLE") == "1":
         return {"status": "disabled"}
+    if harness not in SUPPORTED_HARNESSES:
+        return {"status": "unsupported", "harness": harness}
     home = onboarding_home()
     binary = binary_path(home)
+    previous = read_status(home)
     if dry_run:
         return {
             "status": "planned",
             "binary": str(binary),
-            "command": f"{sys.executable} {Path(__file__).resolve()} run",
+            "command": f"{sys.executable} {Path(__file__).resolve()} run --harness {harness}",
         }
+    if not has_consent(home, harness):
+        write_status(home, "consent_required", harness=harness)
+        return {"status": "consent_required", "harness": harness, "command": approval_command(harness)}
+    if previous.get("status") == "failed":
+        return {"status": "failed", "error": previous.get("error", "unknown error"), "log": previous.get("log", "")}
+    if previous.get("status") == "complete" and binary.is_file() and os.access(binary, os.X_OK) and has_active_login():
+        return {"status": "complete", "binary": str(binary), "log": str(previous.get("log", ""))}
     if not acquire_lock(home):
         return {"status": "running", "log": str(read_status(home).get("log", ""))}
     log = log_file(home)
     write_status(home, "running", log=str(log))
     try:
         subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "run", "--log", str(log)],
+            [sys.executable, str(Path(__file__).resolve()), "run", "--log", str(log), "--harness", harness],
             cwd=str(home), env=clean_environment(), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
@@ -355,23 +479,63 @@ def start(dry_run: bool = False) -> dict[str, str]:
     return {"status": "started", "log": str(log)}
 
 
-def run(log: Path) -> int:
+def approve(harness: str) -> dict[str, str]:
+    if harness not in SUPPORTED_HARNESSES:
+        return {"status": "unsupported", "harness": harness}
     home = onboarding_home()
+    grant_consent(home, harness)
+    if read_status(home).get("status") == "failed":
+        try:
+            status_path(home).unlink()
+        except FileNotFoundError:
+            pass
+    return start(harness)
+
+
+def uninstall(harness: str) -> dict[str, str]:
+    if harness not in SUPPORTED_HARNESSES:
+        return {"status": "unsupported", "harness": harness}
+    home = onboarding_home()
+    binary = binary_path(home)
+    log = log_file(home)
+    try:
+        with log.open("a", encoding="utf-8") as output:
+            if binary.is_file() and os.access(binary, os.X_OK):
+                run_command([str(binary), "hook", "uninstall", harness], cwd=home, log=output)
+                run_command([str(binary), "logout"], cwd=home, log=output)
+        for path in (binary, release_metadata_path(home), consent_path(home), lock_path(home)):
+            path.unlink(missing_ok=True)
+        auth_file().unlink(missing_ok=True)
+        source = source_path(home)
+        if source.exists():
+            shutil.rmtree(source)
+        write_status(home, "uninstalled", harness=harness, log=str(log))
+        return {"status": "uninstalled", "log": str(log)}
+    except Exception as error:
+        write_status(home, "failed", error=str(error), log=str(log))
+        return {"status": "failed", "error": str(error), "log": str(log)}
+
+
+def run(log: Path, harness: str) -> int:
+    home = onboarding_home()
+    if not has_consent(home, harness):
+        write_status(home, "consent_required", harness=harness)
+        return 1
     try:
         with log.open("a", encoding="utf-8") as output:
             output.write("paircli plugin onboarding started\n")
             binary = ensure_paircli(home, output)
             try:
-                run_command([str(binary), "update", "--quiet"], cwd=home, log=output)
+                run_command([str(binary), "update", "--quiet", "--plugin-version", PLUGIN_VERSION], cwd=home, log=output)
             except RuntimeError as error:
                 output.write(f"paircli update skipped: {error}\n")
-            run_command([str(binary), "hook", "install"], cwd=home, log=output)
+            run_command([str(binary), "hook", "install", harness], cwd=home, log=output)
             if has_active_login():
                 write_status(home, "complete", binary=str(binary), log=str(log))
                 output.write("paircli is already logged in\n")
                 return 0
             output.write("opening paircli device login\n")
-            run_command([str(binary), "login"], cwd=home, log=output)
+            run_command([str(binary), "login"], cwd=home, log=output, timeout=LOGIN_TIMEOUT_SECONDS)
             if not has_active_login():
                 raise RuntimeError("login completed without a usable credential")
             write_status(home, "complete", binary=str(binary), log=str(log))
@@ -388,17 +552,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     subcommands = parser.add_subparsers(dest="command", required=True)
     start_parser = subcommands.add_parser("start")
     start_parser.add_argument("--dry-run", action="store_true")
+    start_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
+    approve_parser = subcommands.add_parser("approve")
+    approve_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
+    uninstall_parser = subcommands.add_parser("uninstall")
+    uninstall_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
     run_parser = subcommands.add_parser("run")
     run_parser.add_argument("--log", required=True)
+    run_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = parse_args(argv or sys.argv[1:])
     if arguments.command == "start":
-        print(json.dumps(start(arguments.dry_run)))
+        print(json.dumps(start(arguments.harness, arguments.dry_run)))
         return 0
-    return run(Path(arguments.log))
+    if arguments.command == "approve":
+        print(json.dumps(approve(arguments.harness)))
+        return 0
+    if arguments.command == "uninstall":
+        print(json.dumps(uninstall(arguments.harness)))
+        return 0
+    return run(Path(arguments.log), arguments.harness)
 
 
 if __name__ == "__main__":

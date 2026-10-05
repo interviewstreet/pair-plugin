@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import shutil
@@ -82,12 +84,45 @@ def test_accepts_codex_string_tool_response(tmp_path):
     assert out["plan"]["key"] == "five-sh__awt__12"
 
 
+def test_ignores_ambiguous_pr_urls(tmp_path):
+    out = run(event("gh pr create --fill", f"{URL}\nhttps://github.com/Five-SH/awt/pull/13\n"), tmp=tmp_path)
+    assert out is None
+
+
+def test_debug_event_redacts_command_and_response(tmp_path):
+    debug_log = tmp_path / "event.json"
+    out = run(
+        event("gh pr create --fill --body 'secret'", f"{URL}\n"),
+        {"PAIR_HOOK_EVENT_LOG": str(debug_log)},
+        tmp=tmp_path,
+    )
+
+    assert out is not None
+    payload = json.loads(debug_log.read_text())
+    assert payload["tool_name"] == "Bash"
+    assert payload["has_tool_response"] is True
+    assert "tool_input" not in payload
+    assert "tool_response" not in payload
+
+
 def test_codex_starts_onboarding_without_claude_review(tmp_path):
     out = run(event("gh pr create --fill", f"{URL}\n"),
               {"PLUGIN_ROOT": "/plugins/pair"}, tmp=tmp_path)
     assert "plan" not in out
     assert out["onboarding"]["status"] == "planned"
-    assert "onboarding is planned" in out["systemMessage"]
+    assert "Pair setup status: planned" in out["systemMessage"]
+
+
+def test_live_hook_requires_consent_before_any_setup(tmp_path):
+    out = run(
+        event("gh pr create --fill", f"{URL}\n"),
+        {"PAIR_HOOK_DRY_RUN": "0", "PAIRCLI_PLUGIN_HOME": str(tmp_path / "plugin")},
+        tmp=tmp_path,
+    )
+
+    assert "Pair setup needs your approval" in out["systemMessage"]
+    assert "approve --harness claude-code" in out["systemMessage"]
+    assert not (tmp_path / "plugin" / "bin" / "paircli").exists()
 
 
 def test_launch_detaches_with_clean_env(tmp_path):

@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from paircli_onboarding import start as start_paircli_onboarding
+from paircli_onboarding import approval_command, start as start_paircli_onboarding
 
 GH_PR_CREATE = re.compile(r"(?:^|[\s;&|(/])gh\s+pr\s+create\b")
 PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([\w.-]+)/pull/(\d+)")
@@ -31,9 +31,17 @@ def base_url() -> str:
     host, port = "127.0.0.1", 7788
     cfg = Path(os.environ.get("PAIR_CONFIG") or Path.home() / ".config/pair/config.toml")
     try:
-        import tomllib
-        data = tomllib.loads(cfg.read_text())
-        host, port = data.get("host", host), int(data.get("port", port))
+        contents = cfg.read_text()
+        try:
+            import tomllib
+        except ImportError:
+            host_match = re.search(r'^host\s*=\s*"([^"]+)"\s*$', contents, re.MULTILINE)
+            port_match = re.search(r"^port\s*=\s*(\d+)\s*$", contents, re.MULTILINE)
+            host = host_match.group(1) if host_match else host
+            port = int(port_match.group(1)) if port_match else port
+        else:
+            data = tomllib.loads(contents)
+            host, port = data.get("host", host), int(data.get("port", port))
     except Exception:
         pass
     return f"http://{host}:{port}"
@@ -48,12 +56,34 @@ def pr_from_event(event: dict) -> tuple[str, int] | None:
     response = event.get("tool_response")
     if isinstance(response, dict) and response.get("interrupted"):
         return None
-    payload = response if response is not None else event
-    urls = PR_URL.findall(json.dumps(payload))
-    if not urls:
+    if response is None:
         return None
-    owner, repo, n = urls[-1]
+    stdout = response.get("stdout", "") if isinstance(response, dict) else response
+    urls = PR_URL.findall(stdout) if isinstance(stdout, str) else []
+    if len(urls) != 1:
+        return None
+    owner, repo, n = urls[0]
     return f"{owner}/{repo}".lower(), int(n)
+
+
+def onboarding_message(onboarding: dict, harness: str) -> str:
+    status = onboarding.get("status", "unknown")
+    if status == "consent_required":
+        return (
+            "Pair setup needs your approval before it changes anything. It will download Pair CLI, install a hook "
+            f"only for {harness}, read local {harness} session data for Pair, and open browser login. "
+            "No PR artifact upload is enabled yet. Run: " + onboarding["command"]
+        )
+    if status == "failed":
+        log = onboarding.get("log") or "the Pair plugin data directory"
+        return f"Pair setup previously failed: {onboarding.get('error', 'unknown error')}. Log: {log}. Re-run setup: {approval_command(harness)}"
+    if status == "started":
+        return f"Pair setup started for {harness}; browser login may open shortly. Log: {onboarding.get('log', 'unavailable')}"
+    if status == "running":
+        return f"Pair setup is already running. Log: {onboarding.get('log', 'unavailable')}"
+    if status == "complete":
+        return f"Pair CLI is ready for {harness}."
+    return f"Pair setup status: {status}."
 
 
 def write_debug_event(event: dict) -> None:
@@ -61,7 +91,13 @@ def write_debug_event(event: dict) -> None:
     if not destination:
         return
     try:
-        Path(destination).write_text(json.dumps(event, indent=2) + "\n")
+        safe_event = {
+            key: event.get(key)
+            for key in ("session_id", "hook_event_name", "tool_name", "tool_use_id")
+            if event.get(key) is not None
+        }
+        safe_event["has_tool_response"] = event.get("tool_response") is not None
+        Path(destination).write_text(json.dumps(safe_event, indent=2) + "\n")
     except OSError:
         pass
 
@@ -102,11 +138,13 @@ def main() -> int:
     root = (os.environ.get("CLAUDE_PLUGIN_ROOT") or os.environ.get("PLUGIN_ROOT")
             or str(Path(__file__).resolve().parent.parent))
     dry_run = os.environ.get("PAIR_HOOK_DRY_RUN") == "1"
-    onboarding = start_paircli_onboarding(dry_run)
     is_codex = bool(os.environ.get("PLUGIN_ROOT"))
+    harness = "codex" if is_codex else "claude-code"
+    onboarding = start_paircli_onboarding(harness, dry_run)
+    message = onboarding_message(onboarding, harness)
 
     if is_codex:
-        message = f"pair: Pair CLI onboarding is {onboarding['status']}."
+        message += " Pair review artifact upload is not implemented for Codex yet."
         out = {"systemMessage": message,
                "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}}
         if dry_run:
@@ -114,12 +152,16 @@ def main() -> int:
         print(json.dumps(out))
         return 0
 
+    if onboarding.get("status") in {"consent_required", "failed", "unsupported"}:
+        print(json.dumps({"systemMessage": message}))
+        return 0
+
     try:
         plan = launch(pr[0], pr[1], root, dry_run)
     except OSError as e:
         print(json.dumps({"systemMessage": f"pair: couldn't start the review brief for {pr[0]}#{pr[1]}: {e}"}))
         return 0
-    out = {"systemMessage": f"pair: building the review brief for {pr[0]}#{pr[1]} at {plan['url']}",
+    out = {"systemMessage": f"{message} Building the review brief for {pr[0]}#{pr[1]} at {plan['url']}",
            "hookSpecificOutput": {"hookEventName": "PostToolUse",
                                   "additionalContext": f"A review brief for this PR is being built in the "
                                                        f"background. Review page: {plan['url']}"}}

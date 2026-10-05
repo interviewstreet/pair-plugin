@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import sys
+from email.message import Message
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -15,6 +16,17 @@ assert SPEC and SPEC.loader
 onboarding = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = onboarding
 SPEC.loader.exec_module(onboarding)
+
+
+class FakeResponse(BytesIO):
+    def __init__(self, payload: bytes, url: str, content_type: str = "application/json"):
+        super().__init__(payload)
+        self.url = url
+        self.headers = Message()
+        self.headers["Content-Type"] = content_type
+
+    def geturl(self) -> str:
+        return self.url
 
 
 def make_paircli(tmp_path: Path) -> Path:
@@ -38,10 +50,56 @@ def test_start_plans_a_background_bootstrap(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
     monkeypatch.delenv("PAIRCLI_ONBOARDING_DISABLE", raising=False)
 
-    plan = onboarding.start(dry_run=True)
+    plan = onboarding.start("codex", dry_run=True)
 
     assert plan["status"] == "planned"
     assert plan["binary"] == str(tmp_path / "bin" / "paircli")
+
+
+def test_start_requires_explicit_consent_before_downloading(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+
+    result = onboarding.start("codex")
+
+    assert result["status"] == "consent_required"
+    assert result["harness"] == "codex"
+    assert "approve --harness codex" in result["command"]
+    assert onboarding.read_status(tmp_path)["status"] == "consent_required"
+    assert not (tmp_path / "bin" / "paircli").exists()
+
+
+def test_start_skips_completed_active_onboarding(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    binary = onboarding.binary_path(tmp_path)
+    binary.parent.mkdir(parents=True)
+    binary.write_text("paircli")
+    binary.chmod(0o755)
+    onboarding.grant_consent(tmp_path, "codex")
+    onboarding.write_status(tmp_path, "complete", binary=str(binary), log="/tmp/onboarding.log")
+    monkeypatch.setattr(onboarding, "has_active_login", lambda: True)
+    monkeypatch.setattr(onboarding.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("unexpected onboarding restart"))
+
+    result = onboarding.start("codex")
+
+    assert result == {"status": "complete", "binary": str(binary), "log": "/tmp/onboarding.log"}
+
+
+def test_stale_lock_is_reclaimed(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    tmp_path.mkdir(exist_ok=True)
+    onboarding.lock_path(tmp_path).write_text('{"pid": -1, "created_at": "2000-01-01T00:00:00+00:00"}')
+
+    assert onboarding.acquire_lock(tmp_path)
+    onboarding.release_lock(tmp_path)
+
+
+def test_approval_retries_a_previous_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    onboarding.write_status(tmp_path, "failed", error="network unavailable")
+    monkeypatch.setattr(onboarding, "start", lambda harness: {"status": "started", "harness": harness})
+
+    assert onboarding.approve("codex") == {"status": "started", "harness": "codex"}
+    assert onboarding.read_status(tmp_path) == {}
 
 
 def test_uses_codex_plugin_data_and_active_profile(monkeypatch, tmp_path):
@@ -86,12 +144,12 @@ def test_ensure_paircli_downloads_and_verifies_release(monkeypatch, tmp_path):
             "artifacts": {"darwin-arm64": {"url": "https://cdn.example.test/paircli", "sha256": checksum}},
         }
     ).encode()
-    responses = iter((BytesIO(manifest), BytesIO(binary_contents)))
+    responses = iter((manifest, binary_contents))
 
     monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
     monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
-    monkeypatch.setattr(onboarding, "urlopen", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url))
 
     binary = onboarding.ensure_paircli(tmp_path, None)
 
@@ -111,16 +169,33 @@ def test_ensure_paircli_rejects_checksum_mismatch(monkeypatch, tmp_path):
             "artifacts": {"darwin-arm64": {"url": "https://cdn.example.test/paircli", "sha256": "0" * 64}},
         }
     ).encode()
-    responses = iter((BytesIO(manifest), BytesIO(b"unexpected-binary")))
+    responses = iter((manifest, b"unexpected-binary"))
 
     monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
     monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
-    monkeypatch.setattr(onboarding, "urlopen", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url))
 
     with pytest.raises(RuntimeError, match="checksum"):
         onboarding.ensure_paircli(tmp_path, None)
     assert not (tmp_path / "bin" / "paircli").exists()
+
+
+def test_ensure_paircli_rejects_manifest_redirect_or_html(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
+    monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
+    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(b"<html>", "https://www.example.test/"))
+
+    with pytest.raises(RuntimeError, match="different origin"):
+        onboarding.ensure_paircli(tmp_path, None)
+
+    monkeypatch.setattr(
+        onboarding,
+        "urlopen",
+        lambda request, **_kwargs: FakeResponse(b"<html>", request.full_url, content_type="text/html"),
+    )
+    with pytest.raises(RuntimeError, match="application/json"):
+        onboarding.ensure_paircli(tmp_path, None)
 
 
 def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
@@ -134,19 +209,36 @@ def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
             "artifacts": {"darwin-arm64": {"url": "https://cdn.example.test/paircli", "sha256": checksum}},
         }
     ).encode()
-    responses = iter((BytesIO(manifest), BytesIO(binary_contents)))
+    responses = iter((manifest, binary_contents))
     requested_urls = []
 
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
     monkeypatch.setattr(
         onboarding,
         "urlopen",
-        lambda request, **_kwargs: (requested_urls.append(request.full_url), next(responses))[1],
+        lambda request, **_kwargs: (
+            requested_urls.append(request.full_url), FakeResponse(next(responses), request.full_url)
+        )[1],
     )
 
     onboarding.ensure_paircli(tmp_path, None)
 
     assert requested_urls[0] == onboarding.DEFAULT_RELEASE_MANIFEST_URL
+
+
+def test_ensure_paircli_rejects_an_incompatible_plugin(monkeypatch, tmp_path):
+    manifest = json.dumps(
+        {
+            "version": "0.1.0",
+            "min_plugin_version": "99.0.0",
+            "artifacts": {"darwin-arm64": {"url": "https://cdn.example.test/paircli", "sha256": "0" * 64}},
+        }
+    ).encode()
+    monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
+    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(manifest, request.full_url))
+
+    with pytest.raises(RuntimeError, match="requires Pair plugin 99.0.0"):
+        onboarding.ensure_paircli(tmp_path, None)
 
 
 def test_run_installs_hooks_then_logs_in(monkeypatch, tmp_path):
@@ -158,12 +250,13 @@ def test_run_installs_hooks_then_logs_in(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
     monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
+    onboarding.grant_consent(tmp_path, "codex")
 
-    result = onboarding.run(log)
+    result = onboarding.run(log, "codex")
 
     assert result == 0
     assert onboarding.read_status(tmp_path)["status"] == "complete"
-    assert json.loads(calls.read_text()) == [["update", "--quiet"], ["hook", "install"], ["login"]]
+    assert json.loads(calls.read_text()) == [["update", "--quiet", "--plugin-version", "0.1.0"], ["hook", "install", "codex"], ["login"]]
 
 
 def test_run_skips_login_when_a_live_credential_exists(monkeypatch, tmp_path):
@@ -176,12 +269,13 @@ def test_run_skips_login_when_a_live_credential_exists(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
     monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
+    onboarding.grant_consent(tmp_path, "codex")
 
-    result = onboarding.run(log)
+    result = onboarding.run(log, "codex")
 
     assert result == 0
     assert onboarding.read_status(tmp_path)["status"] == "complete"
-    assert json.loads(calls.read_text()) == [["update", "--quiet"], ["hook", "install"]]
+    assert json.loads(calls.read_text()) == [["update", "--quiet", "--plugin-version", "0.1.0"], ["hook", "install", "codex"]]
 
 
 def test_run_continues_when_update_is_unavailable(monkeypatch, tmp_path):
@@ -194,18 +288,39 @@ def test_run_continues_when_update_is_unavailable(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
     monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
+    onboarding.grant_consent(tmp_path, "codex")
 
-    def failing_update(command, *, cwd, log):
-        if command[1:] == ["update", "--quiet"]:
+    def failing_update(command, *, cwd, log, timeout=onboarding.COMMAND_TIMEOUT_SECONDS):
+        if command[1:] == ["update", "--quiet", "--plugin-version", "0.1.0"]:
             raise RuntimeError("command exited 1: paircli update")
-        original_run_command(command, cwd=cwd, log=log)
+        original_run_command(command, cwd=cwd, log=log, timeout=timeout)
 
     monkeypatch.setattr(onboarding, "run_command", failing_update)
 
-    assert onboarding.run(log) == 0
+    assert onboarding.run(log, "codex") == 0
     assert onboarding.read_status(tmp_path)["status"] == "complete"
-    assert json.loads(calls.read_text()) == [["hook", "install"], ["login"]]
+    assert json.loads(calls.read_text()) == [["hook", "install", "codex"], ["login"]]
     assert "paircli update skipped" in log.read_text()
+
+
+def test_uninstall_removes_the_scoped_hook_and_local_state(monkeypatch, tmp_path):
+    binary = make_paircli(tmp_path)
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"access_token": "already-authorized"}))
+    calls = tmp_path / "calls.json"
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
+    monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
+    onboarding.grant_consent(tmp_path, "codex")
+    onboarding.write_release_metadata(tmp_path, version="0.1.0", target="darwin-arm64", checksum="0" * 64)
+
+    result = onboarding.uninstall("codex")
+
+    assert result["status"] == "uninstalled"
+    assert json.loads(calls.read_text()) == [["hook", "uninstall", "codex"], ["logout"]]
+    assert not binary.exists()
+    assert not auth.exists()
+    assert not onboarding.consent_path(tmp_path).exists()
 
 
 def test_accepts_paircli_rfc3339_expiry_on_macos_python(monkeypatch, tmp_path):
