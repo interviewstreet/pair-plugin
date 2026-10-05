@@ -3,19 +3,28 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 
 DEFAULT_REPOSITORY_URL = "https://github.com/rutvikchandla3/paircli"
+DEFAULT_RELEASE_MANIFEST_URL = "https://downloads.pair.sh/paircli/latest.json"
 COMMON_TOOL_DIRECTORIES = ("/opt/homebrew/bin", "/usr/local/bin")
+MAX_BINARY_SIZE_BYTES = 100 * 1024 * 1024
+RELEASE_MANIFEST_ENV = "PAIRCLI_RELEASE_MANIFEST_URL"
+DEVELOPMENT_BUILD_ENV = "PAIRCLI_DEV_BUILD"
 
 
 def plugin_data_home() -> Path | None:
@@ -38,6 +47,10 @@ def binary_path(home: Path) -> Path:
 
 def source_path(home: Path) -> Path:
     return home / "src"
+
+
+def release_metadata_path(home: Path) -> Path:
+    return home / "release.json"
 
 
 def auth_file() -> Path:
@@ -136,16 +149,115 @@ def executable_path(name: str) -> str | None:
     return shutil.which(name, path=clean_environment().get("PATH"))
 
 
+def platform_key() -> str:
+    """Return the release-manifest key for the current operating system and CPU."""
+    operating_system = platform.system().lower()
+    architecture = platform.machine().lower()
+    system_names = {"darwin": "darwin", "linux": "linux"}
+    architecture_names = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "amd64", "amd64": "amd64"}
+    if operating_system not in system_names or architecture not in architecture_names:
+        raise RuntimeError(f"paircli does not support {operating_system}/{architecture}")
+    return f"{system_names[operating_system]}-{architecture_names[architecture]}"
+
+
+def require_https_url(value: str, *, label: str) -> str:
+    """Validate release URLs before the plugin downloads executable content."""
+    parsed = urlparse(value)
+    is_local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
+    if parsed.scheme != "https" and not (is_local_http and os.environ.get("PAIRCLI_ALLOW_INSECURE_DOWNLOAD") == "1"):
+        raise RuntimeError(f"{label} must use HTTPS")
+    if not parsed.netloc:
+        raise RuntimeError(f"{label} is invalid")
+    return value
+
+
+def fetch_json(url: str) -> dict[str, Any]:
+    """Fetch a JSON release document from the configured CDN endpoint."""
+    request = Request(require_https_url(url, label="paircli release manifest URL"), headers={"User-Agent": "pair-plugin"})
+    try:
+        with urlopen(request, timeout=15) as response:
+            payload = response.read(MAX_BINARY_SIZE_BYTES)
+    except OSError as error:
+        raise RuntimeError(f"could not fetch paircli release manifest: {error}") from error
+    try:
+        document = json.loads(payload)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("paircli release manifest is not valid JSON") from error
+    if not isinstance(document, dict):
+        raise RuntimeError("paircli release manifest must be an object")
+    return document
+
+
+def release_artifact(manifest: dict[str, Any], target: str) -> tuple[str, str, str]:
+    """Extract and validate one platform-specific binary declaration from a manifest."""
+    version = manifest.get("version")
+    artifacts = manifest.get("artifacts")
+    artifact = artifacts.get(target) if isinstance(artifacts, dict) else None
+    if not isinstance(version, str) or not version:
+        raise RuntimeError("paircli release manifest is missing version")
+    if not isinstance(artifact, dict):
+        raise RuntimeError(f"paircli release {version} does not support {target}")
+    url = artifact.get("url")
+    checksum = artifact.get("sha256")
+    if not isinstance(url, str) or not url:
+        raise RuntimeError(f"paircli release {version} is missing a download URL for {target}")
+    if not isinstance(checksum, str) or len(checksum) != 64 or any(character not in "0123456789abcdef" for character in checksum.lower()):
+        raise RuntimeError(f"paircli release {version} has an invalid SHA-256 for {target}")
+    return version, require_https_url(url, label="paircli binary URL"), checksum.lower()
+
+
+def read_release_metadata(home: Path) -> dict[str, str]:
+    try:
+        value = json.loads(release_metadata_path(home).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {key: item for key, item in value.items() if isinstance(key, str) and isinstance(item, str)}
+
+
+def write_release_metadata(home: Path, *, version: str, target: str, checksum: str) -> None:
+    release_metadata_path(home).write_text(
+        json.dumps({"version": version, "platform": target, "sha256": checksum}, indent=2) + "\n"
+    )
+
+
+def download_binary(url: str, destination: Path, checksum: str) -> None:
+    """Download, verify, and atomically install a paircli executable."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="paircli-", dir=str(destination.parent))
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            request = Request(url, headers={"User-Agent": "pair-plugin"})
+            with urlopen(request, timeout=30) as response:
+                while chunk := response.read(64 * 1024):
+                    total += len(chunk)
+                    if total > MAX_BINARY_SIZE_BYTES:
+                        raise RuntimeError("paircli binary exceeds the maximum download size")
+                    digest.update(chunk)
+                    output.write(chunk)
+        if digest.hexdigest() != checksum:
+            raise RuntimeError("paircli binary checksum verification failed")
+        temporary.chmod(0o755)
+        temporary.replace(destination)
+    except OSError as error:
+        raise RuntimeError(f"could not download paircli binary: {error}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def run_command(command: list[str], *, cwd: Path, log) -> None:
     completed = subprocess.run(command, cwd=str(cwd), env=clean_environment(), stdout=log, stderr=subprocess.STDOUT)
     if completed.returncode != 0:
         raise RuntimeError(f"command exited {completed.returncode}: {' '.join(command)}")
 
 
-def ensure_paircli(home: Path, log) -> Path:
+def build_paircli_from_source(home: Path, log) -> Path:
+    """Build paircli from a checkout for explicit local-development use only."""
     binary = binary_path(home)
-    if binary.is_file() and os.access(binary, os.X_OK):
-        return binary
     git = executable_path("git")
     if git is None:
         raise RuntimeError("git is required to install paircli")
@@ -165,6 +277,29 @@ def ensure_paircli(home: Path, log) -> Path:
         )
     binary.parent.mkdir(parents=True, exist_ok=True)
     run_command([go, "build", "-o", str(binary), "./cmd/paircli"], cwd=source, log=log)
+    return binary
+
+
+def ensure_paircli(home: Path, log) -> Path:
+    """Install the current platform binary from the release manifest, or build only in dev mode."""
+    if os.environ.get(DEVELOPMENT_BUILD_ENV) == "1":
+        return build_paircli_from_source(home, log)
+
+    manifest_url = os.environ.get(RELEASE_MANIFEST_ENV, DEFAULT_RELEASE_MANIFEST_URL)
+    target = platform_key()
+    version, url, checksum = release_artifact(fetch_json(manifest_url), target)
+    binary = binary_path(home)
+    installed = read_release_metadata(home)
+    if (
+        binary.is_file()
+        and os.access(binary, os.X_OK)
+        and installed == {"version": version, "platform": target, "sha256": checksum}
+    ):
+        return binary
+    output = log if log is not None else sys.stderr
+    output.write(f"downloading paircli {version} for {target}\n")
+    download_binary(url, binary, checksum)
+    write_release_metadata(home, version=version, target=target, checksum=checksum)
     return binary
 
 
@@ -197,8 +332,6 @@ def start(dry_run: bool = False) -> dict[str, str]:
         return {"status": "disabled"}
     home = onboarding_home()
     binary = binary_path(home)
-    if has_active_login() and binary.is_file() and os.access(binary, os.X_OK):
-        return {"status": "complete", "binary": str(binary)}
     if dry_run:
         return {
             "status": "planned",
@@ -228,6 +361,10 @@ def run(log: Path) -> int:
         with log.open("a", encoding="utf-8") as output:
             output.write("paircli plugin onboarding started\n")
             binary = ensure_paircli(home, output)
+            try:
+                run_command([str(binary), "update", "--quiet"], cwd=home, log=output)
+            except RuntimeError as error:
+                output.write(f"paircli update skipped: {error}\n")
             run_command([str(binary), "hook", "install"], cwd=home, log=output)
             if has_active_login():
                 write_status(home, "complete", binary=str(binary), log=str(log))
