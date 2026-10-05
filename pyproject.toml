@@ -28,4 +28,3 @@ packages = ["src/pair"]
 testpaths = ["tests"]
 markers = ["local: reads the real session stores in ~/.claude and ~/.codex, and calls gh or the Claude API"]
 addopts = "-m 'not local'"
-filterwarnings = ["ignore::claude_agent_sdk.types.CanUseToolShadowedWarning"]

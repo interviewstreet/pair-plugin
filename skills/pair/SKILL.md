@@ -1,7 +1,7 @@
 ---
 name: pair
 description: Build a review brief for a GitHub PR from the Claude and Codex sessions that built it, and open a local review page with a pair agent.
-disable-model-invocation: true
+disable-model-invocation: false
 argument-hint: owner/repo#N
 effort: low
 model: sonnet

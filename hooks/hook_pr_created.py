@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+from paircli_onboarding import start as start_paircli_onboarding
+
 GH_PR_CREATE = re.compile(r"(?:^|[\s;&|(/])gh\s+pr\s+create\b")
 PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([\w.-]+)/pull/(\d+)")
 ALLOWED_TOOLS = ["Bash(pair-brief *)", "Read(~/.pair/briefs/**)", "Edit(~/.pair/briefs/**)",
@@ -43,14 +45,25 @@ def pr_from_event(event: dict) -> tuple[str, int] | None:
     command = (event.get("tool_input") or {}).get("command") or ""
     if not GH_PR_CREATE.search(command):
         return None
-    resp = event.get("tool_response") or {}
-    if not isinstance(resp, dict) or resp.get("interrupted"):
+    response = event.get("tool_response")
+    if isinstance(response, dict) and response.get("interrupted"):
         return None
-    urls = PR_URL.findall(str(resp.get("stdout") or ""))
+    payload = response if response is not None else event
+    urls = PR_URL.findall(json.dumps(payload))
     if not urls:
         return None
     owner, repo, n = urls[-1]
     return f"{owner}/{repo}".lower(), int(n)
+
+
+def write_debug_event(event: dict) -> None:
+    destination = os.environ.get("PAIR_HOOK_EVENT_LOG")
+    if not destination:
+        return
+    try:
+        Path(destination).write_text(json.dumps(event, indent=2) + "\n")
+    except OSError:
+        pass
 
 
 def launch(repo: str, n: int, plugin_root: str, dry_run: bool) -> dict:
@@ -81,11 +94,26 @@ def main() -> int:
         event = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         return 0
+    if isinstance(event, dict):
+        write_debug_event(event)
     pr = pr_from_event(event if isinstance(event, dict) else {})
     if pr is None:
         return 0
-    root = os.environ.get("CLAUDE_PLUGIN_ROOT") or str(Path(__file__).resolve().parent.parent)
+    root = (os.environ.get("CLAUDE_PLUGIN_ROOT") or os.environ.get("PLUGIN_ROOT")
+            or str(Path(__file__).resolve().parent.parent))
     dry_run = os.environ.get("PAIR_HOOK_DRY_RUN") == "1"
+    onboarding = start_paircli_onboarding(dry_run)
+    is_codex = bool(os.environ.get("PLUGIN_ROOT"))
+
+    if is_codex:
+        message = f"pair: Pair CLI onboarding is {onboarding['status']}."
+        out = {"systemMessage": message,
+               "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}}
+        if dry_run:
+            out["onboarding"] = onboarding
+        print(json.dumps(out))
+        return 0
+
     try:
         plan = launch(pr[0], pr[1], root, dry_run)
     except OSError as e:
@@ -97,6 +125,7 @@ def main() -> int:
                                                        f"background. Review page: {plan['url']}"}}
     if dry_run:
         out["plan"] = plan
+        out["onboarding"] = onboarding
     print(json.dumps(out))
     return 0
 

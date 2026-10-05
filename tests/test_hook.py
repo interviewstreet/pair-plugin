@@ -25,7 +25,11 @@ def run(ev, env_extra: dict | None = None, python: str = sys.executable, tmp: Pa
     env.update(PAIR_HOOK_DRY_RUN="1", CLAUDE_PLUGIN_ROOT="/plugins/pair")
     if tmp:
         env.update(PAIR_HOME=str(tmp / "pair-home"), PAIR_CONFIG=str(tmp / "none.toml"))
-    env.update(env_extra or {})
+    for key, value in (env_extra or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     p = subprocess.run([python, str(HOOK)], input=ev if isinstance(ev, str) else json.dumps(ev), text=True,
                        capture_output=True, env=env, timeout=10)
     assert p.returncode == 0, p.stderr
@@ -45,6 +49,7 @@ def test_pr_create_starts_pair(python, tmp_path):
     assert plan["url"] == "http://127.0.0.1:7788/review/?key=five-sh__awt__12"
     assert "five-sh/awt#12" in out["systemMessage"]
     assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+    assert out["onboarding"]["status"] == "planned"
 
 
 @pytest.mark.parametrize("ev", [
@@ -71,6 +76,20 @@ def test_config_port(tmp_path):
     assert out["plan"]["url"].startswith("http://127.0.0.1:7900/review/")
 
 
+def test_accepts_codex_string_tool_response(tmp_path):
+    out = run({"tool_name": "Bash", "tool_input": {"command": "gh pr create --fill"},
+               "tool_response": URL}, tmp=tmp_path)
+    assert out["plan"]["key"] == "five-sh__awt__12"
+
+
+def test_codex_starts_onboarding_without_claude_review(tmp_path):
+    out = run(event("gh pr create --fill", f"{URL}\n"),
+              {"PLUGIN_ROOT": "/plugins/pair"}, tmp=tmp_path)
+    assert "plan" not in out
+    assert out["onboarding"]["status"] == "planned"
+    assert "onboarding is planned" in out["systemMessage"]
+
+
 def test_launch_detaches_with_clean_env(tmp_path):
     """Real launch path, with a fake `claude` on PATH that records how it was called."""
     bin_dir = tmp_path / "bin"
@@ -81,7 +100,8 @@ def test_launch_detaches_with_clean_env(tmp_path):
                     f"json.dump({{'argv': sys.argv[1:], 'cwd': os.getcwd(), 'env': dict(os.environ)}}, "
                     f"open({str(record)!r}, 'w'))\n")
     fake.chmod(0o755)
-    env = {"PAIR_HOOK_DRY_RUN": "0", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    env = {"PAIR_HOOK_DRY_RUN": "0", "PAIRCLI_ONBOARDING_DISABLE": "1",
+           "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
            "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}
     out = run(event("gh pr create --fill", f"{URL}\n"), env, tmp=tmp_path)
     assert "plan" not in out and "being built" in out["hookSpecificOutput"]["additionalContext"]
