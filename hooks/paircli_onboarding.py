@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+from paircli_summary import write_summary
 
 
 DEFAULT_REPOSITORY_URL = "https://github.com/rutvikchandla3/paircli"
@@ -36,6 +39,7 @@ SUPPORTED_HARNESSES = {"claude-code", "codex", "pi"}
 COMMAND_TIMEOUT_SECONDS = 120
 LOGIN_TIMEOUT_SECONDS = 16 * 60
 SCAN_TIMEOUT_SECONDS = 16 * 60
+METADATA_TIMEOUT_SECONDS = 20
 LOCK_STALE_AFTER_SECONDS = 30 * 60
 CONSENT_VERSION = "1"
 PLUGIN_VERSION = "0.1.0"
@@ -512,7 +516,7 @@ def take_pending_scan(home: Path) -> dict[str, str] | None:
     return {"pr_url": pr_url, "repo_dir": repo_dir}
 
 
-def launch_pending_scan(home: Path, binary: Path) -> dict[str, str] | None:
+def launch_pending_scan(home: Path, binary: Path, harness: str) -> dict[str, str] | None:
     """Start a local snapshot scan without blocking the agent hook."""
     request = take_pending_scan(home)
     if request is None:
@@ -535,6 +539,8 @@ def launch_pending_scan(home: Path, binary: Path) -> dict[str, str] | None:
                 request["pr_url"],
                 "--repo-dir",
                 str(repo_dir),
+                "--harness",
+                harness,
             ],
             cwd=str(home),
             env=clean_environment(),
@@ -576,7 +582,7 @@ def start(harness: str, dry_run: bool = False, pr_url: str | None = None, repo_d
         return {"status": "failed", "error": previous.get("error", "unknown error"), "log": previous.get("log", "")}
     if previous.get("status") == "complete" and binary.is_file() and os.access(binary, os.X_OK) and has_active_login():
         result: dict[str, Any] = {"status": "complete", "binary": str(binary), "log": str(previous.get("log", ""))}
-        if scan := launch_pending_scan(home, binary):
+        if scan := launch_pending_scan(home, binary, harness):
             result["scan"] = scan
         return result
     if not acquire_lock(home):
@@ -649,14 +655,14 @@ def run(log: Path, harness: str) -> int:
             if has_active_login():
                 write_status(home, "complete", binary=str(binary), log=str(log))
                 output.write("paircli is already logged in\n")
-                launch_pending_scan(home, binary)
+                launch_pending_scan(home, binary, harness)
                 return 0
             output.write("opening paircli device login\n")
             run_command([str(binary), "login"], cwd=home, log=output, timeout=LOGIN_TIMEOUT_SECONDS)
             if not has_active_login():
                 raise RuntimeError("login completed without a usable credential")
             write_status(home, "complete", binary=str(binary), log=str(log))
-            launch_pending_scan(home, binary)
+            launch_pending_scan(home, binary, harness)
             return 0
     except Exception as error:
         write_status(home, "failed", error=str(error), log=str(log))
@@ -665,12 +671,38 @@ def run(log: Path, harness: str) -> int:
         release_lock(home)
 
 
-def scan(log: Path, pr_url: str, repo_dir: Path) -> int:
-    """Generate local scan artifacts for a PR without posting or uploading them."""
+def artifact_directory(pr_url: str, repo_dir: Path) -> Path:
+    """Resolve the PR head so CLI and plugin write to the same output folder."""
+    match = re.fullmatch(r"https://github\.com/[A-Za-z0-9-]+/[\w.-]+/pull/(\d+)", pr_url)
+    if match is None:
+        raise RuntimeError(f"invalid GitHub PR URL: {pr_url}")
+    commands = (
+        ["git", "rev-parse", "--show-toplevel"],
+        ["gh", "pr", "view", pr_url, "--json", "commits", "--jq", ".commits[-1].oid"],
+    )
+    results = []
+    for command in commands:
+        completed = subprocess.run(
+            command, cwd=repo_dir, env=clean_environment(), text=True,
+            capture_output=True, timeout=METADATA_TIMEOUT_SECONDS, check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"could not resolve PR artifact folder: {' '.join(command)}: {completed.stderr.strip()}")
+        results.append(completed.stdout.strip())
+    root, head_commit = results
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", head_commit):
+        raise RuntimeError("GitHub returned an invalid PR head commit")
+    return Path(root) / ".paircli" / f"pr-{match.group(1)}" / head_commit.lower()
+
+
+def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
+    """Generate CLI evidence, then have the triggering agent write summary.md."""
     home = onboarding_home()
     binary = binary_path(home)
+    artifact_dir = None
     try:
         with log.open("a", encoding="utf-8") as output:
+            artifact_dir = artifact_directory(pr_url, repo_dir)
             try:
                 run_command(
                     [str(binary), "update", "--quiet", "--plugin-version", PLUGIN_VERSION],
@@ -679,12 +711,20 @@ def scan(log: Path, pr_url: str, repo_dir: Path) -> int:
                 )
             except RuntimeError as error:
                 output.write(f"paircli update skipped: {error}\n")
-            output.write(f"generating local Pair artifacts for {pr_url}\n")
-            run_command([str(binary), "scan", pr_url, "--snapshot"], cwd=repo_dir, log=output, timeout=SCAN_TIMEOUT_SECONDS)
-        write_scan_status(home, "complete", log=str(log), pr_url=pr_url)
+            output.write(f"generating local Pair scan artifacts for {pr_url}\n")
+            run_command(
+                [str(binary), "scan", pr_url, "--snapshot", "--out", str(artifact_dir)],
+                cwd=repo_dir, log=output, timeout=SCAN_TIMEOUT_SECONDS,
+            )
+            (artifact_dir / "summary.md").unlink(missing_ok=True)
+            output.write(f"generating AI summary.md with {harness}\n")
+            summary = write_summary(harness, pr_url, repo_dir, artifact_dir, output)
+            output.write(f"wrote {summary}\n")
+        write_scan_status(home, "complete", log=str(log), pr_url=pr_url, summary=str(summary))
         return 0
     except Exception as error:
-        write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=pr_url)
+        write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=pr_url,
+                          artifacts=str(artifact_dir) if artifact_dir else "")
         return 1
 
 
@@ -705,6 +745,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     scan_parser.add_argument("--log", required=True)
     scan_parser.add_argument("--pr-url", required=True)
     scan_parser.add_argument("--repo-dir", required=True)
+    scan_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
     return parser.parse_args(argv)
 
 
@@ -721,7 +762,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if arguments.command == "run":
         return run(Path(arguments.log), arguments.harness)
-    return scan(Path(arguments.log), arguments.pr_url, Path(arguments.repo_dir))
+    return scan(Path(arguments.log), arguments.pr_url, Path(arguments.repo_dir), arguments.harness)
 
 
 if __name__ == "__main__":
