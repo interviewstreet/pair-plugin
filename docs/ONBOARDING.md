@@ -11,15 +11,22 @@ platform, installs a Pair hook for **only** the approved harness, and opens
 Pair device login if no valid credential exists. A later pull request checks
 for a verified CLI update and re-installs that same harness hook.
 
+The PR that requested approval is queued until setup finishes. Pair then runs
+`paircli scan <pr-url> --snapshot` in that repository. Later eligible
+`gh pr create` calls start the same scan in the background immediately. Scan
+artifacts stay local under `.paircli/pr-<number>/`, including `report.md`,
+`signals.json`, `comment.md`, `agent-trace.json`, and `snapshot.json`.
+
 Pair CLI reads local session data for an approved harness when it builds Pair
 review data. Device login contacts the Pair backend. The current Codex flow
-does not upload a PR artifact yet; its hook reports that limitation directly.
+does not post a PR comment or upload a PR artifact yet; its hook reports that
+limitation directly.
 
 ## Status and recovery
 
-The hook prints the current onboarding status and log path. A failed setup is
-reported on the next PR instead of silently retrying. The lock includes a PID
-and timestamp, and is reclaimed after its owner exits or after 30 minutes.
+The hook prints the current onboarding and scan status plus log paths. A failed
+setup is reported on the next PR instead of silently retrying. The lock includes
+a PID and timestamp, and is reclaimed after its owner exits or after 30 minutes.
 
 To retry a failed setup, run the approval command printed by the hook again.
 Enterprise users can point bootstrap at an approved HTTPS mirror or pinned

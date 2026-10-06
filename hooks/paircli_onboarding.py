@@ -28,6 +28,7 @@ DEVELOPMENT_BUILD_ENV = "PAIRCLI_DEV_BUILD"
 SUPPORTED_HARNESSES = {"claude-code", "codex", "pi"}
 COMMAND_TIMEOUT_SECONDS = 120
 LOGIN_TIMEOUT_SECONDS = 16 * 60
+SCAN_TIMEOUT_SECONDS = 16 * 60
 LOCK_STALE_AFTER_SECONDS = 30 * 60
 CONSENT_VERSION = "1"
 PLUGIN_VERSION = "0.1.0"
@@ -90,6 +91,14 @@ def lock_path(home: Path) -> Path:
     return home / "onboarding.lock"
 
 
+def pending_scan_path(home: Path) -> Path:
+    return home / "pending-scan.json"
+
+
+def scan_status_path(home: Path) -> Path:
+    return home / "scan.json"
+
+
 def read_status(home: Path) -> dict[str, Any]:
     try:
         value = json.loads(status_path(home).read_text())
@@ -104,6 +113,14 @@ def write_status(home: Path, status: str, **details: str) -> None:
     temporary = status_path(home).with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n")
     temporary.replace(status_path(home))
+
+
+def write_scan_status(home: Path, status: str, **details: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    payload = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat(), **details}
+    temporary = scan_status_path(home).with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary.replace(scan_status_path(home))
 
 
 def read_consent(home: Path) -> dict[str, str]:
@@ -437,11 +454,81 @@ def log_file(home: Path) -> Path:
     return directory / f"onboarding-{time.strftime('%Y%m%d-%H%M%S')}.log"
 
 
+def scan_log_file(home: Path) -> Path:
+    directory = home / "logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"scan-{time.strftime('%Y%m%d-%H%M%S')}.log"
+
+
+def queue_scan(home: Path, pr_url: str | None, repo_dir: str | None) -> None:
+    """Persist the PR scan requested by a hook until authentication is complete."""
+    if not pr_url or not repo_dir:
+        return
+    home.mkdir(parents=True, exist_ok=True)
+    temporary = pending_scan_path(home).with_suffix(".tmp")
+    temporary.write_text(json.dumps({"pr_url": pr_url, "repo_dir": repo_dir}, indent=2) + "\n")
+    temporary.replace(pending_scan_path(home))
+
+
+def take_pending_scan(home: Path) -> dict[str, str] | None:
+    """Consume one validated pending scan request, if present."""
+    try:
+        value = json.loads(pending_scan_path(home).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    pr_url, repo_dir = value.get("pr_url"), value.get("repo_dir")
+    if not isinstance(pr_url, str) or not isinstance(repo_dir, str) or not pr_url or not repo_dir:
+        return None
+    pending_scan_path(home).unlink(missing_ok=True)
+    return {"pr_url": pr_url, "repo_dir": repo_dir}
+
+
+def launch_pending_scan(home: Path, binary: Path) -> dict[str, str] | None:
+    """Start a local snapshot scan without blocking the agent hook."""
+    request = take_pending_scan(home)
+    if request is None:
+        return None
+    repo_dir = Path(request["repo_dir"]).expanduser()
+    log = scan_log_file(home)
+    if not repo_dir.is_dir():
+        message = f"scan repository does not exist: {repo_dir}"
+        write_scan_status(home, "failed", error=message, log=str(log), pr_url=request["pr_url"])
+        return {"status": "failed", "error": message, "log": str(log)}
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "scan",
+                "--log",
+                str(log),
+                "--pr-url",
+                request["pr_url"],
+                "--repo-dir",
+                str(repo_dir),
+            ],
+            cwd=str(home),
+            env=clean_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        queue_scan(home, request["pr_url"], str(repo_dir))
+        write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=request["pr_url"])
+        return {"status": "failed", "error": str(error), "log": str(log)}
+    write_scan_status(home, "running", log=str(log), pr_url=request["pr_url"])
+    return {"status": "started", "log": str(log), "pr_url": request["pr_url"]}
+
+
 def approval_command(harness: str) -> str:
     return f"{sys.executable} {Path(__file__).resolve()} approve --harness {harness}"
 
 
-def start(harness: str, dry_run: bool = False) -> dict[str, str]:
+def start(harness: str, dry_run: bool = False, pr_url: str | None = None, repo_dir: str | None = None) -> dict[str, Any]:
     if os.environ.get("PAIRCLI_ONBOARDING_DISABLE") == "1":
         return {"status": "disabled"}
     if harness not in SUPPORTED_HARNESSES:
@@ -455,13 +542,17 @@ def start(harness: str, dry_run: bool = False) -> dict[str, str]:
             "binary": str(binary),
             "command": f"{sys.executable} {Path(__file__).resolve()} run --harness {harness}",
         }
+    queue_scan(home, pr_url, repo_dir)
     if not has_consent(home, harness):
         write_status(home, "consent_required", harness=harness)
         return {"status": "consent_required", "harness": harness, "command": approval_command(harness)}
     if previous.get("status") == "failed":
         return {"status": "failed", "error": previous.get("error", "unknown error"), "log": previous.get("log", "")}
     if previous.get("status") == "complete" and binary.is_file() and os.access(binary, os.X_OK) and has_active_login():
-        return {"status": "complete", "binary": str(binary), "log": str(previous.get("log", ""))}
+        result: dict[str, Any] = {"status": "complete", "binary": str(binary), "log": str(previous.get("log", ""))}
+        if scan := launch_pending_scan(home, binary):
+            result["scan"] = scan
+        return result
     if not acquire_lock(home):
         return {"status": "running", "log": str(read_status(home).get("log", ""))}
     log = log_file(home)
@@ -503,7 +594,7 @@ def uninstall(harness: str) -> dict[str, str]:
             if binary.is_file() and os.access(binary, os.X_OK):
                 run_command([str(binary), "hook", "uninstall", harness], cwd=home, log=output)
                 run_command([str(binary), "logout"], cwd=home, log=output)
-        for path in (binary, release_metadata_path(home), consent_path(home), lock_path(home)):
+        for path in (binary, release_metadata_path(home), consent_path(home), lock_path(home), pending_scan_path(home), scan_status_path(home)):
             path.unlink(missing_ok=True)
         auth_file().unlink(missing_ok=True)
         source = source_path(home)
@@ -533,18 +624,43 @@ def run(log: Path, harness: str) -> int:
             if has_active_login():
                 write_status(home, "complete", binary=str(binary), log=str(log))
                 output.write("paircli is already logged in\n")
+                launch_pending_scan(home, binary)
                 return 0
             output.write("opening paircli device login\n")
             run_command([str(binary), "login"], cwd=home, log=output, timeout=LOGIN_TIMEOUT_SECONDS)
             if not has_active_login():
                 raise RuntimeError("login completed without a usable credential")
             write_status(home, "complete", binary=str(binary), log=str(log))
+            launch_pending_scan(home, binary)
             return 0
     except Exception as error:
         write_status(home, "failed", error=str(error), log=str(log))
         return 1
     finally:
         release_lock(home)
+
+
+def scan(log: Path, pr_url: str, repo_dir: Path) -> int:
+    """Generate local scan artifacts for a PR without posting or uploading them."""
+    home = onboarding_home()
+    binary = binary_path(home)
+    try:
+        with log.open("a", encoding="utf-8") as output:
+            try:
+                run_command(
+                    [str(binary), "update", "--quiet", "--plugin-version", PLUGIN_VERSION],
+                    cwd=repo_dir,
+                    log=output,
+                )
+            except RuntimeError as error:
+                output.write(f"paircli update skipped: {error}\n")
+            output.write(f"generating local Pair artifacts for {pr_url}\n")
+            run_command([str(binary), "scan", pr_url, "--snapshot"], cwd=repo_dir, log=output, timeout=SCAN_TIMEOUT_SECONDS)
+        write_scan_status(home, "complete", log=str(log), pr_url=pr_url)
+        return 0
+    except Exception as error:
+        write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=pr_url)
+        return 1
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -560,6 +676,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_parser = subcommands.add_parser("run")
     run_parser.add_argument("--log", required=True)
     run_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
+    scan_parser = subcommands.add_parser("scan")
+    scan_parser.add_argument("--log", required=True)
+    scan_parser.add_argument("--pr-url", required=True)
+    scan_parser.add_argument("--repo-dir", required=True)
     return parser.parse_args(argv)
 
 
@@ -574,7 +694,9 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "uninstall":
         print(json.dumps(uninstall(arguments.harness)))
         return 0
-    return run(Path(arguments.log), arguments.harness)
+    if arguments.command == "run":
+        return run(Path(arguments.log), arguments.harness)
+    return scan(Path(arguments.log), arguments.pr_url, Path(arguments.repo_dir))
 
 
 if __name__ == "__main__":

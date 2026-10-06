@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks" / "hook_pr_created.py"
+HOOK_CONFIG = Path(__file__).resolve().parent.parent / "hooks" / "hooks.json"
 PYTHONS = [sys.executable] + (["/usr/bin/python3"] if Path("/usr/bin/python3").exists() else [])
 URL = "https://github.com/Five-SH/awt/pull/12"
 
@@ -54,6 +55,14 @@ def test_pr_create_starts_pair(python, tmp_path):
     assert out["onboarding"]["status"] == "planned"
 
 
+def test_hook_config_resolves_codex_and_claude_plugin_roots():
+    config = json.loads(HOOK_CONFIG.read_text())
+    command = config["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+
+    assert "PLUGIN_ROOT" in command
+    assert "CLAUDE_PLUGIN_ROOT" in command
+
+
 @pytest.mark.parametrize("ev", [
     event("gh pr view 12", f"{URL}\n"),
     event("echo 'gh pr create'", "gh pr create\n"),
@@ -84,6 +93,29 @@ def test_accepts_codex_string_tool_response(tmp_path):
     assert out["plan"]["key"] == "five-sh__awt__12"
 
 
+def test_codex_resolves_pr_when_hook_omits_tool_response(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nprint({URL!r})\n")
+    gh.chmod(0o755)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = run(
+        {
+            "cwd": str(tmp_path),
+            "tool_name": "Bash",
+            "tool_input": {"command": f"cd {repo} && gh pr create --draft --fill"},
+        },
+        {"PLUGIN_ROOT": "/plugins/pair", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        tmp=tmp_path,
+    )
+
+    assert out["onboarding"]["status"] == "planned"
+    assert "Pair setup status: planned" in out["systemMessage"]
+
+
 def test_ignores_ambiguous_pr_urls(tmp_path):
     out = run(event("gh pr create --fill", f"{URL}\nhttps://github.com/Five-SH/awt/pull/13\n"), tmp=tmp_path)
     assert out is None
@@ -111,8 +143,6 @@ def test_codex_starts_onboarding_without_claude_review(tmp_path):
     assert "plan" not in out
     assert out["onboarding"]["status"] == "planned"
     assert "Pair setup status: planned" in out["systemMessage"]
-
-
 def test_live_hook_requires_consent_before_any_setup(tmp_path):
     out = run(
         event("gh pr create --fill", f"{URL}\n"),

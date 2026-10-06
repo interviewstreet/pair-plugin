@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -47,7 +48,54 @@ def base_url() -> str:
     return f"http://{host}:{port}"
 
 
-def pr_from_event(event: dict) -> tuple[str, int] | None:
+def repo_directory_from_event(event: dict, command: str) -> Path:
+    """Resolve the directory in which the successful `gh pr create` ran."""
+    raw_cwd = event.get("cwd")
+    cwd = Path(raw_cwd).expanduser() if isinstance(raw_cwd, str) and raw_cwd else Path.cwd()
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return cwd
+
+    try:
+        gh_index = next(
+            index for index in range(len(tokens) - 2) if tokens[index:index + 3] == ["gh", "pr", "create"]
+        )
+    except StopIteration:
+        return cwd
+
+    for index in range(gh_index - 1, -1, -1):
+        if tokens[index] == "cd" and index + 1 < gh_index:
+            candidate = Path(tokens[index + 1]).expanduser()
+            return candidate if candidate.is_absolute() else cwd / candidate
+    return cwd
+
+
+def pr_from_current_branch(repo_dir: Path) -> tuple[str, int] | None:
+    """Resolve the just-created PR when Codex omits command stdout from a hook event."""
+    gh = shutil.which("gh")
+    if not gh or not repo_dir.is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            [gh, "pr", "view", "--json", "url", "--jq", ".url"],
+            cwd=repo_dir,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    urls = PR_URL.findall(result.stdout)
+    if result.returncode != 0 or len(urls) != 1:
+        return None
+    owner, repo, number = urls[0]
+    return f"{owner}/{repo}".lower(), int(number)
+
+
+def pr_from_event(event: dict, repo_dir: Path) -> tuple[str, int] | None:
     if event.get("tool_name") != "Bash":
         return None
     command = (event.get("tool_input") or {}).get("command") or ""
@@ -57,7 +105,7 @@ def pr_from_event(event: dict) -> tuple[str, int] | None:
     if isinstance(response, dict) and response.get("interrupted"):
         return None
     if response is None:
-        return None
+        return pr_from_current_branch(repo_dir)
     stdout = response.get("stdout", "") if isinstance(response, dict) else response
     urls = PR_URL.findall(stdout) if isinstance(stdout, str) else []
     if len(urls) != 1:
@@ -71,7 +119,7 @@ def onboarding_message(onboarding: dict, harness: str) -> str:
     if status == "consent_required":
         return (
             "Pair setup needs your approval before it changes anything. It will download Pair CLI, install a hook "
-            f"only for {harness}, read local {harness} session data for Pair, and open browser login. "
+            f"only for {harness}, read local {harness} session data for Pair, create local PR artifacts, and open browser login. "
             "No PR artifact upload is enabled yet. Run: " + onboarding["command"]
         )
     if status == "failed":
@@ -82,6 +130,11 @@ def onboarding_message(onboarding: dict, harness: str) -> str:
     if status == "running":
         return f"Pair setup is already running. Log: {onboarding.get('log', 'unavailable')}"
     if status == "complete":
+        scan = onboarding.get("scan")
+        if isinstance(scan, dict) and scan.get("status") == "started":
+            return f"Pair CLI is ready for {harness}. Generating local Pair artifacts; log: {scan.get('log', 'unavailable')}"
+        if isinstance(scan, dict) and scan.get("status") == "failed":
+            return f"Pair CLI is ready for {harness}, but local artifact generation failed: {scan.get('error', 'unknown error')}. Log: {scan.get('log', 'unavailable')}"
         return f"Pair CLI is ready for {harness}."
     return f"Pair setup status: {status}."
 
@@ -132,7 +185,10 @@ def main() -> int:
         return 0
     if isinstance(event, dict):
         write_debug_event(event)
-    pr = pr_from_event(event if isinstance(event, dict) else {})
+    event = event if isinstance(event, dict) else {}
+    command = (event.get("tool_input") or {}).get("command") or ""
+    repo_dir = repo_directory_from_event(event, command)
+    pr = pr_from_event(event, repo_dir)
     if pr is None:
         return 0
     root = (os.environ.get("CLAUDE_PLUGIN_ROOT") or os.environ.get("PLUGIN_ROOT")
@@ -140,7 +196,8 @@ def main() -> int:
     dry_run = os.environ.get("PAIR_HOOK_DRY_RUN") == "1"
     is_codex = bool(os.environ.get("PLUGIN_ROOT"))
     harness = "codex" if is_codex else "claude-code"
-    onboarding = start_paircli_onboarding(harness, dry_run)
+    pr_url = f"https://github.com/{pr[0]}/pull/{pr[1]}"
+    onboarding = start_paircli_onboarding(harness, dry_run, pr_url=pr_url, repo_dir=str(repo_dir))
     message = onboarding_message(onboarding, harness)
 
     if is_codex:

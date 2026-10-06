@@ -84,6 +84,62 @@ def test_start_skips_completed_active_onboarding(monkeypatch, tmp_path):
     assert result == {"status": "complete", "binary": str(binary), "log": "/tmp/onboarding.log"}
 
 
+def test_start_schedules_scan_for_completed_onboarding(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    binary = make_paircli(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    onboarding.grant_consent(tmp_path, "codex")
+    onboarding.write_status(tmp_path, "complete", binary=str(binary), log="/tmp/onboarding.log")
+    monkeypatch.setattr(onboarding, "has_active_login", lambda: True)
+    calls = []
+    monkeypatch.setattr(onboarding.subprocess, "Popen", lambda command, **kwargs: calls.append((command, kwargs)))
+
+    result = onboarding.start("codex", pr_url="https://github.com/acme/repo/pull/42", repo_dir=str(repo))
+
+    assert result["status"] == "complete"
+    assert result["scan"]["status"] == "started"
+    assert calls[0][0][2] == "scan"
+    assert "--pr-url" in calls[0][0] and "https://github.com/acme/repo/pull/42" in calls[0][0]
+
+
+def test_run_schedules_pending_scan_after_login(monkeypatch, tmp_path):
+    binary = make_paircli(tmp_path)
+    auth = tmp_path / "auth.json"
+    calls = tmp_path / "calls.json"
+    log = tmp_path / "onboarding.log"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
+    monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
+    monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
+    scheduled = []
+    monkeypatch.setattr(onboarding, "launch_pending_scan", lambda home, executable: scheduled.append((home, executable)))
+    onboarding.grant_consent(tmp_path, "codex")
+    onboarding.queue_scan(tmp_path, "https://github.com/acme/repo/pull/42", str(repo))
+
+    assert onboarding.run(log, "codex") == 0
+    assert scheduled == [(tmp_path, binary)]
+
+
+def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_path):
+    binary = make_paircli(tmp_path)
+    calls = tmp_path / "calls.json"
+    log = tmp_path / "scan.log"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
+
+    assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo) == 0
+    assert json.loads(calls.read_text()) == [
+        ["update", "--quiet", "--plugin-version", "0.1.0"],
+        ["scan", "https://github.com/acme/repo/pull/42", "--snapshot"],
+    ]
+    assert onboarding.scan_status_path(tmp_path).exists()
+
+
 def test_stale_lock_is_reclaimed(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
     tmp_path.mkdir(exist_ok=True)
