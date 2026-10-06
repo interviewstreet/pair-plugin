@@ -255,6 +255,38 @@ def test_ensure_paircli_rejects_manifest_redirect_or_html(monkeypatch, tmp_path)
         onboarding.ensure_paircli(tmp_path, None)
 
 
+def test_allows_github_release_asset_redirect():
+    response = FakeResponse(
+        b"{}",
+        "https://release-assets.githubusercontent.com/github-production-release-asset/example",
+    )
+
+    onboarding.verify_response_origin(
+        response,
+        "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json",
+        label="paircli release manifest",
+    )
+
+
+def test_accepts_octet_stream_only_for_github_release_assets():
+    response = FakeResponse(
+        b"{}",
+        "https://release-assets.githubusercontent.com/github-production-release-asset/example",
+        content_type="application/octet-stream",
+    )
+
+    onboarding.verify_json_response(
+        response,
+        "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json",
+    )
+
+    with pytest.raises(RuntimeError, match="application/json"):
+        onboarding.verify_json_response(
+            FakeResponse(b"{}", "https://mirror.example.test/latest.json", content_type="application/octet-stream"),
+            "https://mirror.example.test/latest.json",
+        )
+
+
 def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
     monkeypatch.delenv("PAIRCLI_RELEASE_MANIFEST_URL", raising=False)
     monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
@@ -281,6 +313,7 @@ def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
     onboarding.ensure_paircli(tmp_path, None)
 
     assert requested_urls[0] == onboarding.DEFAULT_RELEASE_MANIFEST_URL
+    assert requested_urls[0] == "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
 
 
 def test_ensure_paircli_rejects_an_incompatible_plugin(monkeypatch, tmp_path):

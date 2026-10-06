@@ -50,10 +50,14 @@ plugin data remains, delete the directory that contains `onboarding.json` and
 
 ## Release endpoint requirements
 
-The release endpoint must return `application/json` at:
+The release job publishes `latest.json` and each versioned binary as GitHub
+Release assets. Bootstrap and later CLI updates use:
 
-`https://downloads.pair.sh/paircli/latest.json`
+`https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json`
 
-It must not redirect to another origin. The manifest's binary URLs must use
-HTTPS and return the checksum declared in the manifest. A release is not ready
-until those public URLs are live and verified.
+GitHub may redirect that URL to its HTTPS release-asset hosts. Other
+cross-origin redirects are rejected. The manifest's binary URLs must use HTTPS
+and return the checksum declared in the manifest. GitHub labels release assets
+as `application/octet-stream`; Pair accepts that type only after this
+repository's expected GitHub redirect. A release is not ready until those
+GitHub Release assets are live and verified.

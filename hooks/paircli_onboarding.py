@@ -20,7 +20,14 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_REPOSITORY_URL = "https://github.com/rutvikchandla3/paircli"
-DEFAULT_RELEASE_MANIFEST_URL = "https://downloads.pair.sh/paircli/latest.json"
+DEFAULT_RELEASE_MANIFEST_URL = "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
+GITHUB_RELEASE_HOST = "github.com"
+GITHUB_RELEASE_PATH_PREFIX = "/rutvikchandla3/paircli/releases/"
+GITHUB_RELEASE_ASSET_HOSTS = {
+    "github-releases.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
 COMMON_TOOL_DIRECTORIES = ("/opt/homebrew/bin", "/usr/local/bin")
 MAX_BINARY_SIZE_BYTES = 100 * 1024 * 1024
 RELEASE_MANIFEST_ENV = "PAIRCLI_RELEASE_MANIFEST_URL"
@@ -226,25 +233,45 @@ def require_https_url(value: str, *, label: str) -> str:
     return value
 
 
-def verify_response_origin(response, requested_url: str, *, label: str) -> None:
-    """Reject redirects that leave the HTTPS origin selected by the manifest."""
+def is_github_release_asset_redirect(requested, final) -> bool:
+    """Return whether a redirect targets this repository's GitHub release assets."""
+    return (
+        requested.scheme == "https"
+        and final.scheme == "https"
+        and (requested.hostname or "").lower() == GITHUB_RELEASE_HOST
+        and requested.path.startswith(GITHUB_RELEASE_PATH_PREFIX)
+        and (final.hostname or "").lower() in GITHUB_RELEASE_ASSET_HOSTS
+    )
+
+
+def verify_response_origin(response, requested_url: str, *, label: str) -> tuple[Any, Any]:
+    """Allow only GitHub's expected release-asset redirects."""
     final_url = response.geturl() if hasattr(response, "geturl") else requested_url
     requested = urlparse(requested_url)
     final = urlparse(final_url)
-    if (final.scheme, final.netloc) != (requested.scheme, requested.netloc):
+    same_origin = (final.scheme, final.netloc) == (requested.scheme, requested.netloc)
+    if not same_origin and not is_github_release_asset_redirect(requested, final):
         raise RuntimeError(f"{label} redirected to a different origin")
+    return requested, final
+
+
+def is_accepted_manifest_content_type(content_type: str, requested, final) -> bool:
+    """Accept JSON, plus GitHub's unavoidable octet-stream release asset type."""
+    return content_type == "application/json" or (
+        content_type == "application/octet-stream" and is_github_release_asset_redirect(requested, final)
+    )
 
 
 def verify_json_response(response, requested_url: str) -> None:
-    verify_response_origin(response, requested_url, label="paircli release manifest")
+    requested, final = verify_response_origin(response, requested_url, label="paircli release manifest")
     headers = getattr(response, "headers", None)
     content_type = headers.get_content_type() if headers is not None and hasattr(headers, "get_content_type") else ""
-    if content_type != "application/json":
+    if not is_accepted_manifest_content_type(content_type, requested, final):
         raise RuntimeError(f"paircli release manifest expected application/json, got {content_type or 'unknown'}")
 
 
 def fetch_json(url: str) -> dict[str, Any]:
-    """Fetch a JSON release document from the configured CDN endpoint."""
+    """Fetch a JSON release document from the configured release endpoint."""
     request = Request(require_https_url(url, label="paircli release manifest URL"), headers={"User-Agent": "pair-plugin"})
     try:
         with urlopen(request, timeout=15) as response:
