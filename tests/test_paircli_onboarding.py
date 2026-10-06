@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 HOOKS_DIR = Path(__file__).resolve().parent.parent / "hooks"
+sys.path.insert(0, str(HOOKS_DIR))
 SPEC = importlib.util.spec_from_file_location("paircli_onboarding", HOOKS_DIR / "paircli_onboarding.py")
 assert SPEC and SPEC.loader
 onboarding = importlib.util.module_from_spec(SPEC)
@@ -116,12 +117,12 @@ def test_run_schedules_pending_scan_after_login(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
     monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
     scheduled = []
-    monkeypatch.setattr(onboarding, "launch_pending_scan", lambda home, executable: scheduled.append((home, executable)))
+    monkeypatch.setattr(onboarding, "launch_pending_scan", lambda home, executable, harness: scheduled.append((home, executable, harness)))
     onboarding.grant_consent(tmp_path, "codex")
     onboarding.queue_scan(tmp_path, "https://github.com/acme/repo/pull/42", str(repo))
 
     assert onboarding.run(log, "codex") == 0
-    assert scheduled == [(tmp_path, binary)]
+    assert scheduled == [(tmp_path, binary, "codex")]
 
 
 def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_path):
@@ -132,13 +133,62 @@ def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_
     repo.mkdir()
     monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
+    artifacts = repo / ".paircli" / "pr-42" / ("a" * 40)
+    artifacts.mkdir(parents=True)
+    monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
+    generated = []
+    monkeypatch.setattr(onboarding, "write_summary", lambda *args: generated.append(args) or artifacts / "summary.md")
 
-    assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo) == 0
+    assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 0
     assert json.loads(calls.read_text()) == [
         ["update", "--quiet", "--plugin-version", "0.1.0"],
-        ["scan", "https://github.com/acme/repo/pull/42", "--snapshot"],
+        ["scan", "https://github.com/acme/repo/pull/42", "--snapshot", "--out", str(artifacts)],
     ]
-    assert onboarding.scan_status_path(tmp_path).exists()
+    assert generated[0][:4] == ("codex", "https://github.com/acme/repo/pull/42", repo, artifacts)
+    assert json.loads(onboarding.scan_status_path(tmp_path).read_text())["summary"] == str(artifacts / "summary.md")
+
+
+def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch, tmp_path):
+    binary = make_paircli(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    artifacts = repo / ".paircli" / "pr-42" / ("b" * 40)
+    artifacts.mkdir(parents=True)
+    (artifacts / "summary.md").write_text("old CLI summary")
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    monkeypatch.setenv("PAIRCLI_CALLS", str(tmp_path / "calls.json"))
+    monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
+
+    def fail_summary(*_args):
+        raise RuntimeError("agent unavailable")
+
+    monkeypatch.setattr(onboarding, "write_summary", fail_summary)
+
+    assert onboarding.scan(tmp_path / "scan.log", "https://github.com/acme/repo/pull/42", repo, "codex") == 1
+    assert not (artifacts / "summary.md").exists()
+    status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
+    assert status["status"] == "failed"
+    assert status["error"] == "agent unavailable"
+    assert status["artifacts"] == str(artifacts)
+
+
+def test_artifact_directory_uses_pr_head_commit(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    commit = "c" * 40
+    replies = iter((str(tmp_path) + "\n", commit + "\n"))
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=next(replies), stderr="")
+
+    monkeypatch.setattr(onboarding.subprocess, "run", fake_run)
+
+    result = onboarding.artifact_directory("https://github.com/acme/repo/pull/42", tmp_path)
+
+    assert result == tmp_path / ".paircli" / "pr-42" / commit
+    assert calls[1][-2:] == ["--jq", ".commits[-1].oid"]
 
 
 def test_stale_lock_is_reclaimed(monkeypatch, tmp_path):

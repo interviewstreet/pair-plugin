@@ -12,9 +12,15 @@ for a verified CLI update and re-installs that same harness hook.
 
 The PR that requested approval is queued until setup finishes. Pair then runs
 `paircli scan <pr-url> --snapshot` in that repository. Later eligible
-`gh pr create` calls start the same scan in the background immediately. Scan
-artifacts stay local under `.paircli/pr-<number>/`, including `report.md`,
-`signals.json`, `comment.md`, `agent-trace.json`, and `snapshot.json`.
+`gh pr create` calls start the same scan in the background immediately. The
+plugin then runs the triggering Codex or Claude agent in read-only mode to
+write an AI-authored `summary.md` from the scan artifacts, PR diff, and linked
+session evidence. All files stay local under
+`.paircli/pr-<number>/<head-commit>/`, including `summary.md`, `report.md`,
+`signals.json`, `comment.md`, `agent-trace.json`, and `snapshot.json`. The
+summary covers the actual code change, a Mermaid flowchart, verification steps,
+risks, and supporting evidence. The plugin records the summary path or a failure
+reason in `scan.json` and the scan log.
 
 Pair CLI reads local session data for the configured harness when it builds Pair
 review data. Device login contacts the Pair backend. The current Codex flow
