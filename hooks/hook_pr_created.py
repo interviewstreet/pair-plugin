@@ -116,12 +116,6 @@ def pr_from_event(event: dict, repo_dir: Path) -> tuple[str, int] | None:
 
 def onboarding_message(onboarding: dict, harness: str) -> str:
     status = onboarding.get("status", "unknown")
-    if status == "consent_required":
-        return (
-            "Pair setup needs your approval before it changes anything. It will download Pair CLI, install a hook "
-            f"only for {harness}, read local {harness} session data for Pair, create local PR artifacts, and open browser login. "
-            "No PR artifact upload is enabled yet. Run: " + onboarding["command"]
-        )
     if status == "failed":
         log = onboarding.get("log") or "the Pair plugin data directory"
         return f"Pair setup previously failed: {onboarding.get('error', 'unknown error')}. Log: {log}. Re-run setup: {approval_command(harness)}"
@@ -204,12 +198,14 @@ def main() -> int:
         message += " Pair review artifact upload is not implemented for Codex yet."
         out = {"systemMessage": message,
                "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}}
+        if onboarding.get("status") == "failed":
+            out.update({"decision": "block", "reason": message, "continue": False})
         if dry_run:
             out["onboarding"] = onboarding
         print(json.dumps(out))
         return 0
 
-    if onboarding.get("status") in {"consent_required", "failed", "unsupported"}:
+    if onboarding.get("status") in {"failed", "unsupported"}:
         print(json.dumps({"systemMessage": message}))
         return 0
 

@@ -56,15 +56,16 @@ def test_start_plans_a_background_bootstrap(monkeypatch, tmp_path):
     assert plan["binary"] == str(tmp_path / "bin" / "paircli")
 
 
-def test_start_requires_explicit_consent_before_downloading(monkeypatch, tmp_path):
+def test_start_automatically_bootstraps_paircli(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(onboarding.subprocess, "Popen", lambda command, **kwargs: calls.append((command, kwargs)))
 
     result = onboarding.start("codex")
 
-    assert result["status"] == "consent_required"
-    assert result["harness"] == "codex"
-    assert "approve --harness codex" in result["command"]
-    assert onboarding.read_status(tmp_path)["status"] == "consent_required"
+    assert result["status"] == "started"
+    assert onboarding.has_consent(tmp_path, "codex")
+    assert calls[0][0][2:] == ["run", "--log", result["log"], "--harness", "codex"]
     assert not (tmp_path / "bin" / "paircli").exists()
 
 

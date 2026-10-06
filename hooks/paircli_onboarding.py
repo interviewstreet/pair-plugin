@@ -544,8 +544,7 @@ def start(harness: str, dry_run: bool = False, pr_url: str | None = None, repo_d
         }
     queue_scan(home, pr_url, repo_dir)
     if not has_consent(home, harness):
-        write_status(home, "consent_required", harness=harness)
-        return {"status": "consent_required", "harness": harness, "command": approval_command(harness)}
+        grant_consent(home, harness)
     if previous.get("status") == "failed":
         return {"status": "failed", "error": previous.get("error", "unknown error"), "log": previous.get("log", "")}
     if previous.get("status") == "complete" and binary.is_file() and os.access(binary, os.X_OK) and has_active_login():
@@ -610,8 +609,7 @@ def uninstall(harness: str) -> dict[str, str]:
 def run(log: Path, harness: str) -> int:
     home = onboarding_home()
     if not has_consent(home, harness):
-        write_status(home, "consent_required", harness=harness)
-        return 1
+        grant_consent(home, harness)
     try:
         with log.open("a", encoding="utf-8") as output:
             output.write("paircli plugin onboarding started\n")

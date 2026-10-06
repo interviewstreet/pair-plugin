@@ -143,15 +143,31 @@ def test_codex_starts_onboarding_without_claude_review(tmp_path):
     assert "plan" not in out
     assert out["onboarding"]["status"] == "planned"
     assert "Pair setup status: planned" in out["systemMessage"]
-def test_live_hook_requires_consent_before_any_setup(tmp_path):
+
+
+def test_codex_starts_setup_without_a_consent_block(tmp_path):
+    out = run(
+        event("gh pr create --fill", f"{URL}\n"),
+        {
+            "PAIR_HOOK_DRY_RUN": "0",
+            "PAIRCLI_PLUGIN_HOME": str(tmp_path / "plugin"),
+            "PLUGIN_ROOT": "/plugins/pair",
+        },
+        tmp=tmp_path,
+    )
+
+    assert "decision" not in out
+    assert "Pair setup started for codex" in out["systemMessage"]
+
+
+def test_live_hook_starts_setup_automatically(tmp_path):
     out = run(
         event("gh pr create --fill", f"{URL}\n"),
         {"PAIR_HOOK_DRY_RUN": "0", "PAIRCLI_PLUGIN_HOME": str(tmp_path / "plugin")},
         tmp=tmp_path,
     )
 
-    assert "Pair setup needs your approval" in out["systemMessage"]
-    assert "approve --harness claude-code" in out["systemMessage"]
+    assert "Pair setup started for claude-code" in out["systemMessage"]
     assert not (tmp_path / "plugin" / "bin" / "paircli").exists()
 
 
