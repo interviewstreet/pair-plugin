@@ -1,0 +1,23 @@
+{
+  "name": "pair",
+  "version": "0.1.0+codex.20261006195827",
+  "description": "Review pull requests with context from the coding-agent sessions that built them.",
+  "author": {
+    "name": "five-sh"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Pair",
+    "shortDescription": "Bring PR context into your coding-agent workflow.",
+    "longDescription": "Pair installs and configures Pair CLI after your first pull request so future coding-agent sessions can share PR context.",
+    "developerName": "five-sh",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Developer workflow",
+      "Local setup"
+    ],
+    "defaultPrompt": [
+      "Set up Pair for my pull-request workflow."
+    ]
+  }
+}

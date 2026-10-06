@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import shutil
@@ -9,6 +11,7 @@ from pathlib import Path
 import pytest
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks" / "hook_pr_created.py"
+HOOK_CONFIG = Path(__file__).resolve().parent.parent / "hooks" / "hooks.json"
 PYTHONS = [sys.executable] + (["/usr/bin/python3"] if Path("/usr/bin/python3").exists() else [])
 URL = "https://github.com/Five-SH/awt/pull/12"
 
@@ -25,7 +28,11 @@ def run(ev, env_extra: dict | None = None, python: str = sys.executable, tmp: Pa
     env.update(PAIR_HOOK_DRY_RUN="1", CLAUDE_PLUGIN_ROOT="/plugins/pair")
     if tmp:
         env.update(PAIR_HOME=str(tmp / "pair-home"), PAIR_CONFIG=str(tmp / "none.toml"))
-    env.update(env_extra or {})
+    for key, value in (env_extra or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     p = subprocess.run([python, str(HOOK)], input=ev if isinstance(ev, str) else json.dumps(ev), text=True,
                        capture_output=True, env=env, timeout=10)
     assert p.returncode == 0, p.stderr
@@ -45,6 +52,15 @@ def test_pr_create_starts_pair(python, tmp_path):
     assert plan["url"] == "http://127.0.0.1:7788/review/?key=five-sh__awt__12"
     assert "five-sh/awt#12" in out["systemMessage"]
     assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+    assert out["onboarding"]["status"] == "planned"
+
+
+def test_hook_config_resolves_codex_and_claude_plugin_roots():
+    config = json.loads(HOOK_CONFIG.read_text())
+    command = config["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+
+    assert "PLUGIN_ROOT" in command
+    assert "CLAUDE_PLUGIN_ROOT" in command
 
 
 @pytest.mark.parametrize("ev", [
@@ -71,6 +87,90 @@ def test_config_port(tmp_path):
     assert out["plan"]["url"].startswith("http://127.0.0.1:7900/review/")
 
 
+def test_accepts_codex_string_tool_response(tmp_path):
+    out = run({"tool_name": "Bash", "tool_input": {"command": "gh pr create --fill"},
+               "tool_response": URL}, tmp=tmp_path)
+    assert out["plan"]["key"] == "five-sh__awt__12"
+
+
+def test_codex_resolves_pr_when_hook_omits_tool_response(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nprint({URL!r})\n")
+    gh.chmod(0o755)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = run(
+        {
+            "cwd": str(tmp_path),
+            "tool_name": "Bash",
+            "tool_input": {"command": f"cd {repo} && gh pr create --draft --fill"},
+        },
+        {"PLUGIN_ROOT": "/plugins/pair", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        tmp=tmp_path,
+    )
+
+    assert out["onboarding"]["status"] == "planned"
+    assert "Pair setup status: planned" in out["systemMessage"]
+
+
+def test_ignores_ambiguous_pr_urls(tmp_path):
+    out = run(event("gh pr create --fill", f"{URL}\nhttps://github.com/Five-SH/awt/pull/13\n"), tmp=tmp_path)
+    assert out is None
+
+
+def test_debug_event_redacts_command_and_response(tmp_path):
+    debug_log = tmp_path / "event.json"
+    out = run(
+        event("gh pr create --fill --body 'secret'", f"{URL}\n"),
+        {"PAIR_HOOK_EVENT_LOG": str(debug_log)},
+        tmp=tmp_path,
+    )
+
+    assert out is not None
+    payload = json.loads(debug_log.read_text())
+    assert payload["tool_name"] == "Bash"
+    assert payload["has_tool_response"] is True
+    assert "tool_input" not in payload
+    assert "tool_response" not in payload
+
+
+def test_codex_starts_onboarding_without_claude_review(tmp_path):
+    out = run(event("gh pr create --fill", f"{URL}\n"),
+              {"PLUGIN_ROOT": "/plugins/pair"}, tmp=tmp_path)
+    assert "plan" not in out
+    assert out["onboarding"]["status"] == "planned"
+    assert "Pair setup status: planned" in out["systemMessage"]
+
+
+def test_codex_starts_setup_without_a_consent_block(tmp_path):
+    out = run(
+        event("gh pr create --fill", f"{URL}\n"),
+        {
+            "PAIR_HOOK_DRY_RUN": "0",
+            "PAIRCLI_PLUGIN_HOME": str(tmp_path / "plugin"),
+            "PLUGIN_ROOT": "/plugins/pair",
+        },
+        tmp=tmp_path,
+    )
+
+    assert "decision" not in out
+    assert "Pair setup started for codex" in out["systemMessage"]
+
+
+def test_live_hook_starts_setup_automatically(tmp_path):
+    out = run(
+        event("gh pr create --fill", f"{URL}\n"),
+        {"PAIR_HOOK_DRY_RUN": "0", "PAIRCLI_PLUGIN_HOME": str(tmp_path / "plugin")},
+        tmp=tmp_path,
+    )
+
+    assert "Pair setup started for claude-code" in out["systemMessage"]
+    assert not (tmp_path / "plugin" / "bin" / "paircli").exists()
+
+
 def test_launch_detaches_with_clean_env(tmp_path):
     """Real launch path, with a fake `claude` on PATH that records how it was called."""
     bin_dir = tmp_path / "bin"
@@ -81,7 +181,8 @@ def test_launch_detaches_with_clean_env(tmp_path):
                     f"json.dump({{'argv': sys.argv[1:], 'cwd': os.getcwd(), 'env': dict(os.environ)}}, "
                     f"open({str(record)!r}, 'w'))\n")
     fake.chmod(0o755)
-    env = {"PAIR_HOOK_DRY_RUN": "0", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    env = {"PAIR_HOOK_DRY_RUN": "0", "PAIRCLI_ONBOARDING_DISABLE": "1",
+           "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
            "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}
     out = run(event("gh pr create --fill", f"{URL}\n"), env, tmp=tmp_path)
     assert "plan" not in out and "being built" in out["hookSpecificOutput"]["additionalContext"]

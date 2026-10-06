@@ -1,14 +1,14 @@
 ---
 name: pair
 description: Build a review brief for a GitHub PR from the Claude and Codex sessions that built it, and open a local review page with a pair agent.
-disable-model-invocation: true
+disable-model-invocation: false
 argument-hint: owner/repo#N
 effort: low
 model: sonnet
 allowed-tools: Bash(pair-brief *) Read(~/.pair/briefs/**) Edit(~/.pair/briefs/**) Write(~/.pair/briefs/**)
 ---
 
-Build the review brief for `$ARGUMENTS`. Follow these steps exactly. Don't read transcripts, the diff, or the brief yourself, and don't write any brief text: the subagents write it from the evidence files.
+Run this skill only after the user explicitly asks to build a Pair review brief for a pull request. Build the review brief for `$ARGUMENTS`. Follow these steps exactly. Don't read transcripts, the diff, or the brief yourself, and don't write any brief text: the subagents write it from the evidence files.
 
 Your final message is shown to the user as the result, so it must be the review page URL and nothing else: no status line, no summary of what the subagents did. Their replies are for you only. Don't run any command other than `pair-brief`, and don't check the output files yourself.
 

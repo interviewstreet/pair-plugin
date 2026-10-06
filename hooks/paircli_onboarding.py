@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""Install and authenticate paircli after the first agent-created pull request."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+from paircli_summary import write_summary
+
+
+DEFAULT_REPOSITORY_URL = "https://github.com/rutvikchandla3/paircli"
+DEFAULT_RELEASE_MANIFEST_URL = "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
+GITHUB_RELEASE_HOST = "github.com"
+GITHUB_RELEASE_PATH_PREFIX = "/rutvikchandla3/paircli/releases/"
+GITHUB_RELEASE_ASSET_HOSTS = {
+    "github-releases.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
+COMMON_TOOL_DIRECTORIES = ("/opt/homebrew/bin", "/usr/local/bin")
+MAX_BINARY_SIZE_BYTES = 100 * 1024 * 1024
+RELEASE_MANIFEST_ENV = "PAIRCLI_RELEASE_MANIFEST_URL"
+DEVELOPMENT_BUILD_ENV = "PAIRCLI_DEV_BUILD"
+SUPPORTED_HARNESSES = {"claude-code", "codex", "pi"}
+COMMAND_TIMEOUT_SECONDS = 120
+LOGIN_TIMEOUT_SECONDS = 16 * 60
+SCAN_TIMEOUT_SECONDS = 16 * 60
+METADATA_TIMEOUT_SECONDS = 20
+LOCK_STALE_AFTER_SECONDS = 30 * 60
+CONSENT_VERSION = "1"
+PLUGIN_VERSION = "0.1.0"
+
+
+def plugin_data_home() -> Path | None:
+    configured = os.environ.get("PLUGIN_DATA")
+    return Path(configured).expanduser() if configured else None
+
+
+def onboarding_home() -> Path:
+    configured = os.environ.get("PAIRCLI_PLUGIN_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    if plugin_data := plugin_data_home():
+        return plugin_data / "paircli"
+    return Path.home() / ".paircli" / "plugin"
+
+
+def binary_path(home: Path) -> Path:
+    return home / "bin" / "paircli"
+
+
+def source_path(home: Path) -> Path:
+    return home / "src"
+
+
+def release_metadata_path(home: Path) -> Path:
+    return home / "release.json"
+
+
+def consent_path(home: Path) -> Path:
+    return home / "consent.json"
+
+
+def auth_file() -> Path:
+    configured = os.environ.get("PAIRCLI_AUTH_FILE")
+    return Path(configured).expanduser() if configured else onboarding_home().parent / "auth.json"
+
+
+def parse_expiry(value: str) -> datetime:
+    """Parse the RFC 3339 timestamp emitted by paircli on all supported Pythons."""
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        for pattern in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+            try:
+                return datetime.strptime(normalized, pattern)
+            except ValueError:
+                continue
+    raise ValueError(f"invalid RFC 3339 timestamp: {value}")
+
+
+def status_path(home: Path) -> Path:
+    return home / "onboarding.json"
+
+
+def lock_path(home: Path) -> Path:
+    return home / "onboarding.lock"
+
+
+def pending_scan_path(home: Path) -> Path:
+    return home / "pending-scan.json"
+
+
+def scan_status_path(home: Path) -> Path:
+    return home / "scan.json"
+
+
+def read_status(home: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(status_path(home).read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def write_status(home: Path, status: str, **details: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    payload = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat(), **details}
+    temporary = status_path(home).with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary.replace(status_path(home))
+
+
+def write_scan_status(home: Path, status: str, **details: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    payload = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat(), **details}
+    temporary = scan_status_path(home).with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary.replace(scan_status_path(home))
+
+
+def read_consent(home: Path) -> dict[str, str]:
+    try:
+        value = json.loads(consent_path(home).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {key: item for key, item in value.items() if isinstance(key, str) and isinstance(item, str)}
+
+
+def has_consent(home: Path, harness: str) -> bool:
+    consent = read_consent(home)
+    return consent.get("version") == CONSENT_VERSION and consent.get("harness") == harness
+
+
+def grant_consent(home: Path, harness: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    temporary = consent_path(home).with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {"version": CONSENT_VERSION, "harness": harness, "approved_at": datetime.now(timezone.utc).isoformat()},
+            indent=2,
+        )
+        + "\n"
+    )
+    temporary.replace(consent_path(home))
+
+
+def has_active_login() -> bool:
+    if os.environ.get("PAIRCLI_AUTH_TOKEN"):
+        return True
+    try:
+        value = json.loads(auth_file().read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(value, dict) or not isinstance(value.get("access_token"), str) or not value["access_token"]:
+        return False
+    expires_at = value.get("expires_at")
+    if not isinstance(expires_at, str) or not expires_at:
+        return True
+    try:
+        expiry = parse_expiry(expires_at)
+    except ValueError:
+        return False
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry > datetime.now(timezone.utc)
+
+
+def clean_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "CLAUDECODE" and not key.startswith("CLAUDE_CODE_")
+    }
+    environment.setdefault("PAIRCLI_AUTH_FILE", str(auth_file()))
+    if codex_home := active_codex_home():
+        environment.setdefault("CODEX_HOME", str(codex_home))
+    path_entries = [directory for directory in COMMON_TOOL_DIRECTORIES if Path(directory).is_dir()]
+    path_entries.extend(environment.get("PATH", "").split(os.pathsep))
+    environment["PATH"] = os.pathsep.join(dict.fromkeys(entry for entry in path_entries if entry))
+    return environment
+
+
+def active_codex_home() -> Path | None:
+    configured = os.environ.get("CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    plugin_root = os.environ.get("PLUGIN_ROOT")
+    if not plugin_root:
+        return None
+    for ancestor in Path(plugin_root).resolve().parents:
+        if ancestor.name == "plugins":
+            return ancestor.parent
+    return None
+
+
+def executable_path(name: str) -> str | None:
+    return shutil.which(name, path=clean_environment().get("PATH"))
+
+
+def platform_key() -> str:
+    """Return the release-manifest key for the current operating system and CPU."""
+    operating_system = platform.system().lower()
+    architecture = platform.machine().lower()
+    system_names = {"darwin": "darwin", "linux": "linux"}
+    architecture_names = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "amd64", "amd64": "amd64"}
+    if operating_system not in system_names or architecture not in architecture_names:
+        raise RuntimeError(f"paircli does not support {operating_system}/{architecture}")
+    return f"{system_names[operating_system]}-{architecture_names[architecture]}"
+
+
+def require_https_url(value: str, *, label: str) -> str:
+    """Validate release URLs before the plugin downloads executable content."""
+    parsed = urlparse(value)
+    is_local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
+    if parsed.scheme != "https" and not (is_local_http and os.environ.get("PAIRCLI_ALLOW_INSECURE_DOWNLOAD") == "1"):
+        raise RuntimeError(f"{label} must use HTTPS")
+    if not parsed.netloc:
+        raise RuntimeError(f"{label} is invalid")
+    return value
+
+
+def is_github_release_asset_redirect(requested, final) -> bool:
+    """Return whether a redirect targets this repository's GitHub release assets."""
+    return (
+        requested.scheme == "https"
+        and final.scheme == "https"
+        and (requested.hostname or "").lower() == GITHUB_RELEASE_HOST
+        and requested.path.startswith(GITHUB_RELEASE_PATH_PREFIX)
+        and (final.hostname or "").lower() in GITHUB_RELEASE_ASSET_HOSTS
+    )
+
+
+def verify_response_origin(response, requested_url: str, *, label: str) -> tuple[Any, Any]:
+    """Allow only GitHub's expected release-asset redirects."""
+    final_url = response.geturl() if hasattr(response, "geturl") else requested_url
+    requested = urlparse(requested_url)
+    final = urlparse(final_url)
+    same_origin = (final.scheme, final.netloc) == (requested.scheme, requested.netloc)
+    if not same_origin and not is_github_release_asset_redirect(requested, final):
+        raise RuntimeError(f"{label} redirected to a different origin")
+    return requested, final
+
+
+def is_accepted_manifest_content_type(content_type: str, requested, final) -> bool:
+    """Accept JSON, plus GitHub's unavoidable octet-stream release asset type."""
+    return content_type == "application/json" or (
+        content_type == "application/octet-stream" and is_github_release_asset_redirect(requested, final)
+    )
+
+
+def verify_json_response(response, requested_url: str) -> None:
+    requested, final = verify_response_origin(response, requested_url, label="paircli release manifest")
+    headers = getattr(response, "headers", None)
+    content_type = headers.get_content_type() if headers is not None and hasattr(headers, "get_content_type") else ""
+    if not is_accepted_manifest_content_type(content_type, requested, final):
+        raise RuntimeError(f"paircli release manifest expected application/json, got {content_type or 'unknown'}")
+
+
+def fetch_json(url: str) -> dict[str, Any]:
+    """Fetch a JSON release document from the configured release endpoint."""
+    request = Request(require_https_url(url, label="paircli release manifest URL"), headers={"User-Agent": "pair-plugin"})
+    try:
+        with urlopen(request, timeout=15) as response:
+            verify_json_response(response, url)
+            payload = response.read(MAX_BINARY_SIZE_BYTES)
+    except OSError as error:
+        raise RuntimeError(f"could not fetch paircli release manifest: {error}") from error
+    try:
+        document = json.loads(payload)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("paircli release manifest is not valid JSON") from error
+    if not isinstance(document, dict):
+        raise RuntimeError("paircli release manifest must be an object")
+    return document
+
+
+def release_artifact(manifest: dict[str, Any], target: str) -> tuple[str, str, str]:
+    """Extract and validate one platform-specific binary declaration from a manifest."""
+    version = manifest.get("version")
+    artifacts = manifest.get("artifacts")
+    artifact = artifacts.get(target) if isinstance(artifacts, dict) else None
+    if not isinstance(version, str) or not version:
+        raise RuntimeError("paircli release manifest is missing version")
+    if not isinstance(artifact, dict):
+        raise RuntimeError(f"paircli release {version} does not support {target}")
+    url = artifact.get("url")
+    checksum = artifact.get("sha256")
+    if not isinstance(url, str) or not url:
+        raise RuntimeError(f"paircli release {version} is missing a download URL for {target}")
+    if not isinstance(checksum, str) or len(checksum) != 64 or any(character not in "0123456789abcdef" for character in checksum.lower()):
+        raise RuntimeError(f"paircli release {version} has an invalid SHA-256 for {target}")
+    return version, require_https_url(url, label="paircli binary URL"), checksum.lower()
+
+
+def version_at_least(actual: str, required: str) -> bool:
+    """Compare stable three-part versions used by the plugin release contract."""
+    try:
+        actual_parts = tuple(int(part) for part in actual.split("+", 1)[0].split("-", 1)[0].split("."))
+        required_parts = tuple(int(part) for part in required.split("+", 1)[0].split("-", 1)[0].split("."))
+    except ValueError:
+        return False
+    return len(actual_parts) == len(required_parts) == 3 and actual_parts >= required_parts
+
+
+def verify_plugin_compatibility(manifest: dict[str, Any]) -> None:
+    required = manifest.get("min_plugin_version")
+    if required is None:
+        return
+    if not isinstance(required, str) or not version_at_least(PLUGIN_VERSION, required):
+        raise RuntimeError(f"paircli release requires Pair plugin {required} or newer")
+
+
+def read_release_metadata(home: Path) -> dict[str, str]:
+    try:
+        value = json.loads(release_metadata_path(home).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {key: item for key, item in value.items() if isinstance(key, str) and isinstance(item, str)}
+
+
+def write_release_metadata(home: Path, *, version: str, target: str, checksum: str) -> None:
+    temporary = release_metadata_path(home).with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"version": version, "platform": target, "sha256": checksum}, indent=2) + "\n"
+    )
+    temporary.replace(release_metadata_path(home))
+
+
+def download_binary(url: str, destination: Path, checksum: str) -> None:
+    """Download, verify, and atomically install a paircli executable."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="paircli-", dir=str(destination.parent))
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            request = Request(url, headers={"User-Agent": "pair-plugin"})
+            with urlopen(request, timeout=30) as response:
+                verify_response_origin(response, url, label="paircli binary")
+                while chunk := response.read(64 * 1024):
+                    total += len(chunk)
+                    if total > MAX_BINARY_SIZE_BYTES:
+                        raise RuntimeError("paircli binary exceeds the maximum download size")
+                    digest.update(chunk)
+                    output.write(chunk)
+        if digest.hexdigest() != checksum:
+            raise RuntimeError("paircli binary checksum verification failed")
+        temporary.chmod(0o755)
+        temporary.replace(destination)
+    except OSError as error:
+        raise RuntimeError(f"could not download paircli binary: {error}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def run_command(command: list[str], *, cwd: Path, log, timeout: int = COMMAND_TIMEOUT_SECONDS) -> None:
+    try:
+        completed = subprocess.run(
+            command, cwd=str(cwd), env=clean_environment(), stdout=log, stderr=subprocess.STDOUT, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"command timed out after {timeout}s: {' '.join(command)}") from error
+    if completed.returncode != 0:
+        raise RuntimeError(f"command exited {completed.returncode}: {' '.join(command)}")
+
+
+def build_paircli_from_source(home: Path, log) -> Path:
+    """Build paircli from a checkout for explicit local-development use only."""
+    binary = binary_path(home)
+    git = executable_path("git")
+    if git is None:
+        raise RuntimeError("git is required to install paircli")
+    go = executable_path("go")
+    if go is None:
+        raise RuntimeError("Go is required to install paircli")
+    source = source_path(home)
+    if source.exists():
+        if not (source / ".git").is_dir():
+            raise RuntimeError(f"refusing to replace unexpected source directory: {source}")
+    else:
+        source.parent.mkdir(parents=True, exist_ok=True)
+        run_command(
+            [git, "clone", "--depth", "1", os.environ.get("PAIRCLI_REPOSITORY_URL", DEFAULT_REPOSITORY_URL), str(source)],
+            cwd=source.parent,
+            log=log,
+        )
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    run_command([go, "build", "-o", str(binary), "./cmd/paircli"], cwd=source, log=log)
+    return binary
+
+
+def ensure_paircli(home: Path, log) -> Path:
+    """Install the current platform binary from the release manifest, or build only in dev mode."""
+    if os.environ.get(DEVELOPMENT_BUILD_ENV) == "1":
+        return build_paircli_from_source(home, log)
+
+    binary = binary_path(home)
+    if binary.is_file() and os.access(binary, os.X_OK):
+        return binary
+    manifest = fetch_json(os.environ.get(RELEASE_MANIFEST_ENV, DEFAULT_RELEASE_MANIFEST_URL))
+    verify_plugin_compatibility(manifest)
+    target = platform_key()
+    version, url, checksum = release_artifact(manifest, target)
+    output = log if log is not None else sys.stderr
+    output.write(f"downloading paircli {version} for {target}\n")
+    download_binary(url, binary, checksum)
+    write_release_metadata(home, version=version, target=target, checksum=checksum)
+    return binary
+
+
+def lock_is_stale(home: Path) -> bool:
+    try:
+        value = json.loads(lock_path(home).read_text())
+    except (OSError, ValueError):
+        return True
+    if not isinstance(value, dict):
+        return True
+    created_at = value.get("created_at")
+    pid = value.get("pid")
+    try:
+        created = parse_expiry(created_at) if isinstance(created_at, str) else None
+    except ValueError:
+        created = None
+    if created is None or datetime.now(timezone.utc) - created > timedelta(seconds=LOCK_STALE_AFTER_SECONDS):
+        return True
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def acquire_lock(home: Path) -> bool:
+    home.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(lock_path(home), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        if not lock_is_stale(home):
+            return False
+        try:
+            lock_path(home).unlink()
+        except FileNotFoundError:
+            pass
+        return acquire_lock(home)
+    with os.fdopen(descriptor, "w") as lock:
+        json.dump({"pid": os.getpid(), "created_at": datetime.now(timezone.utc).isoformat()}, lock)
+    return True
+
+
+def release_lock(home: Path) -> None:
+    try:
+        lock_path(home).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def log_file(home: Path) -> Path:
+    directory = home / "logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"onboarding-{time.strftime('%Y%m%d-%H%M%S')}.log"
+
+
+def scan_log_file(home: Path) -> Path:
+    directory = home / "logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"scan-{time.strftime('%Y%m%d-%H%M%S')}.log"
+
+
+def queue_scan(home: Path, pr_url: str | None, repo_dir: str | None) -> None:
+    """Persist the PR scan requested by a hook until authentication is complete."""
+    if not pr_url or not repo_dir:
+        return
+    home.mkdir(parents=True, exist_ok=True)
+    temporary = pending_scan_path(home).with_suffix(".tmp")
+    temporary.write_text(json.dumps({"pr_url": pr_url, "repo_dir": repo_dir}, indent=2) + "\n")
+    temporary.replace(pending_scan_path(home))
+
+
+def take_pending_scan(home: Path) -> dict[str, str] | None:
+    """Consume one validated pending scan request, if present."""
+    try:
+        value = json.loads(pending_scan_path(home).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    pr_url, repo_dir = value.get("pr_url"), value.get("repo_dir")
+    if not isinstance(pr_url, str) or not isinstance(repo_dir, str) or not pr_url or not repo_dir:
+        return None
+    pending_scan_path(home).unlink(missing_ok=True)
+    return {"pr_url": pr_url, "repo_dir": repo_dir}
+
+
+def launch_pending_scan(home: Path, binary: Path, harness: str) -> dict[str, str] | None:
+    """Start a local snapshot scan without blocking the agent hook."""
+    request = take_pending_scan(home)
+    if request is None:
+        return None
+    repo_dir = Path(request["repo_dir"]).expanduser()
+    log = scan_log_file(home)
+    if not repo_dir.is_dir():
+        message = f"scan repository does not exist: {repo_dir}"
+        write_scan_status(home, "failed", error=message, log=str(log), pr_url=request["pr_url"])
+        return {"status": "failed", "error": message, "log": str(log)}
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "scan",
+                "--log",
+                str(log),
+                "--pr-url",
+                request["pr_url"],
+                "--repo-dir",
+                str(repo_dir),
+                "--harness",
+                harness,
+            ],
+            cwd=str(home),
+            env=clean_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        queue_scan(home, request["pr_url"], str(repo_dir))
+        write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=request["pr_url"])
+        return {"status": "failed", "error": str(error), "log": str(log)}
+    write_scan_status(home, "running", log=str(log), pr_url=request["pr_url"])
+    return {"status": "started", "log": str(log), "pr_url": request["pr_url"]}
+
+
+def approval_command(harness: str) -> str:
+    return f"{sys.executable} {Path(__file__).resolve()} approve --harness {harness}"
+
+
+def start(harness: str, dry_run: bool = False, pr_url: str | None = None, repo_dir: str | None = None) -> dict[str, Any]:
+    if os.environ.get("PAIRCLI_ONBOARDING_DISABLE") == "1":
+        return {"status": "disabled"}
+    if harness not in SUPPORTED_HARNESSES:
+        return {"status": "unsupported", "harness": harness}
+    home = onboarding_home()
+    binary = binary_path(home)
+    previous = read_status(home)
+    if dry_run:
+        return {
+            "status": "planned",
+            "binary": str(binary),
+            "command": f"{sys.executable} {Path(__file__).resolve()} run --harness {harness}",
+        }
+    queue_scan(home, pr_url, repo_dir)
+    if not has_consent(home, harness):
+        grant_consent(home, harness)
+    if previous.get("status") == "failed":
+        return {"status": "failed", "error": previous.get("error", "unknown error"), "log": previous.get("log", "")}
+    if previous.get("status") == "complete" and binary.is_file() and os.access(binary, os.X_OK) and has_active_login():
+        result: dict[str, Any] = {"status": "complete", "binary": str(binary), "log": str(previous.get("log", ""))}
+        if scan := launch_pending_scan(home, binary, harness):
+            result["scan"] = scan
+        return result
+    if not acquire_lock(home):
+        return {"status": "running", "log": str(read_status(home).get("log", ""))}
+    log = log_file(home)
+    write_status(home, "running", log=str(log))
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "run", "--log", str(log), "--harness", harness],
+            cwd=str(home), env=clean_environment(), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except OSError as error:
+        release_lock(home)
+        write_status(home, "failed", error=str(error), log=str(log))
+        return {"status": "failed", "error": str(error), "log": str(log)}
+    return {"status": "started", "log": str(log)}
+
+
+def approve(harness: str) -> dict[str, str]:
+    if harness not in SUPPORTED_HARNESSES:
+        return {"status": "unsupported", "harness": harness}
+    home = onboarding_home()
+    grant_consent(home, harness)
+    if read_status(home).get("status") == "failed":
+        try:
+            status_path(home).unlink()
+        except FileNotFoundError:
+            pass
+    return start(harness)
+
+
+def uninstall(harness: str) -> dict[str, str]:
+    if harness not in SUPPORTED_HARNESSES:
+        return {"status": "unsupported", "harness": harness}
+    home = onboarding_home()
+    binary = binary_path(home)
+    log = log_file(home)
+    try:
+        with log.open("a", encoding="utf-8") as output:
+            if binary.is_file() and os.access(binary, os.X_OK):
+                run_command([str(binary), "hook", "uninstall", harness], cwd=home, log=output)
+                run_command([str(binary), "logout"], cwd=home, log=output)
+        for path in (binary, release_metadata_path(home), consent_path(home), lock_path(home), pending_scan_path(home), scan_status_path(home)):
+            path.unlink(missing_ok=True)
+        auth_file().unlink(missing_ok=True)
+        source = source_path(home)
+        if source.exists():
+            shutil.rmtree(source)
+        write_status(home, "uninstalled", harness=harness, log=str(log))
+        return {"status": "uninstalled", "log": str(log)}
+    except Exception as error:
+        write_status(home, "failed", error=str(error), log=str(log))
+        return {"status": "failed", "error": str(error), "log": str(log)}
+
+
+def run(log: Path, harness: str) -> int:
+    home = onboarding_home()
+    if not has_consent(home, harness):
+        grant_consent(home, harness)
+    try:
+        with log.open("a", encoding="utf-8") as output:
+            output.write("paircli plugin onboarding started\n")
+            binary = ensure_paircli(home, output)
+            try:
+                run_command([str(binary), "update", "--quiet", "--plugin-version", PLUGIN_VERSION], cwd=home, log=output)
+            except RuntimeError as error:
+                output.write(f"paircli update skipped: {error}\n")
+            run_command([str(binary), "hook", "install", harness], cwd=home, log=output)
+            if has_active_login():
+                write_status(home, "complete", binary=str(binary), log=str(log))
+                output.write("paircli is already logged in\n")
+                launch_pending_scan(home, binary, harness)
+                return 0
+            output.write("opening paircli device login\n")
+            run_command([str(binary), "login"], cwd=home, log=output, timeout=LOGIN_TIMEOUT_SECONDS)
+            if not has_active_login():
+                raise RuntimeError("login completed without a usable credential")
+            write_status(home, "complete", binary=str(binary), log=str(log))
+            launch_pending_scan(home, binary, harness)
+            return 0
+    except Exception as error:
+        write_status(home, "failed", error=str(error), log=str(log))
+        return 1
+    finally:
+        release_lock(home)
+
+
+def artifact_directory(pr_url: str, repo_dir: Path) -> Path:
+    """Resolve the PR head so CLI and plugin write to the same output folder."""
+    match = re.fullmatch(r"https://github\.com/[A-Za-z0-9-]+/[\w.-]+/pull/(\d+)", pr_url)
+    if match is None:
+        raise RuntimeError(f"invalid GitHub PR URL: {pr_url}")
+    commands = (
+        ["git", "rev-parse", "--show-toplevel"],
+        ["gh", "pr", "view", pr_url, "--json", "commits", "--jq", ".commits[-1].oid"],
+    )
+    results = []
+    for command in commands:
+        completed = subprocess.run(
+            command, cwd=repo_dir, env=clean_environment(), text=True,
+            capture_output=True, timeout=METADATA_TIMEOUT_SECONDS, check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"could not resolve PR artifact folder: {' '.join(command)}: {completed.stderr.strip()}")
+        results.append(completed.stdout.strip())
+    root, head_commit = results
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", head_commit):
+        raise RuntimeError("GitHub returned an invalid PR head commit")
+    return Path(root) / ".paircli" / f"pr-{match.group(1)}" / head_commit.lower()
+
+
+def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
+    """Generate CLI evidence, then have the triggering agent write summary.md."""
+    home = onboarding_home()
+    binary = binary_path(home)
+    artifact_dir = None
+    try:
+        with log.open("a", encoding="utf-8") as output:
+            artifact_dir = artifact_directory(pr_url, repo_dir)
+            try:
+                run_command(
+                    [str(binary), "update", "--quiet", "--plugin-version", PLUGIN_VERSION],
+                    cwd=repo_dir,
+                    log=output,
+                )
+            except RuntimeError as error:
+                output.write(f"paircli update skipped: {error}\n")
+            output.write(f"generating local Pair scan artifacts for {pr_url}\n")
+            run_command(
+                [str(binary), "scan", pr_url, "--snapshot", "--out", str(artifact_dir)],
+                cwd=repo_dir, log=output, timeout=SCAN_TIMEOUT_SECONDS,
+            )
+            (artifact_dir / "summary.md").unlink(missing_ok=True)
+            output.write(f"generating AI summary.md with {harness}\n")
+            summary = write_summary(harness, pr_url, repo_dir, artifact_dir, output)
+            output.write(f"wrote {summary}\n")
+        write_scan_status(home, "complete", log=str(log), pr_url=pr_url, summary=str(summary))
+        return 0
+    except Exception as error:
+        write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=pr_url,
+                          artifacts=str(artifact_dir) if artifact_dir else "")
+        return 1
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    start_parser = subcommands.add_parser("start")
+    start_parser.add_argument("--dry-run", action="store_true")
+    start_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
+    approve_parser = subcommands.add_parser("approve")
+    approve_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
+    uninstall_parser = subcommands.add_parser("uninstall")
+    uninstall_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
+    run_parser = subcommands.add_parser("run")
+    run_parser.add_argument("--log", required=True)
+    run_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
+    scan_parser = subcommands.add_parser("scan")
+    scan_parser.add_argument("--log", required=True)
+    scan_parser.add_argument("--pr-url", required=True)
+    scan_parser.add_argument("--repo-dir", required=True)
+    scan_parser.add_argument("--harness", required=True, choices=sorted(SUPPORTED_HARNESSES))
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = parse_args(argv or sys.argv[1:])
+    if arguments.command == "start":
+        print(json.dumps(start(arguments.harness, arguments.dry_run)))
+        return 0
+    if arguments.command == "approve":
+        print(json.dumps(approve(arguments.harness)))
+        return 0
+    if arguments.command == "uninstall":
+        print(json.dumps(uninstall(arguments.harness)))
+        return 0
+    if arguments.command == "run":
+        return run(Path(arguments.log), arguments.harness)
+    return scan(Path(arguments.log), arguments.pr_url, Path(arguments.repo_dir), arguments.harness)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

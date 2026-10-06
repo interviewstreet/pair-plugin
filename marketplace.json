@@ -1,0 +1,20 @@
+{
+  "name": "pair-local",
+  "interface": {
+    "displayName": "Pair Local"
+  },
+  "plugins": [
+    {
+      "name": "pair",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
