@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks" / "hook_pr_created.py"
+SESSION_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "hook_session_start.py"
 HOOK_CONFIG = Path(__file__).resolve().parent.parent / "hooks" / "hooks.json"
 PYTHONS = [sys.executable] + (["/usr/bin/python3"] if Path("/usr/bin/python3").exists() else [])
 URL = "https://github.com/Five-SH/awt/pull/12"
@@ -58,9 +59,37 @@ def test_pr_create_starts_pair(python, tmp_path):
 def test_hook_config_resolves_codex_and_claude_plugin_roots():
     config = json.loads(HOOK_CONFIG.read_text())
     command = config["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+    startup = config["hooks"]["SessionStart"][0]
 
     assert "PLUGIN_ROOT" in command
     assert "CLAUDE_PLUGIN_ROOT" in command
+    assert startup["matcher"] == "startup|resume"
+    assert "PLUGIN_ROOT" in startup["hooks"][0]["command"]
+    assert "CLAUDE_PLUGIN_ROOT" in startup["hooks"][0]["command"]
+
+
+@pytest.mark.parametrize("harness,plugin_root", [("codex", "PLUGIN_ROOT"), ("claude-code", "CLAUDE_PLUGIN_ROOT")])
+def test_session_start_plans_onboarding(harness, plugin_root, tmp_path):
+    env = {key: value for key, value in os.environ.items() if key not in ("PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT")}
+    env.update({plugin_root: "/plugins/pair", "PAIR_HOOK_DRY_RUN": "1", "PAIRCLI_PLUGIN_HOME": str(tmp_path)})
+
+    result = subprocess.run([sys.executable, str(SESSION_HOOK)], text=True, capture_output=True, env=env, timeout=10)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "Pair setup status: planned" in payload["systemMessage"]
+    assert not (tmp_path / "onboarding.json").exists()
+
+
+def test_session_start_skips_headless_pair_run(tmp_path):
+    env = dict(os.environ, PLUGIN_ROOT="/plugins/pair", PAIR_RUN="1", PAIRCLI_PLUGIN_HOME=str(tmp_path))
+
+    result = subprocess.run([sys.executable, str(SESSION_HOOK)], text=True, capture_output=True, env=env, timeout=10)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert not (tmp_path / "onboarding.json").exists()
 
 
 @pytest.mark.parametrize("ev", [
@@ -143,6 +172,7 @@ def test_codex_starts_onboarding_without_claude_review(tmp_path):
     assert "plan" not in out
     assert out["onboarding"]["status"] == "planned"
     assert "Pair setup status: planned" in out["systemMessage"]
+    assert "upload is not implemented" not in out["systemMessage"]
 
 
 def test_codex_starts_setup_without_a_consent_block(tmp_path):

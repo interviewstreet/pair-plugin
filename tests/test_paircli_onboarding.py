@@ -41,7 +41,9 @@ def make_paircli(tmp_path: Path) -> Path:
         "entries.append(sys.argv[1:])\n"
         "json.dump(entries, open(calls, 'w'))\n"
         "if sys.argv[1:] == ['login']:\n"
-        "    json.dump({'access_token': 'test-token'}, open(os.environ['PAIRCLI_AUTH_FILE'], 'w'))\n"
+        "    server = os.environ.get('PAIRCLI_SERVER_URL') or 'https://prod-be.pair.sh'\n"
+        "    json.dump({'access_token': 'test-token', 'server_url': server.rstrip('/')}, "
+        "open(os.environ['PAIRCLI_AUTH_FILE'], 'w'))\n"
     )
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
     return binary
@@ -84,6 +86,24 @@ def test_start_skips_completed_active_onboarding(monkeypatch, tmp_path):
     result = onboarding.start("codex")
 
     assert result == {"status": "complete", "binary": str(binary), "log": "/tmp/onboarding.log"}
+
+
+def test_start_restarts_onboarding_for_a_different_backend(monkeypatch, tmp_path):
+    binary = make_paircli(tmp_path)
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"access_token": "local-token", "server_url": "http://localhost:8080"}))
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
+    monkeypatch.setenv("PAIRCLI_SERVER_URL", "https://private.pair.example")
+    onboarding.grant_consent(tmp_path, "codex")
+    onboarding.write_status(tmp_path, "complete", binary=str(binary), log="/tmp/old.log")
+    launched = []
+    monkeypatch.setattr(onboarding.subprocess, "Popen", lambda command, **kwargs: launched.append(command))
+
+    result = onboarding.start("codex")
+
+    assert result["status"] == "started"
+    assert launched[0][2] == "run"
 
 
 def test_start_schedules_scan_for_completed_onboarding(monkeypatch, tmp_path):
@@ -133,11 +153,18 @@ def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_
     repo.mkdir()
     monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
+    monkeypatch.setenv("PAIRCLI_UPLOAD_ENABLED", "0")
     artifacts = repo / ".paircli" / "pr-42" / ("a" * 40)
     artifacts.mkdir(parents=True)
     monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
     generated = []
-    monkeypatch.setattr(onboarding, "write_summary", lambda *args: generated.append(args) or artifacts / "summary.md")
+    def write_summary(*args):
+        generated.append(args)
+        summary = artifacts / "summary.md"
+        summary.write_text("# PR summary\n")
+        return summary
+
+    monkeypatch.setattr(onboarding, "write_summary", write_summary)
 
     assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 0
     assert json.loads(calls.read_text()) == [
@@ -145,7 +172,64 @@ def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_
         ["scan", "https://github.com/acme/repo/pull/42", "--snapshot", "--out", str(artifacts)],
     ]
     assert generated[0][:4] == ("codex", "https://github.com/acme/repo/pull/42", repo, artifacts)
-    assert json.loads(onboarding.scan_status_path(tmp_path).read_text())["summary"] == str(artifacts / "summary.md")
+    status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
+    assert status["summary"] == str(artifacts / "summary.md")
+    assert status["archive"] == str(artifacts.with_suffix(".zip"))
+    assert status["artifact_id"] == ""
+
+
+def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
+    log = tmp_path / "scan.log"
+    repo = tmp_path / "repo"
+    artifacts = repo / ".paircli" / "pr-42" / ("a" * 40)
+    artifacts.mkdir(parents=True)
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    monkeypatch.delenv("PAIRCLI_UPLOAD_ENABLED", raising=False)
+    monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
+    monkeypatch.setattr(onboarding, "run_command", lambda *args, **kwargs: None)
+
+    def write_summary(*_args):
+        summary = artifacts / "summary.md"
+        summary.write_text("# PR summary\n")
+        return summary
+
+    monkeypatch.setattr(onboarding, "write_summary", write_summary)
+    uploads = []
+    monkeypatch.setattr(onboarding, "upload_archive", lambda *args: uploads.append(args) or "artifact-123")
+
+    assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 0
+    assert uploads == [("https://github.com/acme/repo/pull/42", artifacts.with_suffix(".zip"), onboarding.auth_file())]
+    status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
+    assert status["artifact_id"] == "artifact-123"
+
+
+def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
+    log = tmp_path / "scan.log"
+    repo = tmp_path / "repo"
+    artifacts = repo / ".paircli" / "pr-42" / ("a" * 40)
+    artifacts.mkdir(parents=True)
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    monkeypatch.setenv("PAIRCLI_UPLOAD_ENABLED", "1")
+    monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
+    monkeypatch.setattr(onboarding, "run_command", lambda *args, **kwargs: None)
+
+    def write_summary(*_args):
+        summary = artifacts / "summary.md"
+        summary.write_text("# PR summary\n")
+        return summary
+
+    def reject_upload(*_args):
+        raise RuntimeError("Pair BE does not accept this CLI login")
+
+    monkeypatch.setattr(onboarding, "write_summary", write_summary)
+    monkeypatch.setattr(onboarding, "upload_archive", reject_upload)
+
+    assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 1
+    status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
+    assert status["status"] == "failed"
+    assert status["summary"] == str(artifacts / "summary.md")
+    assert status["archive"] == str(artifacts.with_suffix(".zip"))
+    assert artifacts.with_suffix(".zip").is_file()
 
 
 def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch, tmp_path):
@@ -389,6 +473,7 @@ def test_run_installs_hooks_then_logs_in(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
     monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
+    monkeypatch.delenv("PAIRCLI_SERVER_URL", raising=False)
     monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
     onboarding.grant_consent(tmp_path, "codex")
 
@@ -397,6 +482,7 @@ def test_run_installs_hooks_then_logs_in(monkeypatch, tmp_path):
     assert result == 0
     assert onboarding.read_status(tmp_path)["status"] == "complete"
     assert json.loads(calls.read_text()) == [["update", "--quiet", "--plugin-version", "0.1.0"], ["hook", "install", "codex"], ["login"]]
+    assert json.loads(auth.read_text())["server_url"] == onboarding.DEFAULT_SERVER_URL
 
 
 def test_run_skips_login_when_a_live_credential_exists(monkeypatch, tmp_path):
@@ -404,9 +490,10 @@ def test_run_skips_login_when_a_live_credential_exists(monkeypatch, tmp_path):
     auth = tmp_path / "auth.json"
     calls = tmp_path / "calls.json"
     log = tmp_path / "onboarding.log"
-    auth.write_text(json.dumps({"access_token": "already-authorized"}))
+    auth.write_text(json.dumps({"access_token": "already-authorized", "server_url": onboarding.DEFAULT_SERVER_URL}))
     monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
     monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
+    monkeypatch.setenv("PAIRCLI_SERVER_URL", onboarding.DEFAULT_SERVER_URL)
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
     monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
     onboarding.grant_consent(tmp_path, "codex")
@@ -416,6 +503,24 @@ def test_run_skips_login_when_a_live_credential_exists(monkeypatch, tmp_path):
     assert result == 0
     assert onboarding.read_status(tmp_path)["status"] == "complete"
     assert json.loads(calls.read_text()) == [["update", "--quiet", "--plugin-version", "0.1.0"], ["hook", "install", "codex"]]
+
+
+def test_run_logs_in_again_after_server_change(monkeypatch, tmp_path):
+    binary = make_paircli(tmp_path)
+    auth = tmp_path / "auth.json"
+    calls = tmp_path / "calls.json"
+    log = tmp_path / "onboarding.log"
+    auth.write_text(json.dumps({"access_token": "local-token", "server_url": "http://localhost:8080"}))
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
+    monkeypatch.setenv("PAIRCLI_SERVER_URL", "https://private.pair.example/")
+    monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
+    monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
+    onboarding.grant_consent(tmp_path, "codex")
+
+    assert onboarding.run(log, "codex") == 0
+    assert json.loads(auth.read_text())["server_url"] == "https://private.pair.example"
+    assert json.loads(calls.read_text())[-1] == ["login"]
 
 
 def test_run_continues_when_update_is_unavailable(monkeypatch, tmp_path):
@@ -469,10 +574,27 @@ def test_accepts_paircli_rfc3339_expiry_on_macos_python(monkeypatch, tmp_path):
         json.dumps(
             {
                 "access_token": "already-authorized",
+                "server_url": onboarding.DEFAULT_SERVER_URL,
                 "expires_at": "2027-01-03T15:58:58.95555+05:30",
             }
         )
     )
     monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
+    monkeypatch.setenv("PAIRCLI_SERVER_URL", onboarding.DEFAULT_SERVER_URL)
 
     assert onboarding.has_active_login()
+
+
+def test_has_active_login_requires_matching_backend(monkeypatch, tmp_path):
+    auth = tmp_path / "auth.json"
+    monkeypatch.setenv("PAIRCLI_AUTH_FILE", str(auth))
+    monkeypatch.delenv("PAIRCLI_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("PAIRCLI_SERVER_URL", raising=False)
+    auth.write_text(json.dumps({"access_token": "local-token", "server_url": "http://localhost:8080"}))
+    assert not onboarding.has_active_login()
+
+    auth.write_text(json.dumps({"access_token": "production-token", "server_url": "https://prod-be.pair.sh/"}))
+    assert onboarding.has_active_login()
+
+    monkeypatch.setenv("PAIRCLI_SERVER_URL", "https://private.pair.example")
+    assert not onboarding.has_active_login()

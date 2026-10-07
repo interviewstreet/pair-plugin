@@ -19,11 +19,14 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from paircli_archive import create_pr_archive
 from paircli_summary import write_summary
+from paircli_upload import upload_archive
 
 
 DEFAULT_REPOSITORY_URL = "https://github.com/rutvikchandla3/paircli"
 DEFAULT_RELEASE_MANIFEST_URL = "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
+DEFAULT_SERVER_URL = "https://prod-be.pair.sh"
 GITHUB_RELEASE_HOST = "github.com"
 GITHUB_RELEASE_PATH_PREFIX = "/rutvikchandla3/paircli/releases/"
 GITHUB_RELEASE_ASSET_HOSTS = {
@@ -78,6 +81,10 @@ def consent_path(home: Path) -> Path:
 def auth_file() -> Path:
     configured = os.environ.get("PAIRCLI_AUTH_FILE")
     return Path(configured).expanduser() if configured else onboarding_home().parent / "auth.json"
+
+
+def server_url() -> str:
+    return (os.environ.get("PAIRCLI_SERVER_URL") or DEFAULT_SERVER_URL).rstrip("/")
 
 
 def parse_expiry(value: str) -> datetime:
@@ -171,6 +178,9 @@ def has_active_login() -> bool:
         return False
     if not isinstance(value, dict) or not isinstance(value.get("access_token"), str) or not value["access_token"]:
         return False
+    stored_server = value.get("server_url")
+    if not isinstance(stored_server, str) or stored_server.rstrip("/") != server_url():
+        return False
     expires_at = value.get("expires_at")
     if not isinstance(expires_at, str) or not expires_at:
         return True
@@ -190,6 +200,7 @@ def clean_environment() -> dict[str, str]:
         if key != "CLAUDECODE" and not key.startswith("CLAUDE_CODE_")
     }
     environment.setdefault("PAIRCLI_AUTH_FILE", str(auth_file()))
+    environment["PAIRCLI_SERVER_URL"] = server_url()
     if codex_home := active_codex_home():
         environment.setdefault("CODEX_HOME", str(codex_home))
     path_entries = [directory for directory in COMMON_TOOL_DIRECTORIES if Path(directory).is_dir()]
@@ -720,11 +731,20 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
             output.write(f"generating AI summary.md with {harness}\n")
             summary = write_summary(harness, pr_url, repo_dir, artifact_dir, output)
             output.write(f"wrote {summary}\n")
-        write_scan_status(home, "complete", log=str(log), pr_url=pr_url, summary=str(summary))
+            archive = create_pr_archive(repo_dir, artifact_dir)
+            output.write(f"packaged {archive}\n")
+            artifact_id = ""
+            if os.environ.get("PAIRCLI_UPLOAD_ENABLED", "1") != "0":
+                artifact_id = upload_archive(pr_url, archive, auth_file())
+                output.write(f"uploaded Pair artifact {artifact_id}\n")
+        write_scan_status(home, "complete", log=str(log), pr_url=pr_url, summary=str(summary),
+                          archive=str(archive), artifact_id=artifact_id)
         return 0
     except Exception as error:
         write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=pr_url,
-                          artifacts=str(artifact_dir) if artifact_dir else "")
+                          artifacts=str(artifact_dir) if artifact_dir else "",
+                          summary=str(summary) if "summary" in locals() else "",
+                          archive=str(archive) if "archive" in locals() else "")
         return 1
 
 
