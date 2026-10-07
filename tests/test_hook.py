@@ -190,6 +190,30 @@ def test_codex_starts_setup_without_a_consent_block(tmp_path):
     assert "Pair setup started for codex" in out["systemMessage"]
 
 
+def test_codex_reports_prior_setup_failure_without_blocking(tmp_path):
+    plugin_home = tmp_path / "plugin"
+    plugin_home.mkdir()
+    (plugin_home / "onboarding.json").write_text(json.dumps({
+        "status": "failed",
+        "error": "network unavailable",
+        "log": "/tmp/pair-onboarding.log",
+    }))
+
+    out = run(
+        event("gh pr create --fill", f"{URL}\n"),
+        {
+            "PAIR_HOOK_DRY_RUN": "0",
+            "PAIRCLI_PLUGIN_HOME": str(plugin_home),
+            "PLUGIN_ROOT": "/plugins/pair",
+        },
+        tmp=tmp_path,
+    )
+
+    assert "decision" not in out
+    assert "continue" not in out
+    assert "Pair setup previously failed" in out["systemMessage"]
+
+
 def test_live_hook_starts_setup_automatically(tmp_path):
     out = run(
         event("gh pr create --fill", f"{URL}\n"),

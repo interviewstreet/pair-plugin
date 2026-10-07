@@ -197,8 +197,6 @@ def main() -> int:
     if is_codex:
         out = {"systemMessage": message,
                "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}}
-        if onboarding.get("status") == "failed":
-            out.update({"decision": "block", "reason": message, "continue": False})
         if dry_run:
             out["onboarding"] = onboarding
         print(json.dumps(out))

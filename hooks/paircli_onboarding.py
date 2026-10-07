@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 from paircli_archive import create_pr_archive
 from paircli_summary import write_summary
+from paircli_tls import compatible_tls_context
 from paircli_upload import upload_archive
 
 
@@ -289,7 +290,7 @@ def fetch_json(url: str) -> dict[str, Any]:
     """Fetch a JSON release document from the configured release endpoint."""
     request = Request(require_https_url(url, label="paircli release manifest URL"), headers={"User-Agent": "pair-plugin"})
     try:
-        with urlopen(request, timeout=15) as response:
+        with urlopen(request, timeout=15, context=compatible_tls_context()) as response:
             verify_json_response(response, url)
             payload = response.read(MAX_BINARY_SIZE_BYTES)
     except OSError as error:
@@ -367,7 +368,7 @@ def download_binary(url: str, destination: Path, checksum: str) -> None:
     try:
         with os.fdopen(descriptor, "wb") as output:
             request = Request(url, headers={"User-Agent": "pair-plugin"})
-            with urlopen(request, timeout=30) as response:
+            with urlopen(request, timeout=30, context=compatible_tls_context()) as response:
                 verify_response_origin(response, url, label="paircli binary")
                 while chunk := response.read(64 * 1024):
                     total += len(chunk)

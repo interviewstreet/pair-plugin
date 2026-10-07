@@ -9,10 +9,11 @@ import secrets
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 from uuid import UUID
 
 from paircli_archive import MAX_ARCHIVE_BYTES
+from paircli_tls import compatible_tls_context
 
 
 REQUEST_TIMEOUT_SECONDS = 20
@@ -87,7 +88,8 @@ def _sign_upload(server: str, token: str | None, file_path: str) -> dict:
         method="POST",
     )
     try:
-        with build_opener(NoRedirects()).open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        opener = build_opener(NoRedirects(), HTTPSHandler(context=compatible_tls_context()))
+        with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             if response.status != 201:
                 raise RuntimeError(f"Pair BE rejected upload signing (HTTP {response.status})")
             raw = response.read(MAX_RESPONSE_BYTES + 1)
@@ -160,7 +162,12 @@ def _post_to_s3(signed: dict, archive: Path) -> None:
     target = parsed.path or "/"
     if parsed.query:
         target += "?" + parsed.query
-    connection = http.client.HTTPSConnection(host, port=parsed.port, timeout=UPLOAD_TIMEOUT_SECONDS)
+    connection = http.client.HTTPSConnection(
+        host,
+        port=parsed.port,
+        timeout=UPLOAD_TIMEOUT_SECONDS,
+        context=compatible_tls_context(),
+    )
     try:
         connection.request("POST", target, body=body(), headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}",
