@@ -162,8 +162,9 @@ def test_post_to_s3_streams_zip_last_without_pair_token(tmp_path, monkeypatch):
             return b""
 
     class Connection:
-        def __init__(self, host, port, timeout):
+        def __init__(self, host, port, timeout, context):
             assert host == "bucket.s3.us-east-1.amazonaws.com"
+            assert context.check_hostname
             sent.append(self)
 
         def request(self, method, target, body, headers):
