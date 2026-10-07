@@ -126,7 +126,7 @@ def onboarding_message(onboarding: dict, harness: str) -> str:
     if status == "complete":
         scan = onboarding.get("scan")
         if isinstance(scan, dict) and scan.get("status") == "started":
-            return f"Pair CLI is ready for {harness}. Generating local Pair artifacts; log: {scan.get('log', 'unavailable')}"
+            return f"Pair CLI is ready for {harness}. Generating local Pair artifacts and uploading the ZIP; log: {scan.get('log', 'unavailable')}"
         if isinstance(scan, dict) and scan.get("status") == "failed":
             return f"Pair CLI is ready for {harness}, but local artifact generation failed: {scan.get('error', 'unknown error')}. Log: {scan.get('log', 'unavailable')}"
         return f"Pair CLI is ready for {harness}."
@@ -195,7 +195,6 @@ def main() -> int:
     message = onboarding_message(onboarding, harness)
 
     if is_codex:
-        message += " Pair review artifact upload is not implemented for Codex yet."
         out = {"systemMessage": message,
                "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}}
         if onboarding.get("status") == "failed":
