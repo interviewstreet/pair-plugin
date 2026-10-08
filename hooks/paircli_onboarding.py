@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from pair_notification import notify_scan_result
 from paircli_archive import create_pr_archive
 from paircli_summary import write_summary
 from paircli_tls import compatible_tls_context
@@ -740,12 +741,14 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
                 output.write(f"uploaded Pair artifact {artifact_id}\n")
         write_scan_status(home, "complete", log=str(log), pr_url=pr_url, summary=str(summary),
                           archive=str(archive), artifact_id=artifact_id)
+        notify_scan_result(pr_url, succeeded=True, uploaded=bool(artifact_id))
         return 0
     except Exception as error:
         write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=pr_url,
                           artifacts=str(artifact_dir) if artifact_dir else "",
                           summary=str(summary) if "summary" in locals() else "",
                           archive=str(archive) if "archive" in locals() else "")
+        notify_scan_result(pr_url, succeeded=False)
         return 1
 
 

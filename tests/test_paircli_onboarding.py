@@ -195,12 +195,17 @@ def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
 
     monkeypatch.setattr(onboarding, "write_summary", write_summary)
     uploads = []
+    notifications = []
     monkeypatch.setattr(onboarding, "upload_archive", lambda *args: uploads.append(args) or "artifact-123")
+    monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: notifications.append((args, kwargs)))
 
     assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 0
     assert uploads == [("https://github.com/acme/repo/pull/42", artifacts.with_suffix(".zip"), onboarding.auth_file())]
     status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
     assert status["artifact_id"] == "artifact-123"
+    assert notifications == [
+        (("https://github.com/acme/repo/pull/42",), {"succeeded": True, "uploaded": True})
+    ]
 
 
 def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
@@ -223,6 +228,8 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
 
     monkeypatch.setattr(onboarding, "write_summary", write_summary)
     monkeypatch.setattr(onboarding, "upload_archive", reject_upload)
+    notifications = []
+    monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: notifications.append((args, kwargs)))
 
     assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 1
     status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
@@ -230,6 +237,9 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
     assert status["summary"] == str(artifacts / "summary.md")
     assert status["archive"] == str(artifacts.with_suffix(".zip"))
     assert artifacts.with_suffix(".zip").is_file()
+    assert notifications == [
+        (("https://github.com/acme/repo/pull/42",), {"succeeded": False})
+    ]
 
 
 def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch, tmp_path):
