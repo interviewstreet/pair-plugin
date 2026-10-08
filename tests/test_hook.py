@@ -54,6 +54,7 @@ def test_pr_create_starts_pair(python, tmp_path):
     assert "five-sh/awt#12" in out["systemMessage"]
     assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
     assert "https://pair.sh/five-sh/awt/pull/12" in out["hookSpecificOutput"]["additionalContext"]
+    assert out["comment"]["command"][-3:] == [URL.lower(), "https://pair.sh/five-sh/awt/pull/12", str(Path.cwd())]
     assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
     assert out["onboarding"]["status"] == "planned"
 

@@ -16,6 +16,7 @@ import sys
 import time
 from pathlib import Path
 
+from pair_pr_comment import start_pair_comment
 from paircli_onboarding import approval_command, start as start_paircli_onboarding
 
 GH_PR_CREATE = re.compile(r"(?:^|[\s;&|(/])gh\s+pr\s+create\b")
@@ -197,14 +198,16 @@ def main() -> int:
     harness = "codex" if is_codex else "claude-code"
     pr_url = f"https://github.com/{pr[0]}/pull/{pr[1]}"
     review_url = pair_pr_url(pr[0], pr[1])
+    comment = start_pair_comment(pr_url, review_url, repo_dir, pair_home() / "logs", dry_run)
     onboarding = start_paircli_onboarding(harness, dry_run, pr_url=pr_url, repo_dir=str(repo_dir))
-    message = f"{onboarding_message(onboarding, harness)} Pair review: {review_url}"
+    message = f"{onboarding_message(onboarding, harness)} Pair review: {review_url}. Posting this link to the PR."
 
     if is_codex:
         out = {"systemMessage": message,
                "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}}
         if dry_run:
             out["onboarding"] = onboarding
+            out["comment"] = comment
         print(json.dumps(out))
         return 0
 
@@ -225,6 +228,7 @@ def main() -> int:
     if dry_run:
         out["plan"] = plan
         out["onboarding"] = onboarding
+        out["comment"] = comment
     print(json.dumps(out))
     return 0
 
