@@ -23,7 +23,8 @@ immediately. The plugin then runs the triggering Codex or Claude agent in read-o
 write an AI-authored `summary.md` from the scan artifacts, PR diff, and linked
 session evidence. Pair also packages the complete commit folder as a sibling
 `<head-commit>.zip`, then requests a signed upload from Pair BE and streams the
-ZIP directly to S3.
+ZIP directly to S3 at
+`v1/reviews/<repository>/<pr-number>/<head-commit>/artifacts.zip`.
 This upload can include local agent session transcripts and prompts in addition
 to generated review files; plugin installation should disclose that data flow.
 The ZIP contains `.paircli/pr-<number>/<head-commit>/` and no other PRs.
