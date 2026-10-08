@@ -16,9 +16,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
+from pair_notification import notify_scan_result
 from paircli_archive import create_pr_archive
 from paircli_summary import write_summary
 from paircli_tls import compatible_tls_context
@@ -29,6 +30,7 @@ DEFAULT_REPOSITORY_URL = "https://github.com/rutvikchandla3/paircli"
 DEFAULT_RELEASE_MANIFEST_URL = "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
 DEFAULT_SERVER_URL = "https://prod-be.pair.sh"
 GITHUB_RELEASE_HOST = "github.com"
+GITHUB_RELEASE_REPOSITORY = "rutvikchandla3/paircli"
 GITHUB_RELEASE_PATH_PREFIX = "/rutvikchandla3/paircli/releases/"
 GITHUB_RELEASE_ASSET_HOSTS = {
     "github-releases.githubusercontent.com",
@@ -37,6 +39,10 @@ GITHUB_RELEASE_ASSET_HOSTS = {
 }
 COMMON_TOOL_DIRECTORIES = ("/opt/homebrew/bin", "/usr/local/bin")
 MAX_BINARY_SIZE_BYTES = 100 * 1024 * 1024
+RELEASE_DOWNLOAD_ATTEMPTS = 3
+MANIFEST_TIMEOUT_SECONDS = 45
+BINARY_TIMEOUT_SECONDS = 120
+RELEASE_RETRY_DELAYS_SECONDS = (1, 3)
 RELEASE_MANIFEST_ENV = "PAIRCLI_RELEASE_MANIFEST_URL"
 DEVELOPMENT_BUILD_ENV = "PAIRCLI_DEV_BUILD"
 SUPPORTED_HARNESSES = {"claude-code", "codex", "pi"}
@@ -286,15 +292,80 @@ def verify_json_response(response, requested_url: str) -> None:
         raise RuntimeError(f"paircli release manifest expected application/json, got {content_type or 'unknown'}")
 
 
+def github_release_asset(url: str) -> tuple[str | None, str] | None:
+    """Return the tag and asset name for this project's GitHub release URL."""
+    parsed = urlparse(url)
+    parts = parsed.path.strip("/").split("/")
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() != GITHUB_RELEASE_HOST or len(parts) != 6:
+        return None
+    if "/".join(parts[:3]) != f"{GITHUB_RELEASE_REPOSITORY}/releases":
+        return None
+    if parts[3:5] == ["latest", "download"]:
+        tag = None
+    elif parts[3] == "download" and parts[4]:
+        tag = unquote(parts[4])
+    else:
+        return None
+    asset = unquote(parts[5])
+    if not asset or Path(asset).name != asset:
+        return None
+    return tag, asset
+
+
+def fetch_github_release_asset(url: str, maximum_size: int) -> bytes | None:
+    """Download this project's release asset through an authenticated GitHub CLI."""
+    release_asset = github_release_asset(url)
+    gh = executable_path("gh")
+    if release_asset is None or gh is None:
+        return None
+    tag, asset = release_asset
+    with tempfile.TemporaryDirectory(prefix="paircli-release-") as directory:
+        command = [gh, "release", "download"]
+        if tag is not None:
+            command.append(tag)
+        command.extend(["--repo", GITHUB_RELEASE_REPOSITORY, "--pattern", asset, "--dir", directory])
+        try:
+            completed = subprocess.run(
+                command,
+                env=clean_environment(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=BINARY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("GitHub CLI timed out downloading the paircli release") from error
+        if completed.returncode != 0:
+            detail = completed.stdout.decode(errors="replace").strip()
+            raise RuntimeError(f"GitHub CLI could not download the paircli release: {detail or 'unknown error'}")
+        downloaded = Path(directory) / asset
+        try:
+            with downloaded.open("rb") as source:
+                payload = source.read(maximum_size + 1)
+        except OSError as error:
+            raise RuntimeError(f"GitHub CLI did not produce the expected paircli release asset: {error}") from error
+        if len(payload) > maximum_size:
+            raise RuntimeError("paircli release asset exceeds the maximum download size")
+        return payload
+
+
 def fetch_json(url: str) -> dict[str, Any]:
     """Fetch a JSON release document from the configured release endpoint."""
-    request = Request(require_https_url(url, label="paircli release manifest URL"), headers={"User-Agent": "pair-plugin"})
-    try:
-        with urlopen(request, timeout=15, context=compatible_tls_context()) as response:
-            verify_json_response(response, url)
-            payload = response.read(MAX_BINARY_SIZE_BYTES)
-    except OSError as error:
-        raise RuntimeError(f"could not fetch paircli release manifest: {error}") from error
+    manifest_url = require_https_url(url, label="paircli release manifest URL")
+    payload = fetch_github_release_asset(manifest_url, MAX_BINARY_SIZE_BYTES)
+    if payload is None:
+        for attempt in range(RELEASE_DOWNLOAD_ATTEMPTS):
+            request = Request(manifest_url, headers={"User-Agent": "pair-plugin"})
+            try:
+                with urlopen(request, timeout=MANIFEST_TIMEOUT_SECONDS, context=compatible_tls_context()) as response:
+                    verify_json_response(response, url)
+                    payload = response.read(MAX_BINARY_SIZE_BYTES)
+                break
+            except OSError as error:
+                if attempt + 1 == RELEASE_DOWNLOAD_ATTEMPTS:
+                    raise RuntimeError(
+                        f"could not fetch paircli release manifest after {RELEASE_DOWNLOAD_ATTEMPTS} attempts: {error}"
+                    ) from error
+                time.sleep(RELEASE_RETRY_DELAYS_SECONDS[attempt])
     try:
         document = json.loads(payload)
     except (TypeError, ValueError) as error:
@@ -361,29 +432,49 @@ def write_release_metadata(home: Path, *, version: str, target: str, checksum: s
 def download_binary(url: str, destination: Path, checksum: str) -> None:
     """Download, verify, and atomically install a paircli executable."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix="paircli-", dir=str(destination.parent))
-    temporary = Path(temporary_name)
-    digest = hashlib.sha256()
-    total = 0
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            request = Request(url, headers={"User-Agent": "pair-plugin"})
-            with urlopen(request, timeout=30, context=compatible_tls_context()) as response:
-                verify_response_origin(response, url, label="paircli binary")
-                while chunk := response.read(64 * 1024):
-                    total += len(chunk)
-                    if total > MAX_BINARY_SIZE_BYTES:
-                        raise RuntimeError("paircli binary exceeds the maximum download size")
-                    digest.update(chunk)
-                    output.write(chunk)
-        if digest.hexdigest() != checksum:
+    github_payload = fetch_github_release_asset(url, MAX_BINARY_SIZE_BYTES)
+    if github_payload is not None:
+        if hashlib.sha256(github_payload).hexdigest() != checksum:
             raise RuntimeError("paircli binary checksum verification failed")
-        temporary.chmod(0o755)
-        temporary.replace(destination)
-    except OSError as error:
-        raise RuntimeError(f"could not download paircli binary: {error}") from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix="paircli-", dir=str(destination.parent))
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(github_payload)
+            temporary.chmod(0o755)
+            temporary.replace(destination)
+            return
+        finally:
+            temporary.unlink(missing_ok=True)
+    for attempt in range(RELEASE_DOWNLOAD_ATTEMPTS):
+        descriptor, temporary_name = tempfile.mkstemp(prefix="paircli-", dir=str(destination.parent))
+        temporary = Path(temporary_name)
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                request = Request(url, headers={"User-Agent": "pair-plugin"})
+                with urlopen(request, timeout=BINARY_TIMEOUT_SECONDS, context=compatible_tls_context()) as response:
+                    verify_response_origin(response, url, label="paircli binary")
+                    while chunk := response.read(64 * 1024):
+                        total += len(chunk)
+                        if total > MAX_BINARY_SIZE_BYTES:
+                            raise RuntimeError("paircli binary exceeds the maximum download size")
+                        digest.update(chunk)
+                        output.write(chunk)
+            if digest.hexdigest() != checksum:
+                raise RuntimeError("paircli binary checksum verification failed")
+            temporary.chmod(0o755)
+            temporary.replace(destination)
+            return
+        except OSError as error:
+            if attempt + 1 == RELEASE_DOWNLOAD_ATTEMPTS:
+                raise RuntimeError(
+                    f"could not download paircli binary after {RELEASE_DOWNLOAD_ATTEMPTS} attempts: {error}"
+                ) from error
+            time.sleep(RELEASE_RETRY_DELAYS_SECONDS[attempt])
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def run_command(command: list[str], *, cwd: Path, log, timeout: int = COMMAND_TIMEOUT_SECONDS) -> None:
@@ -740,12 +831,14 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
                 output.write(f"uploaded Pair artifact {artifact_id}\n")
         write_scan_status(home, "complete", log=str(log), pr_url=pr_url, summary=str(summary),
                           archive=str(archive), artifact_id=artifact_id)
+        notify_scan_result(pr_url, succeeded=True, uploaded=bool(artifact_id))
         return 0
     except Exception as error:
         write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=pr_url,
                           artifacts=str(artifact_dir) if artifact_dir else "",
                           summary=str(summary) if "summary" in locals() else "",
                           archive=str(archive) if "archive" in locals() else "")
+        notify_scan_result(pr_url, succeeded=False)
         return 1
 
 

@@ -52,6 +52,9 @@ def test_pr_create_starts_pair(python, tmp_path):
     assert plan["cwd"] == str(tmp_path / "pair-home")
     assert plan["url"] == "http://127.0.0.1:7788/review/?key=five-sh__awt__12"
     assert "five-sh/awt#12" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["hookSpecificOutput"]["additionalContext"]
+    assert out["comment"]["command"][-3:] == [URL.lower(), "https://pair.sh/five-sh/awt/pull/12", str(Path.cwd())]
     assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
     assert out["onboarding"]["status"] == "planned"
 
@@ -143,6 +146,7 @@ def test_codex_resolves_pr_when_hook_omits_tool_response(tmp_path):
 
     assert out["onboarding"]["status"] == "planned"
     assert "Pair setup status: planned" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
 
 
 def test_ignores_ambiguous_pr_urls(tmp_path):
@@ -188,6 +192,7 @@ def test_codex_starts_setup_without_a_consent_block(tmp_path):
 
     assert "decision" not in out
     assert "Pair setup started for codex" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
 
 
 def test_codex_reports_prior_setup_failure_without_blocking(tmp_path):
@@ -212,6 +217,7 @@ def test_codex_reports_prior_setup_failure_without_blocking(tmp_path):
     assert "decision" not in out
     assert "continue" not in out
     assert "Pair setup previously failed" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
 
 
 def test_live_hook_starts_setup_automatically(tmp_path):

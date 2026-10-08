@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 from email.message import Message
 from hashlib import sha256
@@ -195,12 +196,17 @@ def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
 
     monkeypatch.setattr(onboarding, "write_summary", write_summary)
     uploads = []
+    notifications = []
     monkeypatch.setattr(onboarding, "upload_archive", lambda *args: uploads.append(args) or "artifact-123")
+    monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: notifications.append((args, kwargs)))
 
     assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 0
     assert uploads == [("https://github.com/acme/repo/pull/42", artifacts.with_suffix(".zip"), onboarding.auth_file())]
     status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
     assert status["artifact_id"] == "artifact-123"
+    assert notifications == [
+        (("https://github.com/acme/repo/pull/42",), {"succeeded": True, "uploaded": True})
+    ]
 
 
 def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
@@ -223,6 +229,8 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
 
     monkeypatch.setattr(onboarding, "write_summary", write_summary)
     monkeypatch.setattr(onboarding, "upload_archive", reject_upload)
+    notifications = []
+    monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: notifications.append((args, kwargs)))
 
     assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 1
     status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
@@ -230,6 +238,9 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
     assert status["summary"] == str(artifacts / "summary.md")
     assert status["archive"] == str(artifacts.with_suffix(".zip"))
     assert artifacts.with_suffix(".zip").is_file()
+    assert notifications == [
+        (("https://github.com/acme/repo/pull/42",), {"succeeded": False})
+    ]
 
 
 def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch, tmp_path):
@@ -353,6 +364,54 @@ def test_ensure_paircli_downloads_and_verifies_release(monkeypatch, tmp_path):
     }
 
 
+def test_fetch_json_retries_transport_timeouts(monkeypatch):
+    manifest = json.dumps({"version": "0.1.0", "artifacts": {}}).encode()
+    attempts = []
+    delays = []
+
+    def flaky_urlopen(request, **kwargs):
+        attempts.append((request.full_url, kwargs["timeout"]))
+        if len(attempts) < 3:
+            raise TimeoutError("read timed out")
+        return FakeResponse(manifest, request.full_url)
+
+    monkeypatch.setattr(onboarding, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(onboarding, "fetch_github_release_asset", lambda *_args: None)
+    monkeypatch.setattr(onboarding.time, "sleep", delays.append)
+
+    assert onboarding.fetch_json("https://cdn.example.test/latest.json")["version"] == "0.1.0"
+    assert attempts == [
+        ("https://cdn.example.test/latest.json", onboarding.MANIFEST_TIMEOUT_SECONDS),
+        ("https://cdn.example.test/latest.json", onboarding.MANIFEST_TIMEOUT_SECONDS),
+        ("https://cdn.example.test/latest.json", onboarding.MANIFEST_TIMEOUT_SECONDS),
+    ]
+    assert delays == list(onboarding.RELEASE_RETRY_DELAYS_SECONDS)
+
+
+def test_download_binary_retries_transport_timeout(monkeypatch, tmp_path):
+    binary_contents = b"paircli"
+    checksum = sha256(binary_contents).hexdigest()
+    attempts = []
+    delays = []
+
+    def flaky_urlopen(request, **kwargs):
+        attempts.append(kwargs["timeout"])
+        if len(attempts) == 1:
+            raise TimeoutError("read timed out")
+        return FakeResponse(binary_contents, request.full_url, content_type="application/octet-stream")
+
+    monkeypatch.setattr(onboarding, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(onboarding, "fetch_github_release_asset", lambda *_args: None)
+    monkeypatch.setattr(onboarding.time, "sleep", delays.append)
+
+    destination = tmp_path / "bin" / "paircli"
+    onboarding.download_binary("https://cdn.example.test/paircli", destination, checksum)
+
+    assert destination.read_bytes() == binary_contents
+    assert attempts == [onboarding.BINARY_TIMEOUT_SECONDS, onboarding.BINARY_TIMEOUT_SECONDS]
+    assert delays == [onboarding.RELEASE_RETRY_DELAYS_SECONDS[0]]
+
+
 def test_ensure_paircli_rejects_checksum_mismatch(monkeypatch, tmp_path):
     manifest = json.dumps(
         {
@@ -436,6 +495,7 @@ def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
     requested_urls = []
 
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
+    monkeypatch.setattr(onboarding, "fetch_github_release_asset", lambda *_args: None)
     monkeypatch.setattr(
         onboarding,
         "urlopen",
@@ -448,6 +508,36 @@ def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
 
     assert requested_urls[0] == onboarding.DEFAULT_RELEASE_MANIFEST_URL
     assert requested_urls[0] == "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
+
+
+def test_fetches_known_github_release_asset_with_gh(monkeypatch, tmp_path):
+    gh = tmp_path / "gh"
+    gh.write_text("gh")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        destination = Path(command[command.index("--dir") + 1]) / "latest.json"
+        destination.write_text('{"version":"0.2.0"}')
+        return subprocess.CompletedProcess(command, 0, stdout=b"")
+
+    monkeypatch.setattr(onboarding, "executable_path", lambda name: str(gh) if name == "gh" else None)
+    monkeypatch.setattr(onboarding.subprocess, "run", fake_run)
+
+    payload = onboarding.fetch_github_release_asset(
+        "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json",
+        1024,
+    )
+
+    assert payload == b'{"version":"0.2.0"}'
+    assert calls[0][0][:3] == [str(gh), "release", "download"]
+    assert "--repo" in calls[0][0]
+
+
+def test_rejects_other_github_release_repositories():
+    assert onboarding.github_release_asset(
+        "https://github.com/example/paircli/releases/latest/download/latest.json"
+    ) is None
 
 
 def test_ensure_paircli_rejects_an_incompatible_plugin(monkeypatch, tmp_path):
