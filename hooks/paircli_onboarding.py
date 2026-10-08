@@ -38,6 +38,10 @@ GITHUB_RELEASE_ASSET_HOSTS = {
 }
 COMMON_TOOL_DIRECTORIES = ("/opt/homebrew/bin", "/usr/local/bin")
 MAX_BINARY_SIZE_BYTES = 100 * 1024 * 1024
+RELEASE_DOWNLOAD_ATTEMPTS = 3
+MANIFEST_TIMEOUT_SECONDS = 45
+BINARY_TIMEOUT_SECONDS = 120
+RELEASE_RETRY_DELAYS_SECONDS = (1, 3)
 RELEASE_MANIFEST_ENV = "PAIRCLI_RELEASE_MANIFEST_URL"
 DEVELOPMENT_BUILD_ENV = "PAIRCLI_DEV_BUILD"
 SUPPORTED_HARNESSES = {"claude-code", "codex", "pi"}
@@ -289,13 +293,20 @@ def verify_json_response(response, requested_url: str) -> None:
 
 def fetch_json(url: str) -> dict[str, Any]:
     """Fetch a JSON release document from the configured release endpoint."""
-    request = Request(require_https_url(url, label="paircli release manifest URL"), headers={"User-Agent": "pair-plugin"})
-    try:
-        with urlopen(request, timeout=15, context=compatible_tls_context()) as response:
-            verify_json_response(response, url)
-            payload = response.read(MAX_BINARY_SIZE_BYTES)
-    except OSError as error:
-        raise RuntimeError(f"could not fetch paircli release manifest: {error}") from error
+    manifest_url = require_https_url(url, label="paircli release manifest URL")
+    for attempt in range(RELEASE_DOWNLOAD_ATTEMPTS):
+        request = Request(manifest_url, headers={"User-Agent": "pair-plugin"})
+        try:
+            with urlopen(request, timeout=MANIFEST_TIMEOUT_SECONDS, context=compatible_tls_context()) as response:
+                verify_json_response(response, url)
+                payload = response.read(MAX_BINARY_SIZE_BYTES)
+            break
+        except OSError as error:
+            if attempt + 1 == RELEASE_DOWNLOAD_ATTEMPTS:
+                raise RuntimeError(
+                    f"could not fetch paircli release manifest after {RELEASE_DOWNLOAD_ATTEMPTS} attempts: {error}"
+                ) from error
+            time.sleep(RELEASE_RETRY_DELAYS_SECONDS[attempt])
     try:
         document = json.loads(payload)
     except (TypeError, ValueError) as error:
@@ -362,29 +373,35 @@ def write_release_metadata(home: Path, *, version: str, target: str, checksum: s
 def download_binary(url: str, destination: Path, checksum: str) -> None:
     """Download, verify, and atomically install a paircli executable."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix="paircli-", dir=str(destination.parent))
-    temporary = Path(temporary_name)
-    digest = hashlib.sha256()
-    total = 0
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            request = Request(url, headers={"User-Agent": "pair-plugin"})
-            with urlopen(request, timeout=30, context=compatible_tls_context()) as response:
-                verify_response_origin(response, url, label="paircli binary")
-                while chunk := response.read(64 * 1024):
-                    total += len(chunk)
-                    if total > MAX_BINARY_SIZE_BYTES:
-                        raise RuntimeError("paircli binary exceeds the maximum download size")
-                    digest.update(chunk)
-                    output.write(chunk)
-        if digest.hexdigest() != checksum:
-            raise RuntimeError("paircli binary checksum verification failed")
-        temporary.chmod(0o755)
-        temporary.replace(destination)
-    except OSError as error:
-        raise RuntimeError(f"could not download paircli binary: {error}") from error
-    finally:
-        temporary.unlink(missing_ok=True)
+    for attempt in range(RELEASE_DOWNLOAD_ATTEMPTS):
+        descriptor, temporary_name = tempfile.mkstemp(prefix="paircli-", dir=str(destination.parent))
+        temporary = Path(temporary_name)
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                request = Request(url, headers={"User-Agent": "pair-plugin"})
+                with urlopen(request, timeout=BINARY_TIMEOUT_SECONDS, context=compatible_tls_context()) as response:
+                    verify_response_origin(response, url, label="paircli binary")
+                    while chunk := response.read(64 * 1024):
+                        total += len(chunk)
+                        if total > MAX_BINARY_SIZE_BYTES:
+                            raise RuntimeError("paircli binary exceeds the maximum download size")
+                        digest.update(chunk)
+                        output.write(chunk)
+            if digest.hexdigest() != checksum:
+                raise RuntimeError("paircli binary checksum verification failed")
+            temporary.chmod(0o755)
+            temporary.replace(destination)
+            return
+        except OSError as error:
+            if attempt + 1 == RELEASE_DOWNLOAD_ATTEMPTS:
+                raise RuntimeError(
+                    f"could not download paircli binary after {RELEASE_DOWNLOAD_ATTEMPTS} attempts: {error}"
+                ) from error
+            time.sleep(RELEASE_RETRY_DELAYS_SECONDS[attempt])
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def run_command(command: list[str], *, cwd: Path, log, timeout: int = COMMAND_TIMEOUT_SECONDS) -> None:

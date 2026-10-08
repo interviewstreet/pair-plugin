@@ -363,6 +363,52 @@ def test_ensure_paircli_downloads_and_verifies_release(monkeypatch, tmp_path):
     }
 
 
+def test_fetch_json_retries_transport_timeouts(monkeypatch):
+    manifest = json.dumps({"version": "0.1.0", "artifacts": {}}).encode()
+    attempts = []
+    delays = []
+
+    def flaky_urlopen(request, **kwargs):
+        attempts.append((request.full_url, kwargs["timeout"]))
+        if len(attempts) < 3:
+            raise TimeoutError("read timed out")
+        return FakeResponse(manifest, request.full_url)
+
+    monkeypatch.setattr(onboarding, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(onboarding.time, "sleep", delays.append)
+
+    assert onboarding.fetch_json("https://cdn.example.test/latest.json")["version"] == "0.1.0"
+    assert attempts == [
+        ("https://cdn.example.test/latest.json", onboarding.MANIFEST_TIMEOUT_SECONDS),
+        ("https://cdn.example.test/latest.json", onboarding.MANIFEST_TIMEOUT_SECONDS),
+        ("https://cdn.example.test/latest.json", onboarding.MANIFEST_TIMEOUT_SECONDS),
+    ]
+    assert delays == list(onboarding.RELEASE_RETRY_DELAYS_SECONDS)
+
+
+def test_download_binary_retries_transport_timeout(monkeypatch, tmp_path):
+    binary_contents = b"paircli"
+    checksum = sha256(binary_contents).hexdigest()
+    attempts = []
+    delays = []
+
+    def flaky_urlopen(request, **kwargs):
+        attempts.append(kwargs["timeout"])
+        if len(attempts) == 1:
+            raise TimeoutError("read timed out")
+        return FakeResponse(binary_contents, request.full_url, content_type="application/octet-stream")
+
+    monkeypatch.setattr(onboarding, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(onboarding.time, "sleep", delays.append)
+
+    destination = tmp_path / "bin" / "paircli"
+    onboarding.download_binary("https://cdn.example.test/paircli", destination, checksum)
+
+    assert destination.read_bytes() == binary_contents
+    assert attempts == [onboarding.BINARY_TIMEOUT_SECONDS, onboarding.BINARY_TIMEOUT_SECONDS]
+    assert delays == [onboarding.RELEASE_RETRY_DELAYS_SECONDS[0]]
+
+
 def test_ensure_paircli_rejects_checksum_mismatch(monkeypatch, tmp_path):
     manifest = json.dumps(
         {
