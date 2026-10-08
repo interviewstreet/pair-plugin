@@ -77,13 +77,20 @@ def _upload_target(auth_path: Path) -> tuple[str | None, str]:
     return _credential(auth_path)
 
 
-def _sign_upload(server: str, token: str | None, file_path: str) -> dict:
+def _commit_hash(archive: Path) -> str:
+    match = re.fullmatch(r"([0-9a-f]{40})\.zip", archive.name)
+    if match is None:
+        raise ValueError("PR artifact ZIP filename must be a commit hash")
+    return match.group(1)
+
+
+def _sign_upload(server: str, token: str | None, file_path: str, commit_hash: str) -> dict:
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = Request(
         f"{server}/api/v1/upload/url",
-        data=json.dumps({"filePath": file_path}).encode("utf-8"),
+        data=json.dumps({"filePath": file_path, "commitHash": commit_hash}).encode("utf-8"),
         headers=headers,
         method="POST",
     )
@@ -103,15 +110,18 @@ def _sign_upload(server: str, token: str | None, file_path: str) -> dict:
         raise RuntimeError("Pair BE upload response is too large")
     try:
         signed = json.loads(raw)["data"]
-        if signed["method"] != "POST" or signed["filePath"] != file_path:
+        if (signed["method"] != "POST" or signed["filePath"] != file_path
+                or signed["commitHash"] != commit_hash):
             raise ValueError("unexpected signed upload")
-        artifact_id = UUID(signed["id"])
+        UUID(signed["id"])
         fields = signed["fields"]
         if not isinstance(fields, dict) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in fields.items()
         ):
             raise ValueError("invalid S3 fields")
-        if fields.get("Content-Type") != "application/zip" or fields.get("key") != f"repositories/{file_path}/{artifact_id}.zip":
+        _, repository, pr_number = file_path.split("/")
+        expected_key = f"v1/reviews/{repository}/{pr_number}/{commit_hash}/artifacts.zip"
+        if fields.get("Content-Type") != "application/zip" or fields.get("key") != expected_key:
             raise ValueError("unexpected S3 upload policy")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError("Pair BE returned an invalid signed upload") from error
@@ -184,7 +194,8 @@ def _post_to_s3(signed: dict, archive: Path) -> None:
 def upload_archive(pr_url: str, archive: Path, auth_path: Path) -> str:
     """Sign with Pair BE, then stream the ZIP to S3."""
     file_path = _file_path(pr_url)
+    commit_hash = _commit_hash(archive)
     token, server = _upload_target(auth_path)
-    signed = _sign_upload(server, token, file_path)
+    signed = _sign_upload(server, token, file_path, commit_hash)
     _post_to_s3(signed, archive)
     return signed["id"]
