@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 from email.message import Message
 from hashlib import sha256
@@ -375,6 +376,7 @@ def test_fetch_json_retries_transport_timeouts(monkeypatch):
         return FakeResponse(manifest, request.full_url)
 
     monkeypatch.setattr(onboarding, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(onboarding, "fetch_github_release_asset", lambda *_args: None)
     monkeypatch.setattr(onboarding.time, "sleep", delays.append)
 
     assert onboarding.fetch_json("https://cdn.example.test/latest.json")["version"] == "0.1.0"
@@ -399,6 +401,7 @@ def test_download_binary_retries_transport_timeout(monkeypatch, tmp_path):
         return FakeResponse(binary_contents, request.full_url, content_type="application/octet-stream")
 
     monkeypatch.setattr(onboarding, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(onboarding, "fetch_github_release_asset", lambda *_args: None)
     monkeypatch.setattr(onboarding.time, "sleep", delays.append)
 
     destination = tmp_path / "bin" / "paircli"
@@ -492,6 +495,7 @@ def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
     requested_urls = []
 
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
+    monkeypatch.setattr(onboarding, "fetch_github_release_asset", lambda *_args: None)
     monkeypatch.setattr(
         onboarding,
         "urlopen",
@@ -504,6 +508,36 @@ def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
 
     assert requested_urls[0] == onboarding.DEFAULT_RELEASE_MANIFEST_URL
     assert requested_urls[0] == "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
+
+
+def test_fetches_known_github_release_asset_with_gh(monkeypatch, tmp_path):
+    gh = tmp_path / "gh"
+    gh.write_text("gh")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        destination = Path(command[command.index("--dir") + 1]) / "latest.json"
+        destination.write_text('{"version":"0.2.0"}')
+        return subprocess.CompletedProcess(command, 0, stdout=b"")
+
+    monkeypatch.setattr(onboarding, "executable_path", lambda name: str(gh) if name == "gh" else None)
+    monkeypatch.setattr(onboarding.subprocess, "run", fake_run)
+
+    payload = onboarding.fetch_github_release_asset(
+        "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json",
+        1024,
+    )
+
+    assert payload == b'{"version":"0.2.0"}'
+    assert calls[0][0][:3] == [str(gh), "release", "download"]
+    assert "--repo" in calls[0][0]
+
+
+def test_rejects_other_github_release_repositories():
+    assert onboarding.github_release_asset(
+        "https://github.com/example/paircli/releases/latest/download/latest.json"
+    ) is None
 
 
 def test_ensure_paircli_rejects_an_incompatible_plugin(monkeypatch, tmp_path):
