@@ -1,11 +1,17 @@
-"""Upload one commit-scoped Pair ZIP through Pair BE's signed S3 POST."""
+"""Publish one commit-scoped evidence ZIP through the review publication protocol."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import http.client
 import json
 import os
 import re
 import secrets
+import shutil
+import sqlite3
+import tempfile
+import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlparse
@@ -45,7 +51,8 @@ def _server_origin(server: str) -> str:
         parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
     ):
         raise ValueError("Pair backend URL must use HTTPS outside localhost")
-    if not parsed.netloc or parsed.username or parsed.password or parsed.path not in {"", "/"}:
+    if (not parsed.netloc or parsed.username or parsed.password or parsed.path not in {"", "/"}
+            or parsed.query or parsed.fragment):
         raise ValueError("Pair backend URL must be an origin without credentials or a path")
     return server.rstrip("/")
 
@@ -68,13 +75,17 @@ def _credential(path: Path) -> tuple[str, str]:
         not isinstance(stored_server, str) or stored_server.rstrip("/") != configured_server.rstrip("/")
     ):
         raise RuntimeError("Pair CLI login belongs to a different backend; log in to this Pair backend")
+    if "\r" in token or "\n" in token:
+        raise RuntimeError("Pair CLI credential contains invalid header characters")
     return token, _server_origin(server)
 
 
-def _upload_target(auth_path: Path) -> tuple[str | None, str]:
+def _upload_target(auth_path: Path) -> tuple[str, str]:
+    token, server = _credential(auth_path)
     if upload_server := os.environ.get("PAIRCLI_UPLOAD_SERVER_URL"):
-        return None, _server_origin(upload_server)
-    return _credential(auth_path)
+        if _server_origin(upload_server) != server:
+            raise RuntimeError("Pair CLI login belongs to a different upload backend; log in there first")
+    return token, server
 
 
 def _commit_hash(archive: Path) -> str:
@@ -84,48 +95,120 @@ def _commit_hash(archive: Path) -> str:
     return match.group(1)
 
 
-def _sign_upload(server: str, token: str | None, file_path: str, commit_hash: str) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+def _request_json(server: str, token: str, path: str, payload: dict, statuses: set[int]) -> dict:
     request = Request(
-        f"{server}/api/v1/upload/url",
-        data=json.dumps({"filePath": file_path, "commitHash": commit_hash}).encode("utf-8"),
-        headers=headers,
+        server + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST",
     )
     try:
         opener = build_opener(NoRedirects(), HTTPSHandler(context=compatible_tls_context()))
         with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            if response.status != 201:
-                raise RuntimeError(f"Pair BE rejected upload signing (HTTP {response.status})")
+            if response.status not in statuses:
+                raise RuntimeError(f"Pair rejected evidence publication (HTTP {response.status})")
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except HTTPError as error:
-        if error.code == 401:
-            raise RuntimeError("Pair CLI login expired or was rejected; run paircli login and retry upload") from error
-        if error.code == 403:
-            raise RuntimeError("Pair refused artifact upload for this account (HTTP 403)") from error
-        raise RuntimeError(f"Pair BE rejected upload signing (HTTP {error.code})") from error
+        messages = {
+            401: "Pair CLI login expired or was rejected; run paircli login and retry publication",
+            403: "Pair refused evidence publication; check GitHub App authorization and repository access",
+            404: "Pair review publication or repository is unavailable",
+            409: "Pair publication conflicts with server state; preserve the ZIP and resolve the revision conflict",
+        }
+        raise RuntimeError(messages.get(error.code, f"Pair rejected evidence publication (HTTP {error.code})"))
     if len(raw) > MAX_RESPONSE_BYTES:
-        raise RuntimeError("Pair BE upload response is too large")
+        raise RuntimeError("Pair publication response is too large")
     try:
-        signed = json.loads(raw)["data"]
-        if (signed["method"] != "POST" or signed["filePath"] != file_path
-                or signed["commitHash"] != commit_hash):
-            raise ValueError("unexpected signed upload")
-        UUID(signed["id"])
+        result = json.loads(raw)["data"]
+        if not isinstance(result, dict):
+            raise ValueError("invalid publication")
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("Pair returned an invalid publication response") from error
+    return result
+
+
+def _revision(archive: Path, server: str, metadata: dict) -> int:
+    # The journal contains only bundle metadata. Replays keep their revision;
+    # new content advances across heads, even if the local clock moves back.
+    journal = archive.parent / ".publication-revisions.sqlite3"
+    with sqlite3.connect(journal, timeout=30) as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("""CREATE TABLE IF NOT EXISTS revisions (
+            server TEXT, head TEXT, digest TEXT, size INTEGER, revision INTEGER,
+            PRIMARY KEY (server, head, digest, size))""")
+        values = (server, metadata["head_sha"], metadata["sha256"], metadata["size"])
+        row = db.execute(
+            "SELECT revision FROM revisions WHERE server=? AND head=? AND digest=? AND size=?", values,
+        ).fetchone()
+        if row:
+            return row[0]
+        latest = db.execute("SELECT COALESCE(MAX(revision), 0) FROM revisions WHERE server=?", (server,))
+        revision = max(time.time_ns(), latest.fetchone()[0] + 1)
+        if not 0 < revision < 2**63:
+            raise RuntimeError("Local publication revision is outside the backend integer range")
+        db.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?)", (*values, revision))
+        return revision
+
+
+def _validate_publication(publication: dict, metadata: dict) -> None:
+    try:
+        for field in ("publication_id", "review_id"):
+            if UUID(publication[field]).int == 0:
+                raise ValueError("missing publication identity")
+        for field in ("head_sha", "revision", "sha256", "size"):
+            if type(publication[field]) is not type(metadata[field]) or publication[field] != metadata[field]:
+                raise ValueError("publication metadata mismatch")
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise RuntimeError("Pair returned mismatched publication metadata") from error
+
+
+def _reserve(server: str, token: str, metadata: dict) -> dict:
+    publication = _request_json(server, token, "/api/v1/reviews/publications/upload-url", metadata, {200, 201})
+    _validate_publication(publication, metadata)
+    try:
+        if (type(publication["pull_number"]) is not int
+                or publication["pull_number"] != metadata["pull_number"]):
+            raise ValueError("different pull request")
+        for field in ("owner", "repo"):
+            if not isinstance(publication[field], str) or not publication[field].strip():
+                raise ValueError("missing canonical coordinates")
+        if publication["state"] == "finalized" and publication["upload"] is None:
+            return publication
+        signed = publication["upload"]
+        if publication["state"] != "reserved" or signed["method"] != "POST":
+            raise ValueError("unexpected publication state")
         fields = signed["fields"]
-        if not isinstance(fields, dict) or not all(
-            isinstance(key, str) and isinstance(value, str) for key, value in fields.items()
-        ):
-            raise ValueError("invalid S3 fields")
-        _, repository, pr_number = file_path.split("/")
-        expected_key = f"v1/reviews/{repository}/{pr_number}/{commit_hash}/artifacts.zip"
-        if fields.get("Content-Type") != "application/zip" or fields.get("key") != expected_key:
-            raise ValueError("unexpected S3 upload policy")
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise RuntimeError("Pair BE returned an invalid signed upload") from error
-    return signed
+        if not isinstance(fields, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                 for k, v in fields.items()):
+            raise ValueError("invalid upload fields")
+        checksum = base64.b64encode(bytes.fromhex(metadata["sha256"])).decode("ascii")
+        key = fields.get("key", "")
+        pattern = (
+            rf"v1/reviews/[1-9][0-9]*/{metadata['pull_number']}/{metadata['head_sha']}/bundles/"
+            rf"([0-9a-f-]{{36}})/{metadata['revision']}/{metadata['sha256']}\.zip"
+        )
+        match = re.fullmatch(pattern, key)
+        if not match or UUID(match.group(1)).int == 0:
+            raise ValueError("unexpected publication object key")
+        if (fields.get("Content-Type") != "application/zip"
+                or fields.get("x-amz-checksum-algorithm") != "SHA256"
+                or fields.get("x-amz-checksum-sha256") != checksum):
+            raise ValueError("unexpected publication checksum policy")
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise RuntimeError("Pair returned an invalid publication upload") from error
+    return publication
+
+
+def _finalize(server: str, token: str, publication: dict, metadata: dict) -> None:
+    result = _request_json(
+        server, token, f"/api/v1/reviews/publications/{publication['publication_id']}/finalize", {}, {200},
+    )
+    _validate_publication(result, metadata)
+    if (result.get("publication_id") != publication["publication_id"]
+            or result.get("review_id") != publication["review_id"] or result.get("state") != "finalized"
+            or not isinstance(result.get("finalized_at"), str) or not result["finalized_at"]
+            or type(result.get("content_version")) is not int or result["content_version"] < 1):
+        raise RuntimeError("Pair did not confirm finalized review evidence")
 
 
 def _multipart_parts(fields: dict[str, str], boundary: str, filename: str) -> tuple[list[bytes], bytes, bytes]:
@@ -192,10 +275,29 @@ def _post_to_s3(signed: dict, archive: Path) -> None:
 
 
 def upload_archive(pr_url: str, archive: Path, auth_path: Path) -> str:
-    """Sign with Pair BE, then stream the ZIP to S3."""
-    file_path = _file_path(pr_url)
-    commit_hash = _commit_hash(archive)
+    """Reserve, upload and finalize; an S3 success alone is not publication."""
+    owner, repo, number = _file_path(pr_url).split("/")
+    head = _commit_hash(archive)
     token, server = _upload_target(auth_path)
-    signed = _sign_upload(server, token, file_path, commit_hash)
-    _post_to_s3(signed, archive)
-    return signed["id"]
+    if archive.is_symlink() or not archive.is_file():
+        raise ValueError("PR artifact ZIP must be a regular file")
+    if not 0 < archive.stat().st_size <= MAX_ARCHIVE_BYTES:
+        raise ValueError("PR artifact ZIP exceeds the 100 MiB upload limit")
+    # Hold immutable bytes across hashing and upload while another scan can
+    # atomically replace the original archive. Credentials never enter it.
+    with tempfile.TemporaryDirectory(prefix="pair-publication-") as directory:
+        snapshot = Path(directory) / archive.name
+        shutil.copyfile(archive, snapshot)
+        size = snapshot.stat().st_size
+        if not 0 < size <= MAX_ARCHIVE_BYTES:
+            raise ValueError("PR artifact ZIP exceeds the 100 MiB upload limit")
+        with snapshot.open("rb") as source:
+            digest = hashlib.file_digest(source, "sha256").hexdigest()
+        metadata = {"owner": owner, "repo": repo, "pull_number": int(number),
+                    "head_sha": head, "sha256": digest, "size": size}
+        metadata["revision"] = _revision(archive, server, metadata)
+        publication = _reserve(server, token, metadata)
+        if publication["state"] == "reserved":
+            _post_to_s3(publication["upload"], snapshot)
+        _finalize(server, token, publication, metadata)
+        return publication["publication_id"]
