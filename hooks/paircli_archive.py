@@ -4,11 +4,20 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import shutil
 import zipfile
 from pathlib import Path
 
 
 MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
+
+
+def _write_entry(archive, source: Path, name: str) -> None:
+    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o100644 << 16
+    with source.open("rb") as contents, archive.open(info, "w") as output:
+        shutil.copyfileobj(contents, output)
 
 
 def create_pr_archive(repo_dir: Path, artifact_dir: Path) -> Path:
@@ -35,11 +44,12 @@ def create_pr_archive(repo_dir: Path, artifact_dir: Path) -> Path:
     try:
         with os.fdopen(descriptor, "wb") as output:
             with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                _write_entry(archive, folder / "summary.md", "overview.md")
                 for path in sorted(folder.rglob("*")):
                     if path.is_symlink():
                         raise ValueError(f"PR artifact contains a symlink: {path.relative_to(folder)}")
                     if path.is_file():
-                        archive.write(path, path.relative_to(repo_root))
+                        _write_entry(archive, path, path.relative_to(repo_root).as_posix())
                     elif not path.is_dir():
                         raise ValueError(f"PR artifact contains a non-file: {path.relative_to(folder)}")
         size = temporary.stat().st_size

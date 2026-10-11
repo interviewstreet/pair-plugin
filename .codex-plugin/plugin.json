@@ -1,6 +1,6 @@
 {
   "name": "pair",
-  "version": "0.1.0+codex.20261007063827",
+  "version": "0.2.0+codex.20261011",
   "description": "Review pull requests with context from the coding-agent sessions that built them.",
   "author": {
     "name": "five-sh"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Pair",
     "shortDescription": "Bring PR context into your coding-agent workflow.",
-    "longDescription": "Pair starts CLI setup and login when your agent session opens, then scans and uploads artifacts after pull-request creation.",
+    "longDescription": "Installs Pair CLI, generates PR evidence, and publishes it for Pair review workspaces.",
     "developerName": "five-sh",
     "category": "Developer Tools",
     "capabilities": [

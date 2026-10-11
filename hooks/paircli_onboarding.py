@@ -52,7 +52,7 @@ SCAN_TIMEOUT_SECONDS = 16 * 60
 METADATA_TIMEOUT_SECONDS = 20
 LOCK_STALE_AFTER_SECONDS = 30 * 60
 CONSENT_VERSION = "1"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 
 
 def plugin_data_home() -> Path | None:
@@ -388,7 +388,8 @@ def release_artifact(manifest: dict[str, Any], target: str) -> tuple[str, str, s
     checksum = artifact.get("sha256")
     if not isinstance(url, str) or not url:
         raise RuntimeError(f"paircli release {version} is missing a download URL for {target}")
-    if not isinstance(checksum, str) or len(checksum) != 64 or any(character not in "0123456789abcdef" for character in checksum.lower()):
+    if (not isinstance(checksum, str) or len(checksum) != 64
+            or any(character not in "0123456789abcdef" for character in checksum.lower())):
         raise RuntimeError(f"paircli release {version} has an invalid SHA-256 for {target}")
     return version, require_https_url(url, label="paircli binary URL"), checksum.lower()
 
@@ -504,7 +505,8 @@ def build_paircli_from_source(home: Path, log) -> Path:
     else:
         source.parent.mkdir(parents=True, exist_ok=True)
         run_command(
-            [git, "clone", "--depth", "1", os.environ.get("PAIRCLI_REPOSITORY_URL", DEFAULT_REPOSITORY_URL), str(source)],
+            [git, "clone", "--depth", "1",
+             os.environ.get("PAIRCLI_REPOSITORY_URL", DEFAULT_REPOSITORY_URL), str(source)],
             cwd=source.parent,
             log=log,
         )
@@ -664,7 +666,9 @@ def approval_command(harness: str) -> str:
     return f"{sys.executable} {Path(__file__).resolve()} approve --harness {harness}"
 
 
-def start(harness: str, dry_run: bool = False, pr_url: str | None = None, repo_dir: str | None = None) -> dict[str, Any]:
+def start(
+    harness: str, dry_run: bool = False, pr_url: str | None = None, repo_dir: str | None = None,
+) -> dict[str, Any]:
     if os.environ.get("PAIRCLI_ONBOARDING_DISABLE") == "1":
         return {"status": "disabled"}
     if harness not in SUPPORTED_HARNESSES:
@@ -729,7 +733,8 @@ def uninstall(harness: str) -> dict[str, str]:
             if binary.is_file() and os.access(binary, os.X_OK):
                 run_command([str(binary), "hook", "uninstall", harness], cwd=home, log=output)
                 run_command([str(binary), "logout"], cwd=home, log=output)
-        for path in (binary, release_metadata_path(home), consent_path(home), lock_path(home), pending_scan_path(home), scan_status_path(home)):
+        for path in (binary, release_metadata_path(home), consent_path(home), lock_path(home),
+                     pending_scan_path(home), scan_status_path(home)):
             path.unlink(missing_ok=True)
         auth_file().unlink(missing_ok=True)
         source = source_path(home)
@@ -751,7 +756,9 @@ def run(log: Path, harness: str) -> int:
             output.write("paircli plugin onboarding started\n")
             binary = ensure_paircli(home, output)
             try:
-                run_command([str(binary), "update", "--quiet", "--plugin-version", PLUGIN_VERSION], cwd=home, log=output)
+                run_command(
+                    [str(binary), "update", "--quiet", "--plugin-version", PLUGIN_VERSION], cwd=home, log=output,
+                )
             except RuntimeError as error:
                 output.write(f"paircli update skipped: {error}\n")
             run_command([str(binary), "hook", "install", harness], cwd=home, log=output)
