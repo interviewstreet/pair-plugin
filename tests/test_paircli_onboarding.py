@@ -82,7 +82,9 @@ def test_start_skips_completed_active_onboarding(monkeypatch, tmp_path):
     onboarding.grant_consent(tmp_path, "codex")
     onboarding.write_status(tmp_path, "complete", binary=str(binary), log="/tmp/onboarding.log")
     monkeypatch.setattr(onboarding, "has_active_login", lambda: True)
-    monkeypatch.setattr(onboarding.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("unexpected onboarding restart"))
+    monkeypatch.setattr(
+        onboarding.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("unexpected onboarding restart"),
+    )
 
     result = onboarding.start("codex")
 
@@ -138,7 +140,10 @@ def test_run_schedules_pending_scan_after_login(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
     monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
     scheduled = []
-    monkeypatch.setattr(onboarding, "launch_pending_scan", lambda home, executable, harness: scheduled.append((home, executable, harness)))
+    monkeypatch.setattr(
+        onboarding, "launch_pending_scan",
+        lambda home, executable, harness: scheduled.append((home, executable, harness)),
+    )
     onboarding.grant_consent(tmp_path, "codex")
     onboarding.queue_scan(tmp_path, "https://github.com/acme/repo/pull/42", str(repo))
 
@@ -169,7 +174,7 @@ def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_
 
     assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 0
     assert json.loads(calls.read_text()) == [
-        ["update", "--quiet", "--plugin-version", "0.1.0"],
+        ["update", "--quiet", "--plugin-version", "0.2.0"],
         ["scan", "https://github.com/acme/repo/pull/42", "--snapshot", "--out", str(artifacts)],
     ]
     assert generated[0][:4] == ("codex", "https://github.com/acme/repo/pull/42", repo, artifacts)
@@ -351,7 +356,9 @@ def test_ensure_paircli_downloads_and_verifies_release(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
     monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
-    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url))
+    monkeypatch.setattr(
+        onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url),
+    )
 
     binary = onboarding.ensure_paircli(tmp_path, None)
 
@@ -424,7 +431,9 @@ def test_ensure_paircli_rejects_checksum_mismatch(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
     monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
-    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url))
+    monkeypatch.setattr(
+        onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url),
+    )
 
     with pytest.raises(RuntimeError, match="checksum"):
         onboarding.ensure_paircli(tmp_path, None)
@@ -434,7 +443,9 @@ def test_ensure_paircli_rejects_checksum_mismatch(monkeypatch, tmp_path):
 def test_ensure_paircli_rejects_manifest_redirect_or_html(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
     monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
-    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(b"<html>", "https://www.example.test/"))
+    monkeypatch.setattr(
+        onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(b"<html>", "https://www.example.test/"),
+    )
 
     with pytest.raises(RuntimeError, match="different origin"):
         onboarding.ensure_paircli(tmp_path, None)
@@ -571,7 +582,10 @@ def test_run_installs_hooks_then_logs_in(monkeypatch, tmp_path):
 
     assert result == 0
     assert onboarding.read_status(tmp_path)["status"] == "complete"
-    assert json.loads(calls.read_text()) == [["update", "--quiet", "--plugin-version", "0.1.0"], ["hook", "install", "codex"], ["login"]]
+    assert json.loads(calls.read_text()) == [
+        ["update", "--quiet", "--plugin-version", "0.2.0"],
+        ["hook", "install", "codex"], ["login"],
+    ]
     assert json.loads(auth.read_text())["server_url"] == onboarding.DEFAULT_SERVER_URL
 
 
@@ -592,7 +606,9 @@ def test_run_skips_login_when_a_live_credential_exists(monkeypatch, tmp_path):
 
     assert result == 0
     assert onboarding.read_status(tmp_path)["status"] == "complete"
-    assert json.loads(calls.read_text()) == [["update", "--quiet", "--plugin-version", "0.1.0"], ["hook", "install", "codex"]]
+    assert json.loads(calls.read_text()) == [
+        ["update", "--quiet", "--plugin-version", "0.2.0"], ["hook", "install", "codex"],
+    ]
 
 
 def test_run_logs_in_again_after_server_change(monkeypatch, tmp_path):
@@ -626,7 +642,7 @@ def test_run_continues_when_update_is_unavailable(monkeypatch, tmp_path):
     onboarding.grant_consent(tmp_path, "codex")
 
     def failing_update(command, *, cwd, log, timeout=onboarding.COMMAND_TIMEOUT_SECONDS):
-        if command[1:] == ["update", "--quiet", "--plugin-version", "0.1.0"]:
+        if command[1:] == ["update", "--quiet", "--plugin-version", "0.2.0"]:
             raise RuntimeError("command exited 1: paircli update")
         original_run_command(command, cwd=cwd, log=log, timeout=timeout)
 
