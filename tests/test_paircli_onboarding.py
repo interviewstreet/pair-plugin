@@ -167,7 +167,7 @@ def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_
     def write_summary(*args):
         generated.append(args)
         summary = artifacts / "summary.md"
-        summary.write_text("# PR summary\n")
+        summary.write_text("# Change Summary\n")
         return summary
 
     monkeypatch.setattr(onboarding, "write_summary", write_summary)
@@ -196,7 +196,7 @@ def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
 
     def write_summary(*_args):
         summary = artifacts / "summary.md"
-        summary.write_text("# PR summary\n")
+        summary.write_text("# Change Summary\n")
         return summary
 
     monkeypatch.setattr(onboarding, "write_summary", write_summary)
@@ -226,7 +226,7 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
 
     def write_summary(*_args):
         summary = artifacts / "summary.md"
-        summary.write_text("# PR summary\n")
+        summary.write_text("# Change Summary\n")
         return summary
 
     def reject_upload(*_args):

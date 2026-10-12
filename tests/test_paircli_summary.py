@@ -15,30 +15,34 @@ sys.modules[SPEC.name] = summary
 SPEC.loader.exec_module(summary)
 
 PR_URL = "https://github.com/acme/repo/pull/42"
-MARKDOWN = """# PR summary
+MARKDOWN = """# Change Summary
 
-## What changed
+## What Changed
 
 Changed `handler.py` to retry failed requests.
 
-## Flowchart
+## Why
+
+Transient failures were returned immediately.
+
+## How It Works
 
 ```mermaid
 flowchart LR
   request --> retry --> response
 ```
 
-## Verification steps
+## Key Files
 
-Run `pytest`; no captured test run.
+- `handler.py` — applies the bounded retry.
 
-## Risks and open questions
+## Verification
+
+- [ ] Run `pytest`; no captured test run.
+
+## Review Notes
 
 Retry limits need review.
-
-## Evidence
-
-`snapshot.json` and `report.md`.
 """
 
 
@@ -93,6 +97,19 @@ def test_claude_writes_ai_summary_without_edit_tools(monkeypatch, tmp_path):
     assert result.read_text() == MARKDOWN
 
 
+def test_summary_prompt_requests_concise_reviewer_content(tmp_path):
+    _, artifacts = evidence(tmp_path)
+
+    prompt = summary.summary_prompt(PR_URL, artifacts)
+
+    for heading in ("# Change Summary", *summary.REQUIRED_SECTIONS):
+        assert heading in prompt
+    assert "between 300 and 600 words" in prompt
+    assert "do not add an Evidence section" in prompt
+    assert "Do not include commit hashes" in prompt
+    assert "complete changed-file list" in prompt
+
+
 def test_invalid_ai_output_does_not_replace_existing_summary(monkeypatch, tmp_path):
     repo, artifacts = evidence(tmp_path)
     target = artifacts / "summary.md"
@@ -100,6 +117,19 @@ def test_invalid_ai_output_does_not_replace_existing_summary(monkeypatch, tmp_pa
     monkeypatch.setattr(summary, "_run_codex", lambda *_args: "no evidence")
 
     with pytest.raises(RuntimeError, match="required Markdown sections"):
+        summary.write_summary("codex", PR_URL, repo, artifacts, io.StringIO())
+
+    assert target.read_text() == "previous valid summary"
+
+
+def test_overlong_ai_output_does_not_replace_existing_summary(monkeypatch, tmp_path):
+    repo, artifacts = evidence(tmp_path)
+    target = artifacts / "summary.md"
+    target.write_text("previous valid summary")
+    overlong = MARKDOWN + (" detail" * summary.MAX_SUMMARY_WORDS)
+    monkeypatch.setattr(summary, "_run_codex", lambda *_args: overlong)
+
+    with pytest.raises(RuntimeError, match="exceeded 700 words"):
         summary.write_summary("codex", PR_URL, repo, artifacts, io.StringIO())
 
     assert target.read_text() == "previous valid summary"

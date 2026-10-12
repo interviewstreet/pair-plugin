@@ -34,9 +34,13 @@ review workspace sync. Workspace installation still completes asynchronously.
 The ZIP contains a root `overview.md` copied from the generated summary, plus
 `.paircli/pr-<number>/<head-commit>/` and no other PRs. The source artifacts stay
 local, including `summary.md`, `report.md`, `signals.json`, `comment.md`,
-`agent-trace.json`, and `snapshot.json`. Uploads can include local agent session
-transcripts and prompts. The plugin does not use browser session cookies or
-reviewer JWTs; publishing requires the CLI device-login bearer.
+`agent-trace.json`, and `snapshot.json`. The summary is a concise reviewer brief
+covering what changed, why, the runtime flow, key implementation files,
+verification, and review notes. It uses the evidence internally without
+repeating commit metadata, artifact identifiers, raw logs, or a full
+changed-file list. Uploads can include local agent session transcripts and
+prompts. The plugin does not use browser session cookies or reviewer JWTs;
+publishing requires the CLI device-login bearer.
 
 ZIP timestamps and permissions are normalized so unchanged evidence has the
 same checksum. A local `.publication-revisions.sqlite3` beside the commit
