@@ -59,6 +59,95 @@ def test_pr_create_starts_pair(python, tmp_path):
     assert out["onboarding"]["status"] == "planned"
 
 
+@pytest.mark.parametrize("python", PYTHONS)
+def test_git_push_refreshes_existing_pr(python, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nprint({URL!r})\n")
+    gh.chmod(0o755)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = run(
+        event(f"cd {repo} && git push origin HEAD", "branch updated\n", exit_code=0),
+        {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        python=python,
+        tmp=tmp_path,
+    )
+
+    assert out["plan"]["key"] == "five-sh__awt__12"
+    assert out["onboarding"]["status"] == "planned"
+    assert out["comment"]["command"][-1] == str(repo)
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
+
+
+def test_git_dash_c_push_uses_target_repository(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nprint({URL!r})\n")
+    gh.chmod(0o755)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = run(
+        event(f"git -C {repo} push", "branch updated\n"),
+        {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        tmp=tmp_path,
+    )
+
+    assert out["comment"]["command"][-1] == str(repo)
+
+
+def test_codex_git_push_refreshes_without_starting_claude(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nprint({URL!r})\n")
+    gh.chmod(0o755)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = run(
+        event(f"cd {repo} && git push", "branch updated\n"),
+        {"PLUGIN_ROOT": "/plugins/pair", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        tmp=tmp_path,
+    )
+
+    assert "plan" not in out
+    assert out["onboarding"]["status"] == "planned"
+    assert out["comment"]["command"][-1] == str(repo)
+
+
+@pytest.mark.parametrize("command", [
+    "git push --delete origin old-branch",
+    "git push --tags",
+    "git push --mirror",
+    "echo 'git push'",
+])
+def test_ignores_pushes_that_do_not_update_the_current_pr_branch(command, tmp_path):
+    assert run(event(command, "done\n"), tmp=tmp_path) is None
+
+
+def test_ignores_failed_git_push(tmp_path):
+    assert run(event("git push", "", exit_code=1), tmp=tmp_path) is None
+
+
+def test_ignores_git_push_without_an_open_pr(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(1)\n")
+    gh.chmod(0o755)
+
+    assert run(
+        event("git push origin HEAD", "branch updated\n"),
+        {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        tmp=tmp_path,
+    ) is None
+
+
 def test_hook_config_resolves_codex_and_claude_plugin_roots():
     config = json.loads(HOOK_CONFIG.read_text())
     command = config["hooks"]["PostToolUse"][0]["hooks"][0]["command"]

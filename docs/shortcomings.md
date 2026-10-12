@@ -81,8 +81,13 @@ What the backend gets wrong or can't do yet, found by reading the code and check
 
 - **Job state is a pending list plus a 15-minute timer.** Fix: a status for each section (queued, running, done, failed, timed out) with its error, attempts, timings, tokens, and cost in `manifest.json`, and failures shown on the page.
 - **Two runs can start at once**, because `prepare` checks for an existing run outside the lock. Fix: a lease in the service, and dedupe by PR, head SHA, and payload hash.
-- **The hook only sees `gh pr create` inside Claude Code.** PRs from Codex, the GitHub UI, or a push followed by the web form are missed. Fix: add a Codex hook, poll open PRs, or build the brief on first open.
-- **Briefs go stale after new pushes**, and the reviewer can't trigger a new gather. Fix: resubmit on each push, and show "brief is for SHA X, PR is now at Y".
+- **The hook only sees agent-executed Git commands.** Codex and Claude runs catch
+  `gh pr create` and successful `git push` commands for branches with open PRs,
+  but GitHub UI changes and pushes from another terminal are missed. Fix: add a
+  server-side GitHub webhook or build the brief on first open.
+- **Push refreshes still depend on the local agent session.** The reviewer can't
+  trigger a new gather when the builder is offline. Fix: add an authenticated
+  server-side refresh action backed by GitHub webhooks.
 - **Personal defaults are hardcoded:** `allowed_repos=["five-sh/awt"]`, GitHub account names, `~/dev`, and the awt and orca layouts (`config.py`, `repos.py`). Fix: config plus auto-detection.
 - **Nothing is cleaned up.** Worktrees are removed only on Close (6 are left here), and old briefs pile up per SHA. Fix: time-based cleanup and S3 lifecycle rules.
 - **A failed upload is lost.** Fix: queue it on the builder and retry.

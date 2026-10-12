@@ -18,8 +18,10 @@ than reusing an unexpired token from the previous server.
 
 If a PR is created before login finishes, its scan is queued until setup
 completes. Pair then runs `paircli scan <pr-url> --snapshot` in that repository.
-Later eligible `gh pr create` calls start the same scan in the background
-immediately. The plugin then runs the triggering Codex or Claude agent in read-only mode to
+Later eligible `gh pr create` calls and successful `git push` commands for a
+branch with an open PR start the same scan in the background immediately. Each
+new PR head is stored under its own commit directory and publication prefix.
+The plugin then runs the triggering Codex or Claude agent in read-only mode to
 write an AI-authored `summary.md` from the scan artifacts, PR diff, and linked
 session evidence. Pair packages the complete commit folder as a sibling `<head-commit>.zip`.
 It reserves evidence with `POST /api/v1/reviews/publications/upload-url`, streams
