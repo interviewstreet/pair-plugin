@@ -78,12 +78,17 @@ def test_upload_target_rejects_insecure_private_backend(tmp_path, monkeypatch):
 def test_sign_upload_sends_bearer_and_checks_policy(monkeypatch):
     artifact_id = uuid4()
     file_path = "acme/repo/42"
+    commit_hash = "a" * 40
     signed = {
         "id": str(artifact_id),
         "method": "POST",
         "filePath": file_path,
+        "commitHash": commit_hash,
         "url": "https://bucket.s3.us-east-1.amazonaws.com",
-        "fields": {"key": f"repositories/{file_path}/{artifact_id}.zip", "Content-Type": "application/zip"},
+        "fields": {
+            "key": f"v1/reviews/{file_path}/{commit_hash}/artifacts.zip",
+            "Content-Type": "application/zip",
+        },
     }
     requests = []
 
@@ -97,22 +102,27 @@ def test_sign_upload_sends_bearer_and_checks_policy(monkeypatch):
 
     monkeypatch.setattr(upload, "build_opener", lambda *_: Opener())
 
-    assert upload._sign_upload("https://pair.example", "cli-token", file_path) == signed
+    assert upload._sign_upload("https://pair.example", "cli-token", file_path, commit_hash) == signed
     request, timeout = requests[0]
     assert request.get_header("Authorization") == "Bearer cli-token"
-    assert json.loads(request.data) == {"filePath": file_path}
+    assert json.loads(request.data) == {"filePath": file_path, "commitHash": commit_hash}
     assert timeout == upload.REQUEST_TIMEOUT_SECONDS
 
 
 def test_sign_upload_to_private_backend_sends_no_bearer(monkeypatch):
     artifact_id = uuid4()
     file_path = "acme/repo/42"
+    commit_hash = "b" * 40
     signed = {
         "id": str(artifact_id),
         "method": "POST",
         "filePath": file_path,
+        "commitHash": commit_hash,
         "url": "https://bucket.s3.us-east-1.amazonaws.com",
-        "fields": {"key": f"repositories/{file_path}/{artifact_id}.zip", "Content-Type": "application/zip"},
+        "fields": {
+            "key": f"v1/reviews/{file_path}/{commit_hash}/artifacts.zip",
+            "Content-Type": "application/zip",
+        },
     }
     requests = []
 
@@ -125,7 +135,7 @@ def test_sign_upload_to_private_backend_sends_no_bearer(monkeypatch):
             return Response(json.dumps({"data": signed}).encode())
 
     monkeypatch.setattr(upload, "build_opener", lambda *_: Opener())
-    assert upload._sign_upload("https://private.pair.example", None, file_path) == signed
+    assert upload._sign_upload("https://private.pair.example", None, file_path, commit_hash) == signed
     assert requests[0].get_header("Authorization") is None
     assert requests[0].full_url == "https://private.pair.example/api/v1/upload/url"
 
@@ -138,7 +148,20 @@ def test_sign_upload_reports_forbidden_account(monkeypatch):
     monkeypatch.setattr(upload, "build_opener", lambda *_: Opener())
 
     with pytest.raises(RuntimeError, match="refused artifact upload for this account"):
-        upload._sign_upload("http://localhost:8080", "cli-token", "acme/repo/42")
+        upload._sign_upload("http://localhost:8080", "cli-token", "acme/repo/42", "c" * 40)
+
+
+def test_upload_archive_requires_commit_scoped_filename(tmp_path, monkeypatch):
+    archive = tmp_path / "artifacts.zip"
+    archive.write_bytes(b"zip-data")
+    monkeypatch.setattr(upload, "_upload_target", lambda _: pytest.fail("must not request credentials"))
+
+    with pytest.raises(ValueError, match="filename must be a commit hash"):
+        upload.upload_archive(
+            "https://github.com/acme/repo/pull/42",
+            archive,
+            tmp_path / "auth.json",
+        )
 
 
 def test_post_to_s3_streams_zip_last_without_pair_token(tmp_path, monkeypatch):
@@ -148,7 +171,7 @@ def test_post_to_s3_streams_zip_last_without_pair_token(tmp_path, monkeypatch):
     signed = {
         "url": "https://bucket.s3.us-east-1.amazonaws.com",
         "fields": {
-            "key": f"acme/repo/42/{artifact_id}.zip",
+            "key": f"v1/reviews/acme/repo/42/{'a' * 40}/artifacts.zip",
             "Content-Type": "application/zip",
             "policy": "signed-policy",
         },

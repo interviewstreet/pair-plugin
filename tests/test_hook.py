@@ -145,6 +145,34 @@ def test_codex_resolves_pr_when_hook_omits_tool_response(tmp_path):
     assert "Pair setup status: planned" in out["systemMessage"]
 
 
+def test_push_on_existing_pr_starts_incremental_scan(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nprint({URL!r})\n")
+    gh.chmod(0o755)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = run(
+        {
+            "cwd": str(repo),
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push origin HEAD"},
+            "tool_response": {"stdout": "pushed", "stderr": "", "exit_code": 0, "interrupted": False},
+        },
+        {"PLUGIN_ROOT": "/plugins/pair", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        tmp=tmp_path,
+    )
+
+    assert out["onboarding"]["status"] == "planned"
+    assert "Pair setup status: planned" in out["systemMessage"]
+
+
+def test_failed_push_is_ignored(tmp_path):
+    assert run(event("git push origin HEAD", "", exit_code=1), tmp=tmp_path) is None
+
+
 def test_ignores_ambiguous_pr_urls(tmp_path):
     out = run(event("gh pr create --fill", f"{URL}\nhttps://github.com/Five-SH/awt/pull/13\n"), tmp=tmp_path)
     assert out is None

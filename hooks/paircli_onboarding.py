@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 from paircli_archive import create_pr_archive
 from paircli_summary import write_summary
+from paircli_transcripts import commit_transcript_capture, stage_incremental_transcripts
 from paircli_upload import upload_archive
 
 
@@ -285,6 +286,77 @@ def verify_json_response(response, requested_url: str) -> None:
         raise RuntimeError(f"paircli release manifest expected application/json, got {content_type or 'unknown'}")
 
 
+def certificate_verification_failed(error: BaseException) -> bool:
+    """Detect the macOS Python certificate-chain failure that system curl can handle."""
+    current: BaseException | None = error
+    while current is not None:
+        if "CERTIFICATE_VERIFY_FAILED" in str(current):
+            return True
+        reason = getattr(current, "reason", None)
+        current = reason if isinstance(reason, BaseException) else current.__cause__
+    return False
+
+
+def download_with_curl(url: str, destination: Path, *, label: str, timeout: int) -> tuple[str, str]:
+    """Download with the system trust store while preserving release-origin restrictions."""
+    curl = executable_path("curl")
+    if curl is None:
+        raise RuntimeError(f"could not download {label}: curl is not installed")
+    scheme = urlparse(url).scheme
+    protocols = "=https" if scheme == "https" else "=http,https"
+    command = [
+        curl,
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--max-redirs",
+        "5",
+        "--proto",
+        protocols,
+        "--proto-redir",
+        protocols,
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        str(timeout),
+        "--max-filesize",
+        str(MAX_BINARY_SIZE_BYTES),
+        "--user-agent",
+        "pair-plugin",
+        "--output",
+        str(destination),
+        "--write-out",
+        "%{url_effective}\n%{content_type}",
+        url,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            env=clean_environment(),
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"could not download {label}: timed out") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"curl exited {completed.returncode}"
+        raise RuntimeError(f"could not download {label}: {detail}")
+    metadata = completed.stdout.splitlines()
+    if len(metadata) != 2:
+        raise RuntimeError(f"could not download {label}: curl returned invalid metadata")
+    final_url, content_type = metadata
+    requested = urlparse(url)
+    final = urlparse(final_url)
+    same_origin = (final.scheme, final.netloc) == (requested.scheme, requested.netloc)
+    if not same_origin and not is_github_release_asset_redirect(requested, final):
+        raise RuntimeError(f"{label} redirected to a different origin")
+    if destination.stat().st_size > MAX_BINARY_SIZE_BYTES:
+        raise RuntimeError(f"{label} exceeds the maximum download size")
+    return final_url, content_type.split(";", 1)[0].strip().lower()
+
+
 def fetch_json(url: str) -> dict[str, Any]:
     """Fetch a JSON release document from the configured release endpoint."""
     request = Request(require_https_url(url, label="paircli release manifest URL"), headers={"User-Agent": "pair-plugin"})
@@ -293,7 +365,27 @@ def fetch_json(url: str) -> dict[str, Any]:
             verify_json_response(response, url)
             payload = response.read(MAX_BINARY_SIZE_BYTES)
     except OSError as error:
-        raise RuntimeError(f"could not fetch paircli release manifest: {error}") from error
+        if not certificate_verification_failed(error):
+            raise RuntimeError(f"could not fetch paircli release manifest: {error}") from error
+        descriptor, temporary_name = tempfile.mkstemp(prefix="paircli-manifest-")
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            final_url, content_type = download_with_curl(
+                url,
+                temporary,
+                label="paircli release manifest",
+                timeout=15,
+            )
+            requested = urlparse(url)
+            final = urlparse(final_url)
+            if not is_accepted_manifest_content_type(content_type, requested, final):
+                raise RuntimeError(
+                    f"paircli release manifest expected application/json, got {content_type or 'unknown'}"
+                )
+            payload = temporary.read_bytes()
+        finally:
+            temporary.unlink(missing_ok=True)
     try:
         document = json.loads(payload)
     except (TypeError, ValueError) as error:
@@ -362,19 +454,26 @@ def download_binary(url: str, destination: Path, checksum: str) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix="paircli-", dir=str(destination.parent))
     temporary = Path(temporary_name)
-    digest = hashlib.sha256()
-    total = 0
     try:
-        with os.fdopen(descriptor, "wb") as output:
+        os.close(descriptor)
+        try:
             request = Request(url, headers={"User-Agent": "pair-plugin"})
-            with urlopen(request, timeout=30) as response:
+            with temporary.open("wb") as output, urlopen(request, timeout=30) as response:
                 verify_response_origin(response, url, label="paircli binary")
+                total = 0
                 while chunk := response.read(64 * 1024):
                     total += len(chunk)
                     if total > MAX_BINARY_SIZE_BYTES:
                         raise RuntimeError("paircli binary exceeds the maximum download size")
-                    digest.update(chunk)
                     output.write(chunk)
+        except OSError as error:
+            if not certificate_verification_failed(error):
+                raise
+            download_with_curl(url, temporary, label="paircli binary", timeout=30)
+        digest = hashlib.sha256()
+        with temporary.open("rb") as source:
+            while chunk := source.read(64 * 1024):
+                digest.update(chunk)
         if digest.hexdigest() != checksum:
             raise RuntimeError("paircli binary checksum verification failed")
         temporary.chmod(0o755)
@@ -727,6 +826,8 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
                 [str(binary), "scan", pr_url, "--snapshot", "--out", str(artifact_dir)],
                 cwd=repo_dir, log=output, timeout=SCAN_TIMEOUT_SECONDS,
             )
+            transcript_capture = stage_incremental_transcripts(artifact_dir)
+            output.write(f"captured incremental raw sessions in {transcript_capture.manifest_path}\n")
             (artifact_dir / "summary.md").unlink(missing_ok=True)
             output.write(f"generating AI summary.md with {harness}\n")
             summary = write_summary(harness, pr_url, repo_dir, artifact_dir, output)
@@ -737,6 +838,8 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
             if os.environ.get("PAIRCLI_UPLOAD_ENABLED", "1") != "0":
                 artifact_id = upload_archive(pr_url, archive, auth_file())
                 output.write(f"uploaded Pair artifact {artifact_id}\n")
+            commit_transcript_capture(transcript_capture)
+            output.write(f"advanced transcript cursor for {artifact_dir.name}\n")
         write_scan_status(home, "complete", log=str(log), pr_url=pr_url, summary=str(summary),
                           archive=str(archive), artifact_id=artifact_id)
         return 0

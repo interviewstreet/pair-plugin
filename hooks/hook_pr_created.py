@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: after `gh pr create` prints a PR URL, build its review brief with a headless /pair run.
+"""PostToolUse hook: scan after PR creation and later pushes to an open PR.
 
 Standard library only, and compatible with the macOS system Python, because hooks run with whatever
 `python3` is on PATH.
@@ -19,6 +19,7 @@ from pathlib import Path
 from paircli_onboarding import approval_command, start as start_paircli_onboarding
 
 GH_PR_CREATE = re.compile(r"(?:^|[\s;&|(/])gh\s+pr\s+create\b")
+GIT_PUSH = re.compile(r"(?:^|[\s;&|(/])git\s+push\b")
 PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([\w.-]+)/pull/(\d+)")
 ALLOWED_TOOLS = ["Bash(pair-brief *)", "Read(~/.pair/briefs/**)", "Edit(~/.pair/briefs/**)",
                  "Write(~/.pair/briefs/**)"]
@@ -49,7 +50,7 @@ def base_url() -> str:
 
 
 def repo_directory_from_event(event: dict, command: str) -> Path:
-    """Resolve the directory in which the successful `gh pr create` ran."""
+    """Resolve the directory in which the successful PR command ran."""
     raw_cwd = event.get("cwd")
     cwd = Path(raw_cwd).expanduser() if isinstance(raw_cwd, str) and raw_cwd else Path.cwd()
     try:
@@ -57,15 +58,16 @@ def repo_directory_from_event(event: dict, command: str) -> Path:
     except ValueError:
         return cwd
 
-    try:
-        gh_index = next(
-            index for index in range(len(tokens) - 2) if tokens[index:index + 3] == ["gh", "pr", "create"]
-        )
-    except StopIteration:
+    command_indexes = [
+        index for index in range(len(tokens))
+        if tokens[index:index + 3] == ["gh", "pr", "create"] or tokens[index:index + 2] == ["git", "push"]
+    ]
+    if not command_indexes:
         return cwd
+    command_index = command_indexes[-1]
 
-    for index in range(gh_index - 1, -1, -1):
-        if tokens[index] == "cd" and index + 1 < gh_index:
+    for index in range(command_index - 1, -1, -1):
+        if tokens[index] == "cd" and index + 1 < command_index:
             candidate = Path(tokens[index + 1]).expanduser()
             return candidate if candidate.is_absolute() else cwd / candidate
     return cwd
@@ -99,11 +101,17 @@ def pr_from_event(event: dict, repo_dir: Path) -> tuple[str, int] | None:
     if event.get("tool_name") != "Bash":
         return None
     command = (event.get("tool_input") or {}).get("command") or ""
-    if not GH_PR_CREATE.search(command):
+    is_create = bool(GH_PR_CREATE.search(command))
+    is_push = bool(GIT_PUSH.search(command))
+    if not is_create and not is_push:
         return None
     response = event.get("tool_response")
     if isinstance(response, dict) and response.get("interrupted"):
         return None
+    if isinstance(response, dict) and response.get("exit_code") not in {None, 0, "0"}:
+        return None
+    if is_push and not is_create:
+        return pr_from_current_branch(repo_dir)
     if response is None:
         return pr_from_current_branch(repo_dir)
     stdout = response.get("stdout", "") if isinstance(response, dict) else response

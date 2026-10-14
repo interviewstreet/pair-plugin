@@ -7,6 +7,7 @@ from email.message import Message
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,6 +48,21 @@ def make_paircli(tmp_path: Path) -> Path:
     )
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
     return binary
+
+
+def stub_transcript_capture(monkeypatch, artifact_dir: Path):
+    committed = []
+
+    def stage(_artifact_dir):
+        assert _artifact_dir == artifact_dir
+        manifest = artifact_dir / "raw-sessions" / "manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text('{"schema_version":1,"sessions":[]}\n')
+        return SimpleNamespace(manifest_path=manifest)
+
+    monkeypatch.setattr(onboarding, "stage_incremental_transcripts", stage)
+    monkeypatch.setattr(onboarding, "commit_transcript_capture", committed.append)
+    return committed
 
 
 def test_start_plans_a_background_bootstrap(monkeypatch, tmp_path):
@@ -157,6 +173,7 @@ def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_
     artifacts = repo / ".paircli" / "pr-42" / ("a" * 40)
     artifacts.mkdir(parents=True)
     monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
+    committed = stub_transcript_capture(monkeypatch, artifacts)
     generated = []
     def write_summary(*args):
         generated.append(args)
@@ -176,6 +193,7 @@ def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_
     assert status["summary"] == str(artifacts / "summary.md")
     assert status["archive"] == str(artifacts.with_suffix(".zip"))
     assert status["artifact_id"] == ""
+    assert len(committed) == 1
 
 
 def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
@@ -187,6 +205,7 @@ def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
     monkeypatch.delenv("PAIRCLI_UPLOAD_ENABLED", raising=False)
     monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
     monkeypatch.setattr(onboarding, "run_command", lambda *args, **kwargs: None)
+    committed = stub_transcript_capture(monkeypatch, artifacts)
 
     def write_summary(*_args):
         summary = artifacts / "summary.md"
@@ -201,6 +220,7 @@ def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
     assert uploads == [("https://github.com/acme/repo/pull/42", artifacts.with_suffix(".zip"), onboarding.auth_file())]
     status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
     assert status["artifact_id"] == "artifact-123"
+    assert len(committed) == 1
 
 
 def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
@@ -212,6 +232,7 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_UPLOAD_ENABLED", "1")
     monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
     monkeypatch.setattr(onboarding, "run_command", lambda *args, **kwargs: None)
+    committed = stub_transcript_capture(monkeypatch, artifacts)
 
     def write_summary(*_args):
         summary = artifacts / "summary.md"
@@ -230,6 +251,7 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
     assert status["summary"] == str(artifacts / "summary.md")
     assert status["archive"] == str(artifacts.with_suffix(".zip"))
     assert artifacts.with_suffix(".zip").is_file()
+    assert committed == []
 
 
 def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch, tmp_path):
@@ -242,6 +264,7 @@ def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch,
     monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
     monkeypatch.setenv("PAIRCLI_CALLS", str(tmp_path / "calls.json"))
     monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
+    committed = stub_transcript_capture(monkeypatch, artifacts)
 
     def fail_summary(*_args):
         raise RuntimeError("agent unavailable")
@@ -254,11 +277,10 @@ def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch,
     assert status["status"] == "failed"
     assert status["error"] == "agent unavailable"
     assert status["artifacts"] == str(artifacts)
+    assert committed == []
 
 
 def test_artifact_directory_uses_pr_head_commit(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-
     commit = "c" * 40
     replies = iter((str(tmp_path) + "\n", commit + "\n"))
     calls = []
@@ -387,6 +409,52 @@ def test_ensure_paircli_rejects_manifest_redirect_or_html(monkeypatch, tmp_path)
     )
     with pytest.raises(RuntimeError, match="application/json"):
         onboarding.ensure_paircli(tmp_path, None)
+
+
+def test_fetch_json_uses_system_curl_for_python_certificate_failure(monkeypatch, tmp_path):
+    manifest = {"version": "0.2.0", "artifacts": {}}
+    monkeypatch.setattr(
+        onboarding,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("CERTIFICATE_VERIFY_FAILED")),
+    )
+
+    def curl_fallback(url, destination, *, label, timeout):
+        assert label == "paircli release manifest"
+        assert timeout == 15
+        destination.write_text(json.dumps(manifest))
+        return url, "application/json"
+
+    monkeypatch.setattr(onboarding, "download_with_curl", curl_fallback)
+
+    assert onboarding.fetch_json("https://cdn.example.test/latest.json") == manifest
+
+
+def test_download_binary_uses_system_curl_for_python_certificate_failure(monkeypatch, tmp_path):
+    contents = b"paircli-binary"
+    destination = tmp_path / "paircli"
+    monkeypatch.setattr(
+        onboarding,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("CERTIFICATE_VERIFY_FAILED")),
+    )
+
+    def curl_fallback(url, temporary, *, label, timeout):
+        assert label == "paircli binary"
+        assert timeout == 30
+        temporary.write_bytes(contents)
+        return url, "application/octet-stream"
+
+    monkeypatch.setattr(onboarding, "download_with_curl", curl_fallback)
+
+    onboarding.download_binary(
+        "https://cdn.example.test/paircli",
+        destination,
+        sha256(contents).hexdigest(),
+    )
+
+    assert destination.read_bytes() == contents
+    assert destination.stat().st_mode & stat.S_IXUSR
 
 
 def test_allows_github_release_asset_redirect():
