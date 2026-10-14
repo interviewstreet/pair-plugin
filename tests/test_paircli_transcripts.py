@@ -136,3 +136,15 @@ def test_unattributed_head_does_not_capture_other_pr_sessions(tmp_path):
     manifest = json.loads(pending.manifest_path.read_text())
 
     assert manifest["sessions"] == []
+
+
+def test_snapshot_with_no_linked_sessions_stages_empty_capture(tmp_path):
+    artifact_dir = tmp_path / "repo" / ".paircli" / "pr-11" / ("e" * 40)
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "snapshot.json").write_text(json.dumps({"sessions": None}), encoding="utf-8")
+
+    pending = transcripts.stage_incremental_transcripts(artifact_dir)
+    manifest = json.loads(pending.manifest_path.read_text())
+
+    assert manifest["sessions"] == []
+    assert manifest["head_sha"] == "e" * 40

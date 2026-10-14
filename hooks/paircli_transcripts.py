@@ -221,7 +221,9 @@ def stage_incremental_transcripts(artifact_dir: Path) -> PendingTranscriptCaptur
         raise ValueError("incremental transcript capture requires a commit-scoped artifact directory")
     snapshot = _read_json(artifact_dir / "snapshot.json")
     sessions = snapshot.get("sessions")
-    if not isinstance(sessions, list):
+    if sessions is None:
+        sessions = []
+    elif not isinstance(sessions, list):
         raise RuntimeError("Pair snapshot is missing linked sessions")
 
     state_path = artifact_dir.parent / "transcript-state.json"
