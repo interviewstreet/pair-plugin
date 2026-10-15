@@ -262,14 +262,15 @@ def test_concurrent_revision_assignment_converges(tmp_path):
     assert len(set(values)) == 1
 
 
-def test_upload_reserve_s3_finalize_order_and_immutable_bytes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("finalize_status", [200, 202])
+def test_upload_reserve_s3_finalize_order_and_immutable_bytes(tmp_path, monkeypatch, finalize_status):
     archive = tmp_path / (COMMIT_HASH + ".zip")
     archive.write_bytes(b"zip-data")
     auth = tmp_path / "auth.json"
     auth.write_text(json.dumps({"access_token": "test-cli-token", "server_url": "https://pair.example"}))
     monkeypatch.setattr(upload.time, "time_ns", lambda: 7)
     reserved = publication(metadata())
-    requests = fake_backend(monkeypatch, [(201, reserved), (200, finalized(reserved))])
+    requests = fake_backend(monkeypatch, [(201, reserved), (finalize_status, finalized(reserved))])
     observed = []
 
     def post(signed, snapshot):
@@ -309,7 +310,8 @@ def test_failed_publication_can_retry_same_revision(tmp_path, monkeypatch, failu
     reserved = publication(metadata())
     responses = [(201, reserved)]
     if failure_phase == "finalize":
-        responses.append(HTTPError("https://pair.example", 503, "private detail", {}, None))
+        responses.extend([HTTPError("https://pair.example", 503, "private detail", {}, None)] * 3)
+        monkeypatch.setattr(upload.time, "sleep", lambda _: None)
     requests = fake_backend(monkeypatch, responses)
 
     def failed_post(*_):
@@ -336,6 +338,20 @@ def test_finalize_requires_confirmed_matching_publication(monkeypatch, field, va
     fake_backend(monkeypatch, [(200, result)])
     with pytest.raises(RuntimeError, match="confirm|mismatched"):
         upload._finalize("https://pair.example", "test-cli-token", reserved, metadata())
+
+
+def test_finalize_retries_transient_failure_without_reupload(monkeypatch):
+    reserved = publication(metadata())
+    requests = fake_backend(monkeypatch, [
+        HTTPError("https://pair.example", 503, "private detail", {}, None),
+        (202, finalized(reserved)),
+    ])
+    monkeypatch.setattr(upload.time, "sleep", lambda _: None)
+
+    upload._finalize("https://pair.example", "test-cli-token", reserved, metadata())
+
+    assert len(requests) == 2
+    assert requests[0].full_url == requests[1].full_url
 
 
 def test_credential_rejects_header_injection_without_printing_token(tmp_path, monkeypatch):

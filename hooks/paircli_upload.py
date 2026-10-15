@@ -32,6 +32,10 @@ class NoRedirects(HTTPRedirectHandler):
         return None
 
 
+class RetryablePublicationError(RuntimeError):
+    """A transient backend response that permits replaying finalize."""
+
+
 def _file_path(pr_url: str) -> str:
     parsed = urlparse(pr_url)
     match = re.fullmatch(
@@ -109,6 +113,10 @@ def _request_json(server: str, token: str, path: str, payload: dict, statuses: s
                 raise RuntimeError(f"Pair rejected evidence publication (HTTP {response.status})")
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except HTTPError as error:
+        if error.code == 429 or error.code >= 500:
+            raise RetryablePublicationError(
+                f"Pair publication temporarily unavailable (HTTP {error.code})"
+            ) from None
         messages = {
             401: "Pair CLI login expired or was rejected; run paircli login and retry publication",
             403: "Pair refused evidence publication; check GitHub App authorization and repository access",
@@ -200,9 +208,17 @@ def _reserve(server: str, token: str, metadata: dict) -> dict:
 
 
 def _finalize(server: str, token: str, publication: dict, metadata: dict) -> None:
-    result = _request_json(
-        server, token, f"/api/v1/reviews/publications/{publication['publication_id']}/finalize", {}, {200},
-    )
+    for attempt in range(3):
+        try:
+            result = _request_json(
+                server, token, f"/api/v1/reviews/publications/{publication['publication_id']}/finalize",
+                {}, {200, 202},
+            )
+            break
+        except (OSError, RetryablePublicationError):
+            if attempt == 2:
+                raise
+            time.sleep(attempt + 1)
     _validate_publication(result, metadata)
     if (result.get("publication_id") != publication["publication_id"]
             or result.get("review_id") != publication["review_id"] or result.get("state") != "finalized"
