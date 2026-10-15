@@ -835,13 +835,17 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
             archive = create_pr_archive(repo_dir, artifact_dir)
             output.write(f"packaged {archive}\n")
             artifact_id = ""
+            upload_status = "disabled"
             if os.environ.get("PAIRCLI_UPLOAD_ENABLED", "1") != "0":
                 artifact_id = upload_archive(pr_url, archive, auth_file())
+                upload_status = "complete"
                 output.write(f"uploaded Pair artifact {artifact_id}\n")
+            else:
+                output.write("Pair artifact upload disabled by PAIRCLI_UPLOAD_ENABLED=0\n")
             commit_transcript_capture(transcript_capture)
             output.write(f"advanced transcript cursor for {artifact_dir.name}\n")
         write_scan_status(home, "complete", log=str(log), pr_url=pr_url, summary=str(summary),
-                          archive=str(archive), artifact_id=artifact_id)
+                          archive=str(archive), artifact_id=artifact_id, upload_status=upload_status)
         return 0
     except Exception as error:
         write_scan_status(home, "failed", error=str(error), log=str(log), pr_url=pr_url,

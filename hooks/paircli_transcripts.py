@@ -228,11 +228,19 @@ def stage_incremental_transcripts(artifact_dir: Path) -> PendingTranscriptCaptur
 
     state_path = artifact_dir.parent / "transcript-state.json"
     prior = _load_state(state_path)
+    raw_root = artifact_dir / "raw-sessions"
+    manifest_path = raw_root / "manifest.json"
+    if prior.get("last_head_sha") == head_sha and manifest_path.is_file():
+        existing = _read_json(manifest_path)
+        if existing.get("head_sha") != head_sha:
+            raise RuntimeError("raw transcript manifest does not match its commit directory")
+        existing_sessions = existing.get("sessions")
+        if existing_sessions or not sessions:
+            return PendingTranscriptCapture(state_path=state_path, state=prior, manifest_path=manifest_path)
     prior_sources = prior["sources"]
     next_sources = dict(prior_sources)
     previous_time = _previous_commit_time(snapshot)
     head_refs = _head_session_refs(snapshot, head_sha)
-    raw_root = artifact_dir / "raw-sessions"
     if raw_root.exists():
         if raw_root.is_symlink():
             raise ValueError("raw transcript directory must not be a symlink")
@@ -304,7 +312,6 @@ def stage_incremental_transcripts(artifact_dir: Path) -> PendingTranscriptCaptur
         "previous_head_sha": prior.get("last_head_sha", ""),
         "sessions": manifest_sessions,
     }
-    manifest_path = raw_root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     state = {
         "schema_version": SCHEMA_VERSION,

@@ -85,6 +85,58 @@ def test_captures_only_new_codex_prompt_range_per_head(tmp_path):
     assert next_manifest["previous_head_sha"] == "a" * 40
 
 
+def test_same_head_rerun_preserves_original_raw_capture(tmp_path):
+    source = tmp_path / "codex" / "rollout-session-1.jsonl"
+    write_jsonl(source, [
+        codex_prompt("build this commit", "2026-10-14T10:00:00Z"),
+        {"timestamp": "2026-10-14T10:01:00Z", "type": "event_msg", "payload": {"type": "agent_message"}},
+    ])
+    artifact_dir = tmp_path / "repo" / ".paircli" / "pr-7" / ("a" * 40)
+    write_snapshot(artifact_dir, source, "codex", "session-1", [("a" * 40, "2026-10-14T10:02:00Z")])
+
+    first = transcripts.stage_incremental_transcripts(artifact_dir)
+    first_manifest = first.manifest_path.read_bytes()
+    manifest = json.loads(first_manifest)
+    captured = artifact_dir / "raw-sessions" / manifest["sessions"][0]["files"][0]["path"]
+    first_capture = captured.read_bytes()
+    transcripts.commit_transcript_capture(first)
+    write_jsonl(source, [codex_prompt("later unrelated prompt", "2026-10-14T10:03:00Z")], append=True)
+
+    repeated = transcripts.stage_incremental_transcripts(artifact_dir)
+
+    assert repeated.manifest_path.read_bytes() == first_manifest
+    assert captured.read_bytes() == first_capture
+    assert b"later unrelated prompt" not in captured.read_bytes()
+
+
+def test_same_head_rerun_replaces_empty_manifest_when_session_becomes_linked(tmp_path):
+    source = tmp_path / "codex" / "rollout-session-1.jsonl"
+    write_jsonl(source, [codex_prompt("build this commit", "2026-10-14T10:00:00Z")])
+    artifact_dir = tmp_path / "repo" / ".paircli" / "pr-7" / ("a" * 40)
+    write_snapshot(artifact_dir, source, "codex", "session-1", [("a" * 40, "2026-10-14T10:02:00Z")])
+    snapshot_path = artifact_dir / "snapshot.json"
+    snapshot = json.loads(snapshot_path.read_text())
+    snapshot["sessions"] = []
+    snapshot["links"][0]["sessions"] = []
+    snapshot_path.write_text(json.dumps(snapshot))
+
+    empty = transcripts.stage_incremental_transcripts(artifact_dir)
+    transcripts.commit_transcript_capture(empty)
+    assert json.loads(empty.manifest_path.read_text())["sessions"] == []
+
+    write_snapshot_data = {
+        "pr": {"commits": [{"sha": "a" * 40, "time": "2026-10-14T10:02:00Z"}]},
+        "sessions": [{"harness": "codex", "id": "session-1", "source_path": str(source)}],
+        "links": [{"sha": "a" * 40, "sessions": ["codex:session-1"]}],
+    }
+    snapshot_path.write_text(json.dumps(write_snapshot_data))
+
+    recovered = transcripts.stage_incremental_transcripts(artifact_dir)
+    manifest = json.loads(recovered.manifest_path.read_text())
+
+    assert manifest["sessions"][0]["session_id"] == "session-1"
+
+
 def test_includes_claude_subagent_jsonl_with_parent_prompt(tmp_path):
     session_id = "claude-session"
     source = tmp_path / "claude" / "project" / f"{session_id}.jsonl"

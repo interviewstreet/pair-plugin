@@ -193,6 +193,8 @@ def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_
     assert status["summary"] == str(artifacts / "summary.md")
     assert status["archive"] == str(artifacts.with_suffix(".zip"))
     assert status["artifact_id"] == ""
+    assert status["upload_status"] == "disabled"
+    assert "upload disabled by PAIRCLI_UPLOAD_ENABLED=0" in log.read_text()
     assert len(committed) == 1
 
 
@@ -220,6 +222,7 @@ def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
     assert uploads == [("https://github.com/acme/repo/pull/42", artifacts.with_suffix(".zip"), onboarding.auth_file())]
     status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
     assert status["artifact_id"] == "artifact-123"
+    assert status["upload_status"] == "complete"
     assert len(committed) == 1
 
 
