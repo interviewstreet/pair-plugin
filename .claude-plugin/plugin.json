@@ -1,6 +1,8 @@
 {
   "name": "pair",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Review a GitHub PR with the context of the Claude and Codex sessions that built it.",
-  "author": {"name": "five-sh"}
+  "author": {
+    "name": "five-sh"
+  }
 }

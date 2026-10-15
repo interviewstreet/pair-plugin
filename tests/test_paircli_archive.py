@@ -1,3 +1,4 @@
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -25,11 +26,13 @@ def test_packages_only_one_complete_pr_commit(tmp_path):
     with zipfile.ZipFile(archive_path) as archive:
         assert sorted(archive.namelist()) == sorted(
             [
+                "overview.md",
                 f".paircli/pr-42/{'a' * 40}/summary.md",
                 f".paircli/pr-42/{'a' * 40}/report.md",
                 f".paircli/pr-42/{'a' * 40}/sessions/agent.json",
             ]
         )
+        assert archive.read("overview.md") == b"summary"
         assert archive.read(f".paircli/pr-42/{'a' * 40}/summary.md") == b"summary"
     assert (folder / "summary.md").read_text() == "summary"
 
@@ -57,3 +60,13 @@ def test_requires_summary_and_commit_scoped_folder(tmp_path):
     (folder / "summary.md").write_text("summary")
     with pytest.raises(ValueError, match="PR artifact folder"):
         create_pr_archive(tmp_path, tmp_path / ".paircli" / "pr-42")
+
+
+def test_archive_bytes_ignore_file_timestamps(tmp_path):
+    folder = tmp_path / ".paircli" / "pr-42" / ("a" * 40)
+    folder.mkdir(parents=True)
+    summary = folder / "summary.md"
+    summary.write_text("same evidence")
+    first = create_pr_archive(tmp_path, folder).read_bytes()
+    os.utime(summary, (1_000_000, 1_000_000))
+    assert create_pr_archive(tmp_path, folder).read_bytes() == first

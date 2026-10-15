@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 from email.message import Message
 from hashlib import sha256
@@ -97,7 +98,9 @@ def test_start_skips_completed_active_onboarding(monkeypatch, tmp_path):
     onboarding.grant_consent(tmp_path, "codex")
     onboarding.write_status(tmp_path, "complete", binary=str(binary), log="/tmp/onboarding.log")
     monkeypatch.setattr(onboarding, "has_active_login", lambda: True)
-    monkeypatch.setattr(onboarding.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("unexpected onboarding restart"))
+    monkeypatch.setattr(
+        onboarding.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("unexpected onboarding restart"),
+    )
 
     result = onboarding.start("codex")
 
@@ -153,7 +156,10 @@ def test_run_schedules_pending_scan_after_login(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_CALLS", str(calls))
     monkeypatch.setattr(onboarding, "ensure_paircli", lambda home, output: binary)
     scheduled = []
-    monkeypatch.setattr(onboarding, "launch_pending_scan", lambda home, executable, harness: scheduled.append((home, executable, harness)))
+    monkeypatch.setattr(
+        onboarding, "launch_pending_scan",
+        lambda home, executable, harness: scheduled.append((home, executable, harness)),
+    )
     onboarding.grant_consent(tmp_path, "codex")
     onboarding.queue_scan(tmp_path, "https://github.com/acme/repo/pull/42", str(repo))
 
@@ -178,14 +184,14 @@ def test_scan_checks_for_an_update_before_generating_artifacts(monkeypatch, tmp_
     def write_summary(*args):
         generated.append(args)
         summary = artifacts / "summary.md"
-        summary.write_text("# PR summary\n")
+        summary.write_text("# Change Summary\n")
         return summary
 
     monkeypatch.setattr(onboarding, "write_summary", write_summary)
 
     assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 0
     assert json.loads(calls.read_text()) == [
-        ["update", "--quiet", "--plugin-version", "0.1.0"],
+        ["update", "--quiet", "--plugin-version", "0.2.0"],
         ["scan", "https://github.com/acme/repo/pull/42", "--snapshot", "--out", str(artifacts)],
     ]
     assert generated[0][:4] == ("codex", "https://github.com/acme/repo/pull/42", repo, artifacts)
@@ -211,12 +217,14 @@ def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
 
     def write_summary(*_args):
         summary = artifacts / "summary.md"
-        summary.write_text("# PR summary\n")
+        summary.write_text("# Change Summary\n")
         return summary
 
     monkeypatch.setattr(onboarding, "write_summary", write_summary)
     uploads = []
+    notifications = []
     monkeypatch.setattr(onboarding, "upload_archive", lambda *args: uploads.append(args) or "artifact-123")
+    monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: notifications.append((args, kwargs)))
 
     assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 0
     assert uploads == [("https://github.com/acme/repo/pull/42", artifacts.with_suffix(".zip"), onboarding.auth_file())]
@@ -224,6 +232,9 @@ def test_scan_uploads_archive_by_default(monkeypatch, tmp_path):
     assert status["artifact_id"] == "artifact-123"
     assert status["upload_status"] == "complete"
     assert len(committed) == 1
+    assert notifications == [
+        (("https://github.com/acme/repo/pull/42",), {"succeeded": True, "uploaded": True})
+    ]
 
 
 def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
@@ -239,7 +250,7 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
 
     def write_summary(*_args):
         summary = artifacts / "summary.md"
-        summary.write_text("# PR summary\n")
+        summary.write_text("# Change Summary\n")
         return summary
 
     def reject_upload(*_args):
@@ -247,6 +258,8 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
 
     monkeypatch.setattr(onboarding, "write_summary", write_summary)
     monkeypatch.setattr(onboarding, "upload_archive", reject_upload)
+    notifications = []
+    monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: notifications.append((args, kwargs)))
 
     assert onboarding.scan(log, "https://github.com/acme/repo/pull/42", repo, "codex") == 1
     status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
@@ -255,6 +268,9 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
     assert status["archive"] == str(artifacts.with_suffix(".zip"))
     assert artifacts.with_suffix(".zip").is_file()
     assert committed == []
+    assert notifications == [
+        (("https://github.com/acme/repo/pull/42",), {"succeeded": False})
+    ]
 
 
 def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch, tmp_path):
@@ -284,6 +300,8 @@ def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch,
 
 
 def test_artifact_directory_uses_pr_head_commit(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
     commit = "c" * 40
     replies = iter((str(tmp_path) + "\n", commit + "\n"))
     calls = []
@@ -365,7 +383,9 @@ def test_ensure_paircli_downloads_and_verifies_release(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
     monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
-    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url))
+    monkeypatch.setattr(
+        onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url),
+    )
 
     binary = onboarding.ensure_paircli(tmp_path, None)
 
@@ -376,6 +396,54 @@ def test_ensure_paircli_downloads_and_verifies_release(monkeypatch, tmp_path):
         "platform": "darwin-arm64",
         "sha256": checksum,
     }
+
+
+def test_fetch_json_retries_transport_timeouts(monkeypatch):
+    manifest = json.dumps({"version": "0.1.0", "artifacts": {}}).encode()
+    attempts = []
+    delays = []
+
+    def flaky_urlopen(request, **kwargs):
+        attempts.append((request.full_url, kwargs["timeout"]))
+        if len(attempts) < 3:
+            raise TimeoutError("read timed out")
+        return FakeResponse(manifest, request.full_url)
+
+    monkeypatch.setattr(onboarding, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(onboarding, "fetch_github_release_asset", lambda *_args: None)
+    monkeypatch.setattr(onboarding.time, "sleep", delays.append)
+
+    assert onboarding.fetch_json("https://cdn.example.test/latest.json")["version"] == "0.1.0"
+    assert attempts == [
+        ("https://cdn.example.test/latest.json", onboarding.MANIFEST_TIMEOUT_SECONDS),
+        ("https://cdn.example.test/latest.json", onboarding.MANIFEST_TIMEOUT_SECONDS),
+        ("https://cdn.example.test/latest.json", onboarding.MANIFEST_TIMEOUT_SECONDS),
+    ]
+    assert delays == list(onboarding.RELEASE_RETRY_DELAYS_SECONDS)
+
+
+def test_download_binary_retries_transport_timeout(monkeypatch, tmp_path):
+    binary_contents = b"paircli"
+    checksum = sha256(binary_contents).hexdigest()
+    attempts = []
+    delays = []
+
+    def flaky_urlopen(request, **kwargs):
+        attempts.append(kwargs["timeout"])
+        if len(attempts) == 1:
+            raise TimeoutError("read timed out")
+        return FakeResponse(binary_contents, request.full_url, content_type="application/octet-stream")
+
+    monkeypatch.setattr(onboarding, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(onboarding, "fetch_github_release_asset", lambda *_args: None)
+    monkeypatch.setattr(onboarding.time, "sleep", delays.append)
+
+    destination = tmp_path / "bin" / "paircli"
+    onboarding.download_binary("https://cdn.example.test/paircli", destination, checksum)
+
+    assert destination.read_bytes() == binary_contents
+    assert attempts == [onboarding.BINARY_TIMEOUT_SECONDS, onboarding.BINARY_TIMEOUT_SECONDS]
+    assert delays == [onboarding.RELEASE_RETRY_DELAYS_SECONDS[0]]
 
 
 def test_ensure_paircli_rejects_checksum_mismatch(monkeypatch, tmp_path):
@@ -390,7 +458,9 @@ def test_ensure_paircli_rejects_checksum_mismatch(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
     monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
-    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url))
+    monkeypatch.setattr(
+        onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(next(responses), request.full_url),
+    )
 
     with pytest.raises(RuntimeError, match="checksum"):
         onboarding.ensure_paircli(tmp_path, None)
@@ -400,7 +470,9 @@ def test_ensure_paircli_rejects_checksum_mismatch(monkeypatch, tmp_path):
 def test_ensure_paircli_rejects_manifest_redirect_or_html(monkeypatch, tmp_path):
     monkeypatch.setenv("PAIRCLI_RELEASE_MANIFEST_URL", "https://cdn.example.test/manifest.json")
     monkeypatch.delenv("PAIRCLI_DEV_BUILD", raising=False)
-    monkeypatch.setattr(onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(b"<html>", "https://www.example.test/"))
+    monkeypatch.setattr(
+        onboarding, "urlopen", lambda request, **_kwargs: FakeResponse(b"<html>", "https://www.example.test/"),
+    )
 
     with pytest.raises(RuntimeError, match="different origin"):
         onboarding.ensure_paircli(tmp_path, None)
@@ -412,52 +484,6 @@ def test_ensure_paircli_rejects_manifest_redirect_or_html(monkeypatch, tmp_path)
     )
     with pytest.raises(RuntimeError, match="application/json"):
         onboarding.ensure_paircli(tmp_path, None)
-
-
-def test_fetch_json_uses_system_curl_for_python_certificate_failure(monkeypatch, tmp_path):
-    manifest = {"version": "0.2.0", "artifacts": {}}
-    monkeypatch.setattr(
-        onboarding,
-        "urlopen",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("CERTIFICATE_VERIFY_FAILED")),
-    )
-
-    def curl_fallback(url, destination, *, label, timeout):
-        assert label == "paircli release manifest"
-        assert timeout == 15
-        destination.write_text(json.dumps(manifest))
-        return url, "application/json"
-
-    monkeypatch.setattr(onboarding, "download_with_curl", curl_fallback)
-
-    assert onboarding.fetch_json("https://cdn.example.test/latest.json") == manifest
-
-
-def test_download_binary_uses_system_curl_for_python_certificate_failure(monkeypatch, tmp_path):
-    contents = b"paircli-binary"
-    destination = tmp_path / "paircli"
-    monkeypatch.setattr(
-        onboarding,
-        "urlopen",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("CERTIFICATE_VERIFY_FAILED")),
-    )
-
-    def curl_fallback(url, temporary, *, label, timeout):
-        assert label == "paircli binary"
-        assert timeout == 30
-        temporary.write_bytes(contents)
-        return url, "application/octet-stream"
-
-    monkeypatch.setattr(onboarding, "download_with_curl", curl_fallback)
-
-    onboarding.download_binary(
-        "https://cdn.example.test/paircli",
-        destination,
-        sha256(contents).hexdigest(),
-    )
-
-    assert destination.read_bytes() == contents
-    assert destination.stat().st_mode & stat.S_IXUSR
 
 
 def test_allows_github_release_asset_redirect():
@@ -507,6 +533,7 @@ def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
     requested_urls = []
 
     monkeypatch.setattr(onboarding, "platform_key", lambda: "darwin-arm64")
+    monkeypatch.setattr(onboarding, "fetch_github_release_asset", lambda *_args: None)
     monkeypatch.setattr(
         onboarding,
         "urlopen",
@@ -519,6 +546,36 @@ def test_ensure_paircli_uses_public_manifest_by_default(monkeypatch, tmp_path):
 
     assert requested_urls[0] == onboarding.DEFAULT_RELEASE_MANIFEST_URL
     assert requested_urls[0] == "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
+
+
+def test_fetches_known_github_release_asset_with_gh(monkeypatch, tmp_path):
+    gh = tmp_path / "gh"
+    gh.write_text("gh")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        destination = Path(command[command.index("--dir") + 1]) / "latest.json"
+        destination.write_text('{"version":"0.2.0"}')
+        return subprocess.CompletedProcess(command, 0, stdout=b"")
+
+    monkeypatch.setattr(onboarding, "executable_path", lambda name: str(gh) if name == "gh" else None)
+    monkeypatch.setattr(onboarding.subprocess, "run", fake_run)
+
+    payload = onboarding.fetch_github_release_asset(
+        "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json",
+        1024,
+    )
+
+    assert payload == b'{"version":"0.2.0"}'
+    assert calls[0][0][:3] == [str(gh), "release", "download"]
+    assert "--repo" in calls[0][0]
+
+
+def test_rejects_other_github_release_repositories():
+    assert onboarding.github_release_asset(
+        "https://github.com/example/paircli/releases/latest/download/latest.json"
+    ) is None
 
 
 def test_ensure_paircli_rejects_an_incompatible_plugin(monkeypatch, tmp_path):
@@ -552,7 +609,10 @@ def test_run_installs_hooks_then_logs_in(monkeypatch, tmp_path):
 
     assert result == 0
     assert onboarding.read_status(tmp_path)["status"] == "complete"
-    assert json.loads(calls.read_text()) == [["update", "--quiet", "--plugin-version", "0.1.0"], ["hook", "install", "codex"], ["login"]]
+    assert json.loads(calls.read_text()) == [
+        ["update", "--quiet", "--plugin-version", "0.2.0"],
+        ["hook", "install", "codex"], ["login"],
+    ]
     assert json.loads(auth.read_text())["server_url"] == onboarding.DEFAULT_SERVER_URL
 
 
@@ -573,7 +633,9 @@ def test_run_skips_login_when_a_live_credential_exists(monkeypatch, tmp_path):
 
     assert result == 0
     assert onboarding.read_status(tmp_path)["status"] == "complete"
-    assert json.loads(calls.read_text()) == [["update", "--quiet", "--plugin-version", "0.1.0"], ["hook", "install", "codex"]]
+    assert json.loads(calls.read_text()) == [
+        ["update", "--quiet", "--plugin-version", "0.2.0"], ["hook", "install", "codex"],
+    ]
 
 
 def test_run_logs_in_again_after_server_change(monkeypatch, tmp_path):
@@ -607,7 +669,7 @@ def test_run_continues_when_update_is_unavailable(monkeypatch, tmp_path):
     onboarding.grant_consent(tmp_path, "codex")
 
     def failing_update(command, *, cwd, log, timeout=onboarding.COMMAND_TIMEOUT_SECONDS):
-        if command[1:] == ["update", "--quiet", "--plugin-version", "0.1.0"]:
+        if command[1:] == ["update", "--quiet", "--plugin-version", "0.2.0"]:
             raise RuntimeError("command exited 1: paircli update")
         original_run_command(command, cwd=cwd, log=log, timeout=timeout)
 

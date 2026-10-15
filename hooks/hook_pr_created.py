@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: scan after PR creation and later pushes to an open PR.
+"""PostToolUse hook: build or refresh a review after PR creation and branch pushes.
 
 Standard library only, and compatible with the macOS system Python, because hooks run with whatever
 `python3` is on PATH.
@@ -16,11 +16,11 @@ import sys
 import time
 from pathlib import Path
 
+from pair_pr_comment import start_pair_comment
 from paircli_onboarding import approval_command, start as start_paircli_onboarding
 
-GH_PR_CREATE = re.compile(r"(?:^|[\s;&|(/])gh\s+pr\s+create\b")
-GIT_PUSH = re.compile(r"(?:^|[\s;&|(/])git\s+push\b")
 PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([\w.-]+)/pull/(\d+)")
+SHELL_SEPARATORS = {"&", "&&", "|", "||", ";", "(", ")"}
 ALLOWED_TOOLS = ["Bash(pair-brief *)", "Read(~/.pair/briefs/**)", "Edit(~/.pair/briefs/**)",
                  "Write(~/.pair/briefs/**)"]
 
@@ -49,32 +49,73 @@ def base_url() -> str:
     return f"http://{host}:{port}"
 
 
+def shell_tokens(command: str) -> list[str]:
+    """Split a shell command while preserving control operators."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return []
+
+
+def command_operation(command: str) -> tuple[str, int, list[str]] | None:
+    """Return the supported PR operation and its executable token index."""
+    tokens = shell_tokens(command)
+    for index, token in enumerate(tokens):
+        if Path(token).name == "gh" and tokens[index + 1:index + 3] == ["pr", "create"]:
+            return "create", index, tokens
+    for index, token in enumerate(tokens):
+        if Path(token).name != "git":
+            continue
+        cursor = index + 1
+        while cursor < len(tokens) and tokens[cursor] not in SHELL_SEPARATORS:
+            if tokens[cursor] == "-C" and cursor + 1 < len(tokens):
+                cursor += 2
+                continue
+            if tokens[cursor].startswith("-"):
+                cursor += 1
+                continue
+            break
+        if cursor >= len(tokens) or tokens[cursor] != "push":
+            continue
+        arguments = []
+        for argument in tokens[cursor + 1:]:
+            if argument in SHELL_SEPARATORS:
+                break
+            arguments.append(argument)
+        if any(argument in {"--all", "--delete", "--mirror", "--tags", "-d"}
+               or argument.startswith(":") for argument in arguments):
+            continue
+        return "push", index, tokens
+    return None
+
+
 def repo_directory_from_event(event: dict, command: str) -> Path:
-    """Resolve the directory in which the successful PR command ran."""
+    """Resolve the repository directory used by the supported command."""
     raw_cwd = event.get("cwd")
     cwd = Path(raw_cwd).expanduser() if isinstance(raw_cwd, str) and raw_cwd else Path.cwd()
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
+    operation = command_operation(command)
+    if operation is None:
         return cwd
-
-    command_indexes = [
-        index for index in range(len(tokens))
-        if tokens[index:index + 3] == ["gh", "pr", "create"] or tokens[index:index + 2] == ["git", "push"]
-    ]
-    if not command_indexes:
-        return cwd
-    command_index = command_indexes[-1]
-
-    for index in range(command_index - 1, -1, -1):
-        if tokens[index] == "cd" and index + 1 < command_index:
+    _, executable_index, tokens = operation
+    if Path(tokens[executable_index]).name == "git":
+        for index in range(executable_index + 1, len(tokens) - 1):
+            if tokens[index] == "-C":
+                candidate = Path(tokens[index + 1]).expanduser()
+                return candidate if candidate.is_absolute() else cwd / candidate
+            if tokens[index] == "push" or tokens[index] in SHELL_SEPARATORS:
+                break
+    for index in range(executable_index - 1, -1, -1):
+        if tokens[index] == "cd" and index + 1 < executable_index:
             candidate = Path(tokens[index + 1]).expanduser()
             return candidate if candidate.is_absolute() else cwd / candidate
     return cwd
 
 
 def pr_from_current_branch(repo_dir: Path) -> tuple[str, int] | None:
-    """Resolve the just-created PR when Codex omits command stdout from a hook event."""
+    """Resolve the open PR associated with the current branch."""
     gh = shutil.which("gh")
     if not gh or not repo_dir.is_dir():
         return None
@@ -101,18 +142,17 @@ def pr_from_event(event: dict, repo_dir: Path) -> tuple[str, int] | None:
     if event.get("tool_name") != "Bash":
         return None
     command = (event.get("tool_input") or {}).get("command") or ""
-    is_create = bool(GH_PR_CREATE.search(command))
-    is_push = bool(GIT_PUSH.search(command))
-    if not is_create and not is_push:
+    operation = command_operation(command)
+    if operation is None:
         return None
     response = event.get("tool_response")
     if isinstance(response, dict) and response.get("interrupted"):
         return None
-    if isinstance(response, dict) and response.get("exit_code") not in {None, 0, "0"}:
-        return None
-    if is_push and not is_create:
-        return pr_from_current_branch(repo_dir)
-    if response is None:
+    if isinstance(response, dict):
+        for key in ("exit_code", "exitCode", "returncode"):
+            if isinstance(response.get(key), int) and response[key] != 0:
+                return None
+    if operation[0] == "push" or response is None:
         return pr_from_current_branch(repo_dir)
     stdout = response.get("stdout", "") if isinstance(response, dict) else response
     urls = PR_URL.findall(stdout) if isinstance(stdout, str) else []
@@ -139,6 +179,11 @@ def onboarding_message(onboarding: dict, harness: str) -> str:
             return f"Pair CLI is ready for {harness}, but local artifact generation failed: {scan.get('error', 'unknown error')}. Log: {scan.get('log', 'unavailable')}"
         return f"Pair CLI is ready for {harness}."
     return f"Pair setup status: {status}."
+
+
+def pair_pr_url(repo: str, number: int) -> str:
+    """Return the Pair review URL corresponding to one GitHub pull request."""
+    return f"https://pair.sh/{repo}/pull/{number}"
 
 
 def write_debug_event(event: dict) -> None:
@@ -199,16 +244,17 @@ def main() -> int:
     is_codex = bool(os.environ.get("PLUGIN_ROOT"))
     harness = "codex" if is_codex else "claude-code"
     pr_url = f"https://github.com/{pr[0]}/pull/{pr[1]}"
+    review_url = pair_pr_url(pr[0], pr[1])
+    comment = start_pair_comment(pr_url, review_url, repo_dir, pair_home() / "logs", dry_run)
     onboarding = start_paircli_onboarding(harness, dry_run, pr_url=pr_url, repo_dir=str(repo_dir))
-    message = onboarding_message(onboarding, harness)
+    message = f"{onboarding_message(onboarding, harness)} Pair review: {review_url}. Posting this link to the PR."
 
     if is_codex:
         out = {"systemMessage": message,
                "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}}
-        if onboarding.get("status") == "failed":
-            out.update({"decision": "block", "reason": message, "continue": False})
         if dry_run:
             out["onboarding"] = onboarding
+            out["comment"] = comment
         print(json.dumps(out))
         return 0
 
@@ -224,10 +270,12 @@ def main() -> int:
     out = {"systemMessage": f"{message} Building the review brief for {pr[0]}#{pr[1]} at {plan['url']}",
            "hookSpecificOutput": {"hookEventName": "PostToolUse",
                                   "additionalContext": f"A review brief for this PR is being built in the "
-                                                       f"background. Review page: {plan['url']}"}}
+                                                       f"background. Pair review: {review_url}. "
+                                                       f"Local review page: {plan['url']}"}}
     if dry_run:
         out["plan"] = plan
         out["onboarding"] = onboarding
+        out["comment"] = comment
     print(json.dumps(out))
     return 0
 

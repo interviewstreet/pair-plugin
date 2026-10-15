@@ -52,8 +52,100 @@ def test_pr_create_starts_pair(python, tmp_path):
     assert plan["cwd"] == str(tmp_path / "pair-home")
     assert plan["url"] == "http://127.0.0.1:7788/review/?key=five-sh__awt__12"
     assert "five-sh/awt#12" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["hookSpecificOutput"]["additionalContext"]
+    assert out["comment"]["command"][-3:] == [URL.lower(), "https://pair.sh/five-sh/awt/pull/12", str(Path.cwd())]
     assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
     assert out["onboarding"]["status"] == "planned"
+
+
+@pytest.mark.parametrize("python", PYTHONS)
+def test_git_push_refreshes_existing_pr(python, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nprint({URL!r})\n")
+    gh.chmod(0o755)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = run(
+        event(f"cd {repo} && git push origin HEAD", "branch updated\n", exit_code=0),
+        {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        python=python,
+        tmp=tmp_path,
+    )
+
+    assert out["plan"]["key"] == "five-sh__awt__12"
+    assert out["onboarding"]["status"] == "planned"
+    assert out["comment"]["command"][-1] == str(repo)
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
+
+
+def test_git_dash_c_push_uses_target_repository(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nprint({URL!r})\n")
+    gh.chmod(0o755)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = run(
+        event(f"git -C {repo} push", "branch updated\n"),
+        {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        tmp=tmp_path,
+    )
+
+    assert out["comment"]["command"][-1] == str(repo)
+
+
+def test_codex_git_push_refreshes_without_starting_claude(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nprint({URL!r})\n")
+    gh.chmod(0o755)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = run(
+        event(f"cd {repo} && git push", "branch updated\n"),
+        {"PLUGIN_ROOT": "/plugins/pair", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        tmp=tmp_path,
+    )
+
+    assert "plan" not in out
+    assert out["onboarding"]["status"] == "planned"
+    assert out["comment"]["command"][-1] == str(repo)
+
+
+@pytest.mark.parametrize("command", [
+    "git push --delete origin old-branch",
+    "git push --tags",
+    "git push --mirror",
+    "echo 'git push'",
+])
+def test_ignores_pushes_that_do_not_update_the_current_pr_branch(command, tmp_path):
+    assert run(event(command, "done\n"), tmp=tmp_path) is None
+
+
+def test_ignores_failed_git_push(tmp_path):
+    assert run(event("git push", "", exit_code=1), tmp=tmp_path) is None
+
+
+def test_ignores_git_push_without_an_open_pr(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(1)\n")
+    gh.chmod(0o755)
+
+    assert run(
+        event("git push origin HEAD", "branch updated\n"),
+        {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        tmp=tmp_path,
+    ) is None
 
 
 def test_hook_config_resolves_codex_and_claude_plugin_roots():
@@ -143,6 +235,7 @@ def test_codex_resolves_pr_when_hook_omits_tool_response(tmp_path):
 
     assert out["onboarding"]["status"] == "planned"
     assert "Pair setup status: planned" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
 
 
 def test_push_on_existing_pr_starts_incremental_scan(tmp_path):
@@ -216,6 +309,32 @@ def test_codex_starts_setup_without_a_consent_block(tmp_path):
 
     assert "decision" not in out
     assert "Pair setup started for codex" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
+
+
+def test_codex_reports_prior_setup_failure_without_blocking(tmp_path):
+    plugin_home = tmp_path / "plugin"
+    plugin_home.mkdir()
+    (plugin_home / "onboarding.json").write_text(json.dumps({
+        "status": "failed",
+        "error": "network unavailable",
+        "log": "/tmp/pair-onboarding.log",
+    }))
+
+    out = run(
+        event("gh pr create --fill", f"{URL}\n"),
+        {
+            "PAIR_HOOK_DRY_RUN": "0",
+            "PAIRCLI_PLUGIN_HOME": str(plugin_home),
+            "PLUGIN_ROOT": "/plugins/pair",
+        },
+        tmp=tmp_path,
+    )
+
+    assert "decision" not in out
+    assert "continue" not in out
+    assert "Pair setup previously failed" in out["systemMessage"]
+    assert "https://pair.sh/five-sh/awt/pull/12" in out["systemMessage"]
 
 
 def test_live_hook_starts_setup_automatically(tmp_path):

@@ -18,39 +18,51 @@ than reusing an unexpired token from the previous server.
 
 If a PR is created before login finishes, its scan is queued until setup
 completes. Pair then runs `paircli scan <pr-url> --snapshot` in that repository.
-Later eligible `gh pr create` calls start the same scan in the background
-immediately. The plugin then runs the triggering Codex or Claude agent in read-only mode to
+Later eligible `gh pr create` calls and successful `git push` commands for a
+branch with an open PR start the same scan in the background immediately. Each
+new PR head is stored under its own commit directory and publication prefix.
+The plugin then runs the triggering Codex or Claude agent in read-only mode to
 write an AI-authored `summary.md` from the scan artifacts, PR diff, and linked
-session evidence. Pair also packages the complete commit folder as a sibling
-`<head-commit>.zip`, then requests a signed upload from Pair BE and streams the
-ZIP directly to S3.
-This upload can include local agent session transcripts and prompts in addition
-to generated review files; plugin installation should disclose that data flow.
-The ZIP contains `.paircli/pr-<number>/<head-commit>/` and no other PRs.
-The source artifacts stay local under
-`.paircli/pr-<number>/<head-commit>/`, including `summary.md`, `report.md`,
-`signals.json`, `comment.md`, `agent-trace.json`, and `snapshot.json`. The
-summary covers the actual code change, a Mermaid flowchart, verification steps,
-risks, and supporting evidence. The plugin records the summary path or a failure
-reason and ZIP path in `scan.json` and the scan log.
+session evidence. Pair packages the complete commit folder as a sibling `<head-commit>.zip`.
+It reserves evidence with `POST /api/v1/reviews/publications/upload-url`, streams
+the ZIP directly to the signed S3 POST, then calls
+`POST /api/v1/reviews/publications/:id/finalize`. Only confirmed finalization
+reports a successful publication. The request declares canonical PR input,
+head SHA, a positive revision, ZIP SHA-256, and exact ZIP size. The backend
+verifies GitHub access using the publisher's own identity, then verifies the
+uploaded object's size/checksum before marking evidence available and re-arming
+review workspace sync. Workspace installation still completes asynchronously.
 
-Pair CLI reads local session data for the configured harness when it builds Pair
-review data. Device login contacts the Pair backend. The current Codex flow
-does not post a PR comment. By default, uploads use the CLI login server and
-bearer token. The backend records the Pair user who requests the signed S3
-form, but does not verify GitHub access to the PR path. Deploy the Pair BE
-upload-access change before releasing this plugin version.
-Set `PAIRCLI_UPLOAD_ENABLED=0` to disable automatic uploads. On auth or access
-failure, the local ZIP is kept and `scan.json` records the failure and log path.
-The browser's session cookie is not read or copied by the plugin.
+The ZIP contains a root `overview.md` copied from the generated summary, plus
+`.paircli/pr-<number>/<head-commit>/` and no other PRs. The source artifacts stay
+local, including `summary.md`, `report.md`, `signals.json`, `comment.md`,
+`agent-trace.json`, and `snapshot.json`. The summary is a concise reviewer brief
+covering what changed, why, the runtime flow, key implementation files,
+verification, and review notes. It uses the evidence internally without
+repeating commit metadata, artifact identifiers, raw logs, or a full
+changed-file list. Uploads can include local agent session transcripts and
+prompts. The plugin does not use browser session cookies or reviewer JWTs;
+publishing requires the CLI device-login bearer.
 
-For a private upload test after deploying Pair BE's anonymous upload-signing
-change, set `PAIRCLI_UPLOAD_SERVER_URL=https://dhruvi-pair.private.hackerrank.link`
-before starting Codex or Claude. This changes only where the plugin requests
-`/api/v1/upload/url`; CLI installation and login still use `PAIRCLI_SERVER_URL`.
-The signing request sends no CLI token in this mode. Use the origin only,
-without `/api` in the setting. The ZIP still goes directly to the S3 URL that
-Pair BE returns.
+ZIP timestamps and permissions are normalized so unchanged evidence has the
+same checksum. A local `.publication-revisions.sqlite3` beside the commit
+folders stores only server/head/checksum/size/revision metadata, never tokens
+or signed forms. Identical retries reuse a revision; changed content advances
+across heads. Concurrent scans serialize revision assignment. An immutable
+upload snapshot prevents a later scan from replacing bytes during publication.
+A finalized reservation replay skips S3 and confirms finalization idempotently.
+A revision conflict from another device is surfaced rather than overwritten.
+Keep the local revision journal when retrying a failed upload or finalization.
+
+The current Codex flow does not post a PR comment. Set
+`PAIRCLI_UPLOAD_ENABLED=0` to generate artifacts without publishing. Uploads use
+the CLI login server and bearer. `PAIRCLI_UPLOAD_SERVER_URL`, if set, must match
+the authenticated backend; anonymous upload signing is not supported by this
+protocol. Log in to the target backend using `PAIRCLI_SERVER_URL` before
+publishing there. On auth/access, pending App permissions, S3, or finalize
+failure, the ZIP and revision journal remain local and `scan.json` records a
+failure. Backend review routes and the publisher's GitHub App authorization
+must be configured before running live publication.
 
 ## Status and recovery
 
