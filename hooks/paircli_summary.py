@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -9,14 +10,12 @@ from pathlib import Path
 
 
 SUMMARY_TIMEOUT_SECONDS = 5 * 60
-MAX_SUMMARY_WORDS = 700
+MAX_SUMMARY_WORDS = 300
 REQUIRED_SECTIONS = (
-    "## What Changed",
-    "## Why",
-    "## How It Works",
-    "## Key Files",
+    "## Intent",
+    "## Diagram",
+    "## Decisions",
     "## Verification",
-    "## Review Notes",
 )
 
 
@@ -25,7 +24,11 @@ def summary_prompt(pr_url: str, artifact_dir: Path) -> str:
     return f"""Write an evidence-grounded summary for {pr_url}.
 
 Read the Pair evidence in {artifact_dir}: report.md, signals.json, snapshot.json,
-and the relevant sessions/*.json. The snapshot includes the PR diff and linked
+and the relevant sessions/*.json. When present, read raw-sessions/manifest.json
+and bounded extracts of its linked JSONL files inside raw-sessions/. These are
+incremental captures: missing earlier context is unknown, not evidence that a
+decision never happened. Never search unrelated sessions or other repositories.
+The snapshot includes the PR diff and linked
 agent transcripts. Start with report.md and bounded extracts of the PR fields
 in snapshot.json. Inspect the relevant request, edit, command, and verification
 events in every session linked to this PR. Use bounded extracts rather than
@@ -34,22 +37,41 @@ needs context.
 
 Return only Markdown for summary.md, using exactly this structure:
 # Change Summary
-## What Changed
-## Why
-## How It Works
-## Key Files
+## Intent
+## Diagram
+## Decisions
 ## Verification
-## Review Notes
 
-Keep the complete summary between 300 and 600 words. Focus on what changed,
-why it changed, the important runtime flow, how it was verified, and what a
-reviewer should inspect. Under How It Works include one small Mermaid flowchart
-of the changed application flow, not the Pair scanning pipeline. Under Key Files
-list only files necessary to understand the implementation. Under Verification
-use checkboxes and report only checks supported by the evidence; include short
-manual verification steps when useful. Under Review Notes mention security,
-configuration, migrations, compatibility, or known limitations, and write
-"None" when there are no special concerns.
+Aim for 150 to 200 words; never exceed 300 words including the diagram. Be shorter
+for a small change. No preamble, extra sections, generic advice, or filler.
+
+Intent: at most two plain-language sentences explaining the problem and the
+observable before-to-after behavior. Say when business intent is not recorded.
+
+Diagram: one small fenced mermaid flowchart, at most six nodes, showing only
+relationships grounded in changed code. Distinguish new/changed behavior from
+existing behavior with short labels. Do not diagram Pair's capture/upload flow
+unless that is the actual PR change. No invented components, execution timings,
+HTML, click directives, external URLs, or Mermaid init directives. For a docs-only
+change or insufficient evidence, write "No runtime architecture change." or
+"Insufficient evidence for a diagram." instead of inventing a flow.
+
+Decisions: at most three short bullets, each a consequential choice plus its
+reason or trade-off. Use actual human requests, approvals, rejections, corrections,
+and explicitly deferred work from the linked transcripts. Attribute agent-only
+recommendations as proposals, not human decisions; silence, tool permission,
+conversation length, and code alone do not prove a human accepted an approach.
+Prefer an explicit later reversal over an earlier superseded choice. Never infer
+private thoughts. Include a short supporting human quote when useful, not a chat
+retelling. If none are captured, write "No explicit builder decisions captured."
+
+Verification: at most four bullets. Mark Passed, Failed, Blocked, or Not run.
+Only report commands/checks with observed results before the reviewed push or PR
+creation, applicable to the final code. An attempted command is not a pass;
+an earlier pass invalidated by later edits is not current verification. Separate
+human-reported manual checks from observed command results. Do not run tests now
+to fill gaps, turn suggestions into completed work, or claim full coverage.
+If absent, write "No pre-push verification captured."
 
 Use the evidence internally, but do not add an Evidence section or cite Pair
 artifact filenames. Do not include commit hashes, commit counts, PR numbers,
@@ -132,8 +154,14 @@ def write_summary(harness: str, pr_url: str, repo_dir: Path, artifact_dir: Path,
     else:
         raise RuntimeError(f"AI summary is not supported for {harness}")
     content = content.strip() + "\n"
-    if not content.startswith("# Change Summary\n") or any(section not in content for section in REQUIRED_SECTIONS):
+    outside_fences = re.sub(r"```[^\n]*\n.*?```", "", content, flags=re.DOTALL)
+    headings = re.findall(r"^## .+$", outside_fences, flags=re.MULTILINE)
+    if not content.startswith("# Change Summary\n") or tuple(headings) != REQUIRED_SECTIONS:
         raise RuntimeError("AI summary omitted required Markdown sections")
+    for section in REQUIRED_SECTIONS:
+        body = content.split(section + "\n", 1)[1].split("\n## ", 1)[0]
+        if not body.strip():
+            raise RuntimeError("AI summary contains an empty section")
     if len(content.split()) > MAX_SUMMARY_WORDS:
         raise RuntimeError(f"AI summary exceeded {MAX_SUMMARY_WORDS} words")
     log.write(f"{harness} generated a {len(content)}-character PR summary\n")

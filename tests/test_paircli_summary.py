@@ -17,32 +17,24 @@ SPEC.loader.exec_module(summary)
 PR_URL = "https://github.com/acme/repo/pull/42"
 MARKDOWN = """# Change Summary
 
-## What Changed
+## Intent
 
 Changed `handler.py` to retry failed requests.
 
-## Why
-
-Transient failures were returned immediately.
-
-## How It Works
+## Diagram
 
 ```mermaid
 flowchart LR
   request --> retry --> response
 ```
 
-## Key Files
+## Decisions
 
-- `handler.py` — applies the bounded retry.
+- Builder requested bounded retries rather than retrying indefinitely.
 
 ## Verification
 
-- [ ] Run `pytest`; no captured test run.
-
-## Review Notes
-
-Retry limits need review.
+- Not run: `pytest`; no captured test run.
 """
 
 
@@ -104,7 +96,13 @@ def test_summary_prompt_requests_concise_reviewer_content(tmp_path):
 
     for heading in ("# Change Summary", *summary.REQUIRED_SECTIONS):
         assert heading in prompt
-    assert "between 300 and 600 words" in prompt
+    assert "150 to 200 words" in prompt
+    assert "raw-sessions/manifest.json" in prompt
+    assert "silence, tool permission" in prompt
+    assert "before the reviewed push" in prompt
+    assert "No pre-push verification captured." in prompt
+    assert "No explicit builder decisions captured." in prompt
+    assert "No runtime architecture change." in prompt
     assert "do not add an Evidence section" in prompt
     assert "Do not include commit hashes" in prompt
     assert "complete changed-file list" in prompt
@@ -129,7 +127,46 @@ def test_overlong_ai_output_does_not_replace_existing_summary(monkeypatch, tmp_p
     overlong = MARKDOWN + (" detail" * summary.MAX_SUMMARY_WORDS)
     monkeypatch.setattr(summary, "_run_codex", lambda *_args: overlong)
 
-    with pytest.raises(RuntimeError, match="exceeded 700 words"):
+    with pytest.raises(RuntimeError, match="exceeded 300 words"):
         summary.write_summary("codex", PR_URL, repo, artifacts, io.StringIO())
 
     assert target.read_text() == "previous valid summary"
+
+
+@pytest.mark.parametrize("content", [
+    MARKDOWN.replace("## Decisions", "## Review Notes"),
+    MARKDOWN + "\n## Extra\nUnnecessary details.\n",
+    MARKDOWN.replace("## Intent", "## Diagram", 1),
+])
+def test_rejects_wrong_duplicate_or_extra_sections(monkeypatch, tmp_path, content):
+    repo, artifacts = evidence(tmp_path)
+    monkeypatch.setattr(summary, "_run_codex", lambda *_args: content)
+    with pytest.raises(RuntimeError, match="required Markdown sections"):
+        summary.write_summary("codex", PR_URL, repo, artifacts, io.StringIO())
+    assert not (artifacts / "summary.md").exists()
+
+
+def test_rejects_empty_section(monkeypatch, tmp_path):
+    repo, artifacts = evidence(tmp_path)
+    content = MARKDOWN.replace(
+        "- Builder requested bounded retries rather than retrying indefinitely.", "",
+    )
+    monkeypatch.setattr(summary, "_run_codex", lambda *_args: content)
+    with pytest.raises(RuntimeError, match="empty section"):
+        summary.write_summary("codex", PR_URL, repo, artifacts, io.StringIO())
+
+
+def test_docs_only_summary_needs_no_invented_diagram(monkeypatch, tmp_path):
+    repo, artifacts = evidence(tmp_path)
+    content = """# Change Summary
+## Intent
+Help readers find setup instructions.
+## Diagram
+No runtime architecture change.
+## Decisions
+No explicit builder decisions captured.
+## Verification
+No pre-push verification captured.
+"""
+    monkeypatch.setattr(summary, "_run_codex", lambda *_args: content)
+    assert summary.write_summary("codex", PR_URL, repo, artifacts, io.StringIO()).read_text() == content
