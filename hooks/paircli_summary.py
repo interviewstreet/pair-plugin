@@ -167,6 +167,28 @@ def write_summary(harness: str, pr_url: str, repo_dir: Path, artifact_dir: Path,
     if len(content.split()) > MAX_SUMMARY_WORDS:
         raise RuntimeError(f"AI summary exceeded {MAX_SUMMARY_WORDS} words")
     log.write(f"{harness} generated a {len(content)}-character PR summary\n")
+    _save_summary(artifact_dir, content)
+    generate = _run_codex if harness == "codex" else _run_claude
+    architecture = write_architecture(artifact_dir, lambda prompt: generate(prompt, repo_dir), log)
+    if architecture is not None:
+        _save_summary(artifact_dir, summary_without_diagram(content))
+        log.write("interactive architecture available; omitted inline Diagram section\n")
+    return artifact_dir / "summary.md"
+
+
+def summary_without_diagram(content: str) -> str:
+    """Keep the validated summary's prose without duplicating the interactive board."""
+    before, separator, after = content.partition("## Diagram\n")
+    if not separator:
+        return content
+    _, separator, decisions = after.partition("\n## Decisions\n")
+    if not separator:
+        raise RuntimeError("AI summary omitted required Markdown sections")
+    return before.rstrip() + "\n\n## Decisions\n" + decisions
+
+
+def _save_summary(artifact_dir: Path, content: str) -> None:
+    """Atomically replace the summary only after its content is ready."""
     descriptor, temporary_name = tempfile.mkstemp(prefix="pair-summary-", suffix=".md", dir=artifact_dir)
     temporary = Path(temporary_name)
     try:
@@ -175,6 +197,3 @@ def write_summary(harness: str, pr_url: str, repo_dir: Path, artifact_dir: Path,
         temporary.replace(artifact_dir / "summary.md")
     finally:
         temporary.unlink(missing_ok=True)
-    generate = _run_codex if harness == "codex" else _run_claude
-    write_architecture(artifact_dir, lambda prompt: generate(prompt, repo_dir), log)
-    return artifact_dir / "summary.md"

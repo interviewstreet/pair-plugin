@@ -4,7 +4,7 @@ The automatic PR hook asks the triggering Codex or Claude harness to write
 `summary.md` before packaging and uploading the commit's artifacts. The same
 format applies when the backend presents that summary as an overview.
 
-Only four sections appear, targeting 150–200 words (300 maximum including Mermaid):
+The initial draft has four sections, targeting 150–200 words (300 maximum including Mermaid):
 
 1. **Intent:** problem and observable behavior change in at most two sentences.
 2. **Diagram:** a small, code-grounded Mermaid flowchart, or an explicit statement
@@ -13,6 +13,13 @@ Only four sections appear, targeting 150–200 words (300 maximum including Merm
    grounded in linked sessions. Missing history is not reconstructed as fact.
 4. **Verification:** up to four checks, with observed pre-push outcomes and clear
    distinctions between failed, blocked, absent, stale, and human-reported checks.
+
+When a valid interactive architecture artifact is generated, the final Markdown
+omits the entire **Diagram** section: Overview shows only Intent, Decisions and
+Verification, while ADE's Architecture tab shows the board. If generation is
+unavailable or invalid, the inline diagram remains as a Markdown fallback.
+This selection is plugin-side; it does not detect whether an older deployed ADE
+supports the board, so deploy the ADE renderer before enabling this plugin version.
 
 The generator reads existing scan evidence and, when available, bounded extracts
 of the raw-session manifest's JSONL files. It does not run new verification or

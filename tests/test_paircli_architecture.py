@@ -86,9 +86,28 @@ def test_summary_then_architecture_use_triggering_harness(tmp_path, monkeypatch,
     monkeypatch.setattr(paircli_summary, runner, generate)
     result = paircli_summary.write_summary(harness, "https://github.com/acme/reviews/pull/42",
                                           tmp_path, folder, io.StringIO())
-    assert result.read_text() == markdown.strip() + "\n"
+    assert result.read_text() == paircli_summary.summary_without_diagram(markdown.strip() + "\n")
+    assert "## Diagram" not in result.read_text()
+    assert "## Intent" in result.read_text() and "## Decisions" in result.read_text()
     assert len(calls) == 2 and all(repo == tmp_path for _, repo in calls)
     assert json.loads((folder / "generated_artifacts/architecture.json").read_text()) == diagram()
+    with zipfile.ZipFile(create_pr_archive(tmp_path, folder)) as archive:
+        assert b"## Diagram" not in archive.read("overview.md")
+        assert "generated_artifacts/architecture.json" in archive.namelist()
+
+
+@pytest.mark.parametrize("architecture_output", ["null", "bad JSON"])
+def test_inline_diagram_remains_when_board_unavailable(tmp_path, monkeypatch, architecture_output):
+    folder = prepare(tmp_path)
+    for name in ("report.md", "signals.json"):
+        (folder / name).write_text("{}")
+    markdown = "# Change Summary\n## Intent\nPersist reviews.\n## Diagram\n```mermaid\nflowchart LR\nAPI --> DB\n```\n## Decisions\nNo explicit choices captured.\n## Verification\nNo pre-push checks captured.\n"
+    responses = iter([markdown, architecture_output])
+    monkeypatch.setattr(paircli_summary, "_run_codex", lambda *_args: next(responses))
+    result = paircli_summary.write_summary("codex", "https://github.com/acme/reviews/pull/42",
+                                          tmp_path, folder, io.StringIO())
+    assert result.read_text() == markdown
+    assert not (folder / "generated_artifacts/architecture.json").exists()
 
 
 @pytest.mark.parametrize("fault", [
