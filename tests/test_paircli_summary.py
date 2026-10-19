@@ -8,6 +8,7 @@ import pytest
 
 
 HOOKS_DIR = Path(__file__).resolve().parent.parent / "hooks"
+sys.path.insert(0, str(HOOKS_DIR))
 SPEC = importlib.util.spec_from_file_location("paircli_summary", HOOKS_DIR / "paircli_summary.py")
 assert SPEC and SPEC.loader
 summary = importlib.util.module_from_spec(SPEC)

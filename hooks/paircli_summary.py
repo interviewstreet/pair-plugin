@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from paircli_architecture import write_architecture
+
 
 SUMMARY_TIMEOUT_SECONDS = 5 * 60
 MAX_SUMMARY_WORDS = 300
@@ -173,4 +175,6 @@ def write_summary(harness: str, pr_url: str, repo_dir: Path, artifact_dir: Path,
         temporary.replace(artifact_dir / "summary.md")
     finally:
         temporary.unlink(missing_ok=True)
+    generate = _run_codex if harness == "codex" else _run_claude
+    write_architecture(artifact_dir, lambda prompt: generate(prompt, repo_dir), log)
     return artifact_dir / "summary.md"

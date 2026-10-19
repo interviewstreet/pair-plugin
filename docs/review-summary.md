@@ -24,13 +24,30 @@ proof of semantic correctness.
 
 ## Diagram display and compatibility
 
-This PR changes only the plugin's Markdown artifact. It does not create a new ADE
-tab or emit the separately validated `architecture.json` contract. The existing
-Overview Markdown renderer already supports Mermaid, so the flowchart can appear
-inline without an ADE code change (subject to the deployed renderer version).
-The interactive **Overview / Architecture** switch requires the separate ADE
-architecture integration and a current-head `architecture.json` from the AI
-pipeline. A plugin cannot add that application UI through Markdown alone.
+The existing Overview Markdown renderer supports inline Mermaid. For the draggable
+board, the plugin also makes a second read-only call to the same Codex or Claude
+harness to generate `generated_artifacts/architecture.json`. No separate model key
+or AI-pipeline worker is needed. Each call has the existing five-minute timeout.
+
+The JSON uses ADE's v1 artifact contract with diff-only citations and empty
+`episode_ids` (the plugin does not generate episodes). Validation binds the head
+to both the artifact directory and the snapshot's last PR commit, checks strict
+fields, lengths, graph references and connected flows, and verifies citations lie
+inside actual new-side PR diff hunks. Citations do not prove a model's semantic
+interpretation is correct. Deletion-only or insufficient evidence can produce no
+diagram rather than fabricated references.
+
+The writer atomically saves valid output and removes an older diagram before a
+retry. Null, invalid, oversized or timed-out diagram output is logged and does not
+block the Markdown upload. Symlinked output paths are rejected. The existing ZIP
+retains the versioned files and exposes a root `generated_artifacts/architecture.json`
+alias alongside `overview.md` for ADE's extracted publisher bundle reader.
+
+The interactive **Overview / Architecture** switch still requires deployment of
+the separate ADE architecture integration. Older ADE renders the Markdown and
+ignores the extra JSON. Pair BE must preserve the root generated-artifacts path
+when extracting the existing ZIP. No backend or AI-pipeline API change is made
+here; live S3 extraction is a rollout verification, not covered by unit tests.
 
 This does not change upload paths, capture offsets, publication versioning, or the
 separate `/pair` JSON review-brief agent contract.
