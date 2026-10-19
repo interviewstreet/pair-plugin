@@ -50,6 +50,8 @@ def create_pr_archive(repo_dir: Path, artifact_dir: Path) -> Path:
                         raise ValueError(f"PR artifact contains a symlink: {path.relative_to(folder)}")
                     if path.is_file():
                         _write_entry(archive, path, path.relative_to(repo_root).as_posix())
+                        if path.relative_to(folder).as_posix() == "generated_artifacts/architecture.json":
+                            _write_entry(archive, path, "generated_artifacts/architecture.json")
                     elif not path.is_dir():
                         raise ValueError(f"PR artifact contains a non-file: {path.relative_to(folder)}")
         size = temporary.stat().st_size
