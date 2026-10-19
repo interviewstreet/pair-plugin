@@ -6,7 +6,13 @@ format applies when the backend presents that summary as an overview.
 
 The initial draft has four sections, targeting 150–200 words (300 maximum including Mermaid):
 
-1. **Intent:** problem and observable behavior change in at most two sentences.
+1. **Intent:** the problem or goal and what changes for the affected person or
+   system, in one or two short sentences (45 words maximum requested from the model).
+   It should read like a developer explaining the PR to a teammate, not a list of
+   schema details, limits or implementation mechanics. Missing business context
+   must not be invented, but does not need a disclaimer when the practical purpose
+   is clear. This style/section-length guidance is prompt-driven, not a semantic
+   correctness guarantee.
 2. **Diagram:** a small, code-grounded Mermaid flowchart, or an explicit statement
    that no runtime diagram is applicable or supported by the evidence.
 3. **Decisions:** up to three consequential human choices and their reasons,

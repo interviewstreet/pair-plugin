@@ -109,6 +109,18 @@ def test_summary_prompt_requests_concise_reviewer_content(tmp_path):
     assert "complete changed-file list" in prompt
 
 
+def test_intent_prompt_explains_objective_in_teammate_language(tmp_path):
+    _, artifacts = evidence(tmp_path)
+    prompt = summary.summary_prompt(PR_URL, artifacts)
+    intent = prompt.split("Intent: ", 1)[1].split("\nDiagram:", 1)[0]
+    assert "developer explaining the PR to a teammate" in intent
+    assert "at most 45 words" in intent
+    assert "Lead with the concrete problem or goal" in intent
+    assert "not a list of implementation steps" in intent
+    assert "do not copy its facts" in intent
+    assert "Do not invent business motivation" in intent
+
+
 def test_invalid_ai_output_does_not_replace_existing_summary(monkeypatch, tmp_path):
     repo, artifacts = evidence(tmp_path)
     target = artifacts / "summary.md"

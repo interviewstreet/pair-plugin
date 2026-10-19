@@ -47,8 +47,22 @@ Return only Markdown for summary.md, using exactly this structure:
 Aim for 150 to 200 words; never exceed 300 words including the diagram. Be shorter
 for a small change. No preamble, extra sections, generic advice, or filler.
 
-Intent: at most two plain-language sentences explaining the problem and the
-observable before-to-after behavior. Say when business intent is not recorded.
+Intent: write like the developer explaining the PR to a teammate, not an AI
+describing its analysis. Use one or two short sentences, at most 45 words total.
+Lead with the concrete problem or goal, then say what will be different for the
+person or system affected. Use everyday words, active voice and specific subjects.
+Explain the overall objective, not a list of implementation steps or constraints.
+Keep schema versions, word limits, validation mechanics, artifact names and fallback
+details out unless they are essential to the purpose of this particular PR.
+Avoid phrases such as "evidence-grounded", "observable before-to-after behavior",
+"streamlines", "leverages", "robust", "seamless" and "enhances the experience".
+For example, prefer "Stop expired sessions from sending users back to the login
+page while they are reviewing a PR" over "Enhance session restoration robustness".
+This example illustrates tone only; do not copy its facts into an unrelated PR.
+Use goals stated in the human request when available. Otherwise describe only the
+observable purpose supported by the diff. Do not invent business motivation or
+append "business intent is not recorded" when the practical objective is clear.
+If no objective can be established, say "The purpose of this change is unclear."
 
 Diagram: one small fenced mermaid flowchart, at most six nodes, showing only
 relationships grounded in changed code. Distinguish new/changed behavior from
