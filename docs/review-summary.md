@@ -84,6 +84,18 @@ inside actual new-side PR diff hunks. Citations do not prove a model's semantic
 interpretation is correct. Deletion-only or insufficient evidence can produce no
 diagram rather than fabricated references.
 
+Code nodes can include optional `methods`, for example `["submitReview()"]`.
+The generator is asked to use real function names, one node per important function
+when separate connections or navigation targets are needed, and focused diff
+citations from that node's files. Validation bounds the list to six unique names
+(120 characters each) and requires a matching name in cited new-side code lines;
+comment-only lines and names found only in transcripts are not sufficient.
+This is a lexical grounding check, not a language parser or proof of a runtime call.
+Methods are omitted for non-code components or unsupported names. Existing
+artifacts without `methods` remain valid and display their component labels.
+The deployed ADE parser must support this optional field before using the new
+generator; older strict parsers may reject artifacts containing it.
+
 The writer atomically saves valid output and removes an older diagram before a
 retry. Null, invalid, oversized or timed-out diagram output is logged and does not
 block the Markdown upload. Symlinked output paths are rejected. The existing ZIP

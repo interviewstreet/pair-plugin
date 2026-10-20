@@ -48,8 +48,18 @@ def diagram():
 
 def snapshot():
     return {"pr": {"commits": [{"sha": HEAD}], "files": [
-        {"path": "src/reviews.ts", "hunks": [{"new_start": 10, "new_lines": 20}]},
+        {"path": "src/reviews.ts", "hunks": [{"new_start": 10, "new_lines": 20,
+         "lines": [
+             {"kind": "ctx", "new_no": 12, "text": "async function submitReview(input) {"},
+             {"kind": "add", "new_no": 20, "text": "  return database.insert(input);"},
+         ]}]},
     ]}}
+
+
+def method_diagram():
+    document = diagram()
+    document["nodes"][0]["methods"] = ["submitReview()"]
+    return document
 
 
 def prepare(tmp_path):
@@ -66,13 +76,18 @@ def test_generates_and_archives_ade_root_artifact(tmp_path):
 
     def generate(prompt):
         calls.append(prompt)
-        return json.dumps(diagram())
+        return json.dumps(method_diagram())
 
     result = write_architecture(folder, generate, io.StringIO())
-    assert json.loads(result.read_text()) == diagram()
+    assert json.loads(result.read_text()) == method_diagram()
     assert HEAD in calls[0] and "episode_ids empty" in calls[0]
+    assert '"methods":["submitReview()"]' in calls[0]
+    assert "one code node per important" in calls[0]
+    assert "Omit methods" in calls[0]
+    assert "pre-existing function whose behavior changes is modified" in calls[0]
+    assert "Do not invent an old" in calls[0]
     with zipfile.ZipFile(create_pr_archive(tmp_path, folder)) as archive:
-        assert json.loads(archive.read("generated_artifacts/architecture.json")) == diagram()
+        assert json.loads(archive.read("generated_artifacts/architecture.json")) == method_diagram()
         assert f".paircli/pr-42/{HEAD}/generated_artifacts/architecture.json" in archive.namelist()
         assert archive.read("overview.md").startswith(b"# Change Summary")
 
@@ -86,7 +101,7 @@ def test_summary_then_architecture_use_triggering_harness(tmp_path, monkeypatch,
         READING_GUIDE if section == "## Reading guide" else section + "\nRecorded evidence.\n"
         for section in paircli_summary.REQUIRED_SECTIONS
     )
-    responses = iter([markdown, json.dumps(diagram())])
+    responses = iter([markdown, json.dumps(method_diagram())])
     calls = []
 
     def generate(prompt, repo):
@@ -101,20 +116,76 @@ def test_summary_then_architecture_use_triggering_harness(tmp_path, monkeypatch,
     assert "## Intent" in result.read_text() and "## Decisions" in result.read_text()
     assert READING_GUIDE in result.read_text()
     assert len(calls) == 2 and all(repo == tmp_path for _, repo in calls)
-    assert json.loads((folder / "generated_artifacts/architecture.json").read_text()) == diagram()
+    assert json.loads((folder / "generated_artifacts/architecture.json").read_text()) == method_diagram()
     with zipfile.ZipFile(create_pr_archive(tmp_path, folder)) as archive:
         assert b"## Diagram" not in archive.read("overview.md")
         assert READING_GUIDE.encode() in archive.read("overview.md")
         assert "generated_artifacts/architecture.json" in archive.namelist()
+        assert json.loads(archive.read("generated_artifacts/architecture.json"))["nodes"][0]["methods"] == ["submitReview()"]
 
 
-@pytest.mark.parametrize("architecture_output", ["null", "bad JSON"])
+def test_legacy_artifacts_without_methods_remain_valid():
+    validate_architecture(diagram(), HEAD, snapshot())
+
+
+@pytest.mark.parametrize("method", ["submitReview()", "ReviewService.submitReview()"])
+def test_method_names_match_cited_code_not_component_labels(method):
+    document = method_diagram()
+    document["nodes"][0]["methods"] = [method]
+    validate_architecture(document, HEAD, snapshot())
+
+
+@pytest.mark.parametrize("methods", [
+    None, "submitReview()", [42], [""], ["a" * 121],
+    ["submitReview()"] * 7, ["submitReview()"] * 2,
+    ["invented()"], ["submitReview(input)"], ["<script>()"],
+])
+def test_rejects_invalid_or_unbacked_method_names(methods):
+    document = method_diagram()
+    document["nodes"][0]["methods"] = methods
+    with pytest.raises(ValueError):
+        validate_architecture(document, HEAD, snapshot())
+
+
+@pytest.mark.parametrize("fault", [
+    "comment-only", "deleted-only", "outside-citation", "different-file", "missing-source", "partial-name",
+])
+def test_methods_require_cited_code_in_the_nodes_own_files(fault):
+    document = method_diagram()
+    source = snapshot()
+    line = source["pr"]["files"][0]["hunks"][0]["lines"][0]
+    if fault == "comment-only": line["text"] = "// function submitReview(input)"
+    if fault == "deleted-only": line["kind"] = "del"
+    if fault == "outside-citation": line["new_no"] = 11
+    if fault == "different-file": document["nodes"][0]["files"] = []
+    if fault == "missing-source": source["pr"]["files"][0]["hunks"][0]["lines"] = []
+    if fault == "partial-name": line["text"] = "function resubmitReview(input) {"
+    with pytest.raises(ValueError):
+        validate_architecture(document, HEAD, source)
+
+
+def test_unbacked_methods_do_not_publish_a_diagram_or_break_summary(tmp_path):
+    folder = prepare(tmp_path)
+    document = method_diagram()
+    document["nodes"][0]["methods"] = ["invented()"]
+    log = io.StringIO()
+    assert write_architecture(folder, lambda _: json.dumps(document), log) is None
+    assert not (folder / "generated_artifacts" / "architecture.json").exists()
+    assert (folder / "summary.md").exists()
+    assert "keeping Markdown summary" in log.getvalue()
+
+
+@pytest.mark.parametrize("architecture_output", ["null", "bad JSON", "unbacked methods"])
 def test_summary_stays_without_diagram_when_board_unavailable(tmp_path, monkeypatch, architecture_output):
     folder = prepare(tmp_path)
     for name in ("report.md", "signals.json"):
         (folder / name).write_text("{}")
     markdown = ("# Change Summary\n## Intent\nPersist reviews.\n" + READING_GUIDE
                 + "## Decisions\nNo developer choices were recorded.\n## Verification\nNo check results were recorded before this push.\n")
+    if architecture_output == "unbacked methods":
+        document = method_diagram()
+        document["nodes"][0]["methods"] = ["invented()"]
+        architecture_output = json.dumps(document)
     responses = iter([markdown, architecture_output])
     monkeypatch.setattr(paircli_summary, "_run_codex", lambda *_args: next(responses))
     result = paircli_summary.write_summary("codex", "https://github.com/acme/reviews/pull/42",
