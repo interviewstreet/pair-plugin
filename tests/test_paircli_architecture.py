@@ -14,6 +14,15 @@ from paircli_archive import create_pr_archive
 import paircli_summary
 
 HEAD = "a" * 40
+READING_GUIDE = f"""## Reading guide
+Start here. Skipping a file does not mean it is correct.
+### Critical
+- [src/reviews.ts:10-29](https://github.com/acme/reviews/blob/{HEAD}/src/reviews.ts#L10-L29) — Check which reviews can be saved.
+### Skim through
+None suggested.
+### Usually safe to skip
+None suggested.
+"""
 
 
 def diagram():
@@ -74,7 +83,8 @@ def test_summary_then_architecture_use_triggering_harness(tmp_path, monkeypatch,
     for name in ("report.md", "signals.json"):
         (folder / name).write_text("{}")
     markdown = "# Change Summary\n" + "\n".join(
-        section + "\nRecorded evidence.\n" for section in paircli_summary.REQUIRED_SECTIONS
+        READING_GUIDE if section == "## Reading guide" else section + "\nRecorded evidence.\n"
+        for section in paircli_summary.REQUIRED_SECTIONS
     )
     responses = iter([markdown, json.dumps(diagram())])
     calls = []
@@ -86,27 +96,33 @@ def test_summary_then_architecture_use_triggering_harness(tmp_path, monkeypatch,
     monkeypatch.setattr(paircli_summary, runner, generate)
     result = paircli_summary.write_summary(harness, "https://github.com/acme/reviews/pull/42",
                                           tmp_path, folder, io.StringIO())
-    assert result.read_text() == paircli_summary.summary_without_diagram(markdown.strip() + "\n")
+    assert result.read_text() == markdown.strip() + "\n"
     assert "## Diagram" not in result.read_text()
     assert "## Intent" in result.read_text() and "## Decisions" in result.read_text()
+    assert READING_GUIDE in result.read_text()
     assert len(calls) == 2 and all(repo == tmp_path for _, repo in calls)
     assert json.loads((folder / "generated_artifacts/architecture.json").read_text()) == diagram()
     with zipfile.ZipFile(create_pr_archive(tmp_path, folder)) as archive:
         assert b"## Diagram" not in archive.read("overview.md")
+        assert READING_GUIDE.encode() in archive.read("overview.md")
         assert "generated_artifacts/architecture.json" in archive.namelist()
 
 
 @pytest.mark.parametrize("architecture_output", ["null", "bad JSON"])
-def test_inline_diagram_remains_when_board_unavailable(tmp_path, monkeypatch, architecture_output):
+def test_summary_stays_without_diagram_when_board_unavailable(tmp_path, monkeypatch, architecture_output):
     folder = prepare(tmp_path)
     for name in ("report.md", "signals.json"):
         (folder / name).write_text("{}")
-    markdown = "# Change Summary\n## Intent\nPersist reviews.\n## Diagram\n```mermaid\nflowchart LR\nAPI --> DB\n```\n## Decisions\nNo explicit choices captured.\n## Verification\nNo pre-push checks captured.\n"
+    markdown = ("# Change Summary\n## Intent\nPersist reviews.\n" + READING_GUIDE
+                + "## Decisions\nNo developer choices were recorded.\n## Verification\nNo check results were recorded before this push.\n")
     responses = iter([markdown, architecture_output])
     monkeypatch.setattr(paircli_summary, "_run_codex", lambda *_args: next(responses))
     result = paircli_summary.write_summary("codex", "https://github.com/acme/reviews/pull/42",
                                           tmp_path, folder, io.StringIO())
     assert result.read_text() == markdown
+    assert "## Diagram" not in result.read_text() and "```mermaid" not in result.read_text()
+    with zipfile.ZipFile(create_pr_archive(tmp_path, folder)) as archive:
+        assert archive.read("overview.md") == markdown.encode()
     assert not (folder / "generated_artifacts/architecture.json").exists()
 
 
