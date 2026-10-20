@@ -28,7 +28,7 @@ from paircli_upload import upload_archive
 
 DEFAULT_REPOSITORY_URL = "https://github.com/rutvikchandla3/paircli"
 DEFAULT_RELEASE_MANIFEST_URL = "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
-DEFAULT_SERVER_URL = "https://prod-be.pair.sh"
+DEFAULT_SERVER_URL = "https://pair.sh"
 GITHUB_RELEASE_HOST = "github.com"
 GITHUB_RELEASE_REPOSITORY = "rutvikchandla3/paircli"
 GITHUB_RELEASE_PATH_PREFIX = "/rutvikchandla3/paircli/releases/"
