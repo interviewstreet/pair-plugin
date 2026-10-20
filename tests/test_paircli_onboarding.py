@@ -42,7 +42,7 @@ def make_paircli(tmp_path: Path) -> Path:
         "entries.append(sys.argv[1:])\n"
         "json.dump(entries, open(calls, 'w'))\n"
         "if sys.argv[1:] == ['login']:\n"
-        "    server = os.environ.get('PAIRCLI_SERVER_URL') or 'https://prod-be.pair.sh'\n"
+        "    server = os.environ.get('PAIRCLI_SERVER_URL') or 'https://pair.sh'\n"
         "    json.dump({'access_token': 'test-token', 'server_url': server.rstrip('/')}, "
         "open(os.environ['PAIRCLI_AUTH_FILE'], 'w'))\n"
     )
@@ -699,7 +699,10 @@ def test_has_active_login_requires_matching_backend(monkeypatch, tmp_path):
     auth.write_text(json.dumps({"access_token": "local-token", "server_url": "http://localhost:8080"}))
     assert not onboarding.has_active_login()
 
-    auth.write_text(json.dumps({"access_token": "production-token", "server_url": "https://prod-be.pair.sh/"}))
+    auth.write_text(json.dumps({"access_token": "previous-server-token", "server_url": "https://prod-be.pair.sh/"}))
+    assert not onboarding.has_active_login()
+
+    auth.write_text(json.dumps({"access_token": "production-token", "server_url": "https://pair.sh/"}))
     assert onboarding.has_active_login()
 
     monkeypatch.setenv("PAIRCLI_SERVER_URL", "https://private.pair.example")
