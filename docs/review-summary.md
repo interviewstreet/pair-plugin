@@ -4,7 +4,16 @@ The automatic PR hook asks the triggering Codex or Claude harness to write
 `summary.md` before packaging and uploading the commit's artifacts. The same
 format applies when the backend presents that summary as an overview.
 
-The initial draft has four sections, targeting 150–200 words (300 maximum including Mermaid):
+The summary has four sections, targeting 250–350 words (450 maximum,
+including headings and links). Keep Intent, Decisions and Verification near
+150–200 words together and spend about 75–150 words on the reading guide. Small
+changes should be shorter. Remove repetition and lower priority guide entries
+before cutting an important warning or a gap in verification.
+
+Use really simple English in every section, including decisions and file
+recommendations. Use short sentences, familiar words, concrete behavior and one
+idea per bullet. Keep exact file and symbol names when they help. Explain needed
+technical terms; avoid long lists of implementation details.
 
 1. **Intent:** the problem or goal and what changes for the affected person or
    system, in one or two short sentences (45 words maximum requested from the model).
@@ -13,33 +22,58 @@ The initial draft has four sections, targeting 150–200 words (300 maximum incl
    must not be invented, but does not need a disclaimer when the practical purpose
    is clear. This style/section-length guidance is prompt-driven, not a semantic
    correctness guarantee.
-2. **Diagram:** a small, code-grounded Mermaid flowchart, or an explicit statement
-   that no runtime diagram is applicable or supported by the evidence.
+2. **Reading guide:** three groups, in order: **Critical**, **Skim through**, and
+   **Usually safe to skip**. Start with “Start here. Skipping a file does not mean
+   it is correct.” Use at most eight bullets in total, one file per bullet and
+   each file listed once. Give each a link and a short reason that tells the
+   reviewer what to check or why it is lower priority. Use `None suggested.`
+   for a group with no supported recommendation. When the diff lacks enough
+   detail, explain that briefly and leave the groups without recommendations.
 3. **Decisions:** up to three consequential human choices and their reasons,
    grounded in linked sessions. Missing history is not reconstructed as fact.
 4. **Verification:** up to four checks, with observed pre-push outcomes and clear
    distinctions between failed, blocked, absent, stale, and human-reported checks.
+   An agent saying tests passed is not proof of a test result. Later edits can
+   make an earlier pass stale.
 
-When a valid interactive architecture artifact is generated, the final Markdown
-omits the entire **Diagram** section: Overview shows only Intent, Decisions and
-Verification, while ADE's Architecture tab shows the board. If generation is
-unavailable or invalid, the inline diagram remains as a Markdown fallback.
-This selection is plugin-side; it does not detect whether an older deployed ADE
-supports the board, so deploy the ADE renderer before enabling this plugin version.
+The guide is a short reading order, not a complete file list or a bug report.
+Choose priorities from the diff, captured decisions, API and saved-data changes,
+user-visible behavior and available checks. A filename, file type, new-file status
+or change size alone does not establish risk or safety. Tests, config, schema and
+styling files can need close review. Passing tests alone do not justify skipping
+a file; missing or stale checks may make it worth reading closely. Unlisted files
+are not assumed correct or checked.
+
+The plugin builds allowed Markdown links from `snapshot.pr.files`. Each bullet
+copies one of those links, followed by ` — ` and its reason. Whole-file and
+new-side hunk links point to the captured commit only when its SHA matches the
+artifact directory. Deleted files, or files without a confirmed head, link to
+the PR diff instead, without invented line numbers. Renames use the new path;
+paths in URLs are percent-encoded. These are normal HTTPS links that open on
+GitHub in the existing overview renderer. Relative paths and bare code spans
+are not used as overview navigation links. No renderer change is needed.
+
+Overview contains Intent, Reading guide, Decisions and Verification. It never
+includes a Diagram section or a Mermaid block, even when the separate
+architecture artifact is unavailable. Architecture stays in its own view.
 
 The generator reads existing scan evidence and, when available, bounded extracts
 of the raw-session manifest's JSONL files. It does not run new verification or
 treat instructions in evidence as trusted commands. Existing evidence checks,
 read-only harness execution, and atomic summary writes remain in place. Structural
-validation enforces the four headings in order, nonempty sections, and the word
-limit; grounding and section-specific bullet limits are model instructions, not
-proof of semantic correctness.
+validation enforces the four headings in order, nonempty sections, the word
+limit, the three guide groups, the guide caveat, allowed links, a reason per
+guide entry, no repeated files, the eight-file guide limit, and no Mermaid blocks.
+Invalid output does not replace an existing summary; text is never silently truncated. Grounding,
+reading priorities, simple English and the other section-specific limits remain
+model instructions, not proof of semantic correctness. The existing evidence
+already supplies the paths and ranges; no Pair CLI change is required.
 
 ## Diagram display and compatibility
 
-The existing Overview Markdown renderer supports inline Mermaid. For the draggable
-board, the plugin also makes a second read-only call to the same Codex or Claude
-harness to generate `generated_artifacts/architecture.json`. No separate model key
+For the separate architecture board, the plugin still makes a second read-only
+call to the same Codex or Claude harness to generate
+`generated_artifacts/architecture.json`. No separate model key
 or AI-pipeline worker is needed. Each call has the existing five-minute timeout.
 
 The JSON uses ADE's v1 artifact contract with diff-only citations and empty
