@@ -1,6 +1,6 @@
 {
   "name": "pair",
-  "version": "0.2.0+codex.20261011",
+  "version": "0.2.0+codex.20261020",
   "description": "Review pull requests with context from the coding-agent sessions that built them.",
   "author": {
     "name": "five-sh"

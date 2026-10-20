@@ -11,7 +11,7 @@ Setup downloads the checksum-verified `paircli` binary for the current
 platform, installs a Pair hook for **only** the triggering harness, and opens
 Pair device login if no valid credential exists. A later pull request checks
 for a verified CLI update and re-installs that same harness hook.
-Login targets `https://pair.sh` by default. Set `PAIRCLI_SERVER_URL`
+Login targets `https://prod-be.pair.sh` by default. Set `PAIRCLI_SERVER_URL`
 before starting Codex or Claude to test a private or local backend. Credentials
 are scoped to that backend; switching servers starts a new device login rather
 than reusing an unexpired token from the previous server.
