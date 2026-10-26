@@ -103,7 +103,7 @@ def prepare(monkeypatch, tmp_path, snapshot=None, agent=None):
                         lambda url, archive, auth: uploads.append(zipfile.ZipFile(archive)) or "artifact-1")
     monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: None)
     agent = agent or Agent()
-    monkeypatch.setattr(sys.modules[onboarding.agent_runner.__module__], "_run_codex", agent)
+    monkeypatch.setitem(onboarding.agent_runner.__globals__, "_run_codex", agent)
     return repo, artifacts, uploads, agent
 
 
@@ -387,7 +387,7 @@ def test_a_subdirectory_scan_writes_v2_under_the_toplevel(monkeypatch, tmp_path)
                         lambda url, archive, auth: uploads.append(zipfile.ZipFile(archive)) or "artifact-1")
     monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: None)
     agent = Agent()
-    monkeypatch.setattr(sys.modules[onboarding.agent_runner.__module__], "_run_codex", agent)
+    monkeypatch.setitem(onboarding.agent_runner.__globals__, "_run_codex", agent)
 
     log = tmp_path / "scan.log"
     assert onboarding.scan(log, PR_URL, subdirectory, "codex") == 0, log.read_text()
