@@ -4,6 +4,7 @@ import os
 import stat
 import subprocess
 import sys
+import zipfile
 from email.message import Message
 from hashlib import sha256
 from io import BytesIO
@@ -248,28 +249,158 @@ def test_scan_keeps_zip_when_backend_rejects_cli_login(monkeypatch, tmp_path):
     ]
 
 
-def test_scan_records_summary_failure_and_removes_stale_cli_summary(monkeypatch, tmp_path):
-    binary = make_paircli(tmp_path)
+PR_URL = "https://github.com/acme/repo/pull/42"
+HEAD = "a" * 40
+VALID_SUMMARY = f"""# Change Summary
+## Intent
+Retry failed requests.
+## Reading guide
+Start here. Skipping a file does not mean it is correct.
+### Critical
+- handler.py:10-14 — Check when failed requests stop retrying.
+### Skim through
+None suggested.
+### Usually safe to skip
+None suggested.
+## Decisions
+No developer choices were recorded.
+## Verification
+No check results were recorded before this push.
+"""
+
+
+def fault_scan(monkeypatch, tmp_path, *, evidence=True, commits=None):
+    """Run scan() against real evidence, a stubbed CLI, and a recorded upload."""
     repo = tmp_path / "repo"
-    repo.mkdir()
-    artifacts = repo / ".paircli" / "pr-42" / ("b" * 40)
+    artifacts = repo / ".paircli" / "pr-42" / HEAD
     artifacts.mkdir(parents=True)
-    (artifacts / "summary.md").write_text("old CLI summary")
+    if evidence:
+        for name in ("report.md", "signals.json"):
+            (artifacts / name).write_text("{}")
+        (artifacts / "snapshot.json").write_text(json.dumps({"pr": {
+            "title": "Retry requests", "commits": commits or [{"sha": HEAD}],
+            "files": [{"path": "handler.py", "status": "modified", "additions": 5, "deletions": 1,
+                       "hunks": [{"new_start": 10, "new_lines": 5}]}],
+        }}))
     monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
-    monkeypatch.setenv("PAIRCLI_CALLS", str(tmp_path / "calls.json"))
+    monkeypatch.delenv("PAIRCLI_UPLOAD_ENABLED", raising=False)
     monkeypatch.setattr(onboarding, "artifact_directory", lambda *_: artifacts)
+    monkeypatch.setattr(onboarding, "run_command", lambda *args, **kwargs: None)
+    uploads = []
+    monkeypatch.setattr(onboarding, "upload_archive",
+                        lambda url, archive, auth: uploads.append(zipfile.ZipFile(archive).namelist()) or "artifact-1")
+    monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: None)
+    return repo, artifacts, uploads
+
+
+def summary_module():
+    return sys.modules[onboarding.agent_runner.__module__]
+
+
+def test_scan_falls_back_when_summary_generation_raises_and_removes_stale_summary(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    (artifacts / "summary.md").write_text("old CLI summary")
 
     def fail_summary(*_args):
         raise RuntimeError("agent unavailable")
 
     monkeypatch.setattr(onboarding, "write_summary", fail_summary)
-
-    assert onboarding.scan(tmp_path / "scan.log", "https://github.com/acme/repo/pull/42", repo, "codex") == 1
-    assert not (artifacts / "summary.md").exists()
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: "null")
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    text = (artifacts / "summary.md").read_text()
+    assert text.startswith("# Change Summary\n") and "old CLI summary" not in text
+    assert "This PR is titled 'Retry requests'. It changes 1 file (+5/-1)." in text
+    assert len(uploads) == 1 and "overview.md" in uploads[0]
+    assert "summary generation failed unexpectedly (RuntimeError: agent unavailable)" in log.read_text()
     status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
-    assert status["status"] == "failed"
-    assert status["error"] == "agent unavailable"
-    assert status["artifacts"] == str(artifacts)
+    assert status["status"] == "complete" and status["artifact_id"] == "artifact-1"
+
+
+def test_scan_uploads_fallback_when_model_returns_garbage_for_summary_and_diagram(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: "garbage")
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert len(uploads) == 1 and "overview.md" in uploads[0]
+    assert not any(name.endswith("architecture.json") for name in uploads[0])
+    assert not any("diagnostics" in name for name in uploads[0])
+    assert json.loads((artifacts / "diagnostics" / "summary-status.json").read_text())["mode"] == "fallback"
+    assert "summary mode: fallback" in log.read_text()
+    assert "architecture diagram: not produced" in log.read_text()
+
+
+@pytest.mark.parametrize("failure", [subprocess.TimeoutExpired("codex", 300), RuntimeError("boom"), OSError("gone")])
+def test_scan_uploads_when_the_diagram_step_fails(monkeypatch, tmp_path, failure):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    answers = iter([VALID_SUMMARY])
+
+    def generate(prompt, _repo):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise failure
+
+    monkeypatch.setattr(summary_module(), "_run_codex", generate)
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert len(uploads) == 1 and "overview.md" in uploads[0]
+    assert not any(name.endswith("architecture.json") for name in uploads[0])
+    assert "summary mode: llm)" in log.read_text()
+    assert "architecture diagram: not produced" in log.read_text()
+
+
+def test_scan_survives_the_diagram_step_raising_and_drops_a_stale_diagram(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    (artifacts / "generated_artifacts").mkdir()
+    (artifacts / "generated_artifacts" / "architecture.json").write_text("{}")
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: VALID_SUMMARY)
+
+    def explode(*_args):
+        raise KeyError("unexpected")
+
+    monkeypatch.setattr(onboarding, "write_architecture", explode)
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert not any(name.endswith("architecture.json") for name in uploads[0])
+    assert "architecture unavailable (KeyError" in log.read_text()
+
+
+def test_scan_uploads_when_both_summary_and_diagram_fail(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+
+    def timeout(*_args):
+        raise subprocess.TimeoutExpired("codex", 300)
+
+    monkeypatch.setattr(summary_module(), "_run_codex", timeout)
+    assert onboarding.scan(tmp_path / "scan.log", PR_URL, repo, "codex") == 0
+    assert len(uploads) == 1 and "overview.md" in uploads[0]
+    assert (artifacts / "summary.md").read_text().startswith("# Change Summary\n")
+
+
+def test_scan_uses_the_fallback_for_an_unsupported_harness(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "other") == 0
+    assert len(uploads) == 1
+    assert "summary mode: fallback" in log.read_text() and "architecture diagram: not produced" in log.read_text()
+
+
+def test_scan_reports_a_produced_diagram(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: VALID_SUMMARY)
+    monkeypatch.setattr(onboarding, "write_architecture", lambda folder, generate, log: folder / "x.json")
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert "architecture diagram: produced" in log.read_text()
+
+
+def test_scan_still_fails_when_scan_evidence_is_missing(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path, evidence=False)
+    assert onboarding.scan(tmp_path / "scan.log", PR_URL, repo, "codex") == 1
+    assert uploads == []
+    status = json.loads(onboarding.scan_status_path(tmp_path).read_text())
+    assert status["status"] == "failed" and "Pair evidence is missing" in status["error"]
 
 
 def test_artifact_directory_uses_pr_head_commit(monkeypatch, tmp_path):
@@ -288,7 +419,123 @@ def test_artifact_directory_uses_pr_head_commit(monkeypatch, tmp_path):
     result = onboarding.artifact_directory("https://github.com/acme/repo/pull/42", tmp_path)
 
     assert result == tmp_path / ".paircli" / "pr-42" / commit
-    assert calls[1][-2:] == ["--jq", ".commits[-1].oid"]
+    # GitHub's true head, not commits[-1], which is stale once a PR has more than 100 commits.
+    assert calls[1] == ["gh", "pr", "view", "https://github.com/acme/repo/pull/42",
+                        "--json", "headRefOid", "--jq", ".headRefOid"]
+
+
+@pytest.mark.parametrize("head", ["", "not-a-sha", "c" * 39])
+def test_artifact_directory_rejects_an_invalid_head(monkeypatch, tmp_path, head):
+    from types import SimpleNamespace
+
+    replies = iter((str(tmp_path) + "\n", head + "\n"))
+    monkeypatch.setattr(onboarding.subprocess, "run",
+                        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=next(replies), stderr=""))
+    with pytest.raises(RuntimeError, match="invalid PR head"):
+        onboarding.artifact_directory("https://github.com/acme/repo/pull/42", tmp_path)
+
+
+def test_scan_accepts_a_snapshot_whose_commit_list_was_cut_at_one_hundred(monkeypatch, tmp_path):
+    # GitHub returned 100 commits and the real head is not among them.
+    commits = [{"sha": f"{index:040x}"} for index in range(1, 101)]
+    assert commits[-1]["sha"] != HEAD
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path, commits=commits)
+    diagram = {
+        "schema_version": 1, "head_sha": HEAD, "title": "Retry", "description": "Failed requests retry.",
+        "nodes": [{"id": "handler", "label": "Handler", "kind": "service", "layer": 0, "change": "modified",
+                   "description": "Retries failed requests.", "files": ["handler.py"], "episode_ids": [],
+                   "evidence": [{"type": "diff", "path": "handler.py", "start": 10, "end": 14}]}],
+        "edges": [], "flows": [], "gaps": [],
+    }
+    answers = iter([VALID_SUMMARY, json.dumps(diagram)])
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: next(answers))
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert f"https://github.com/acme/repo/blob/{HEAD}/handler.py#L10-L14" in (artifacts / "summary.md").read_text()
+    assert (artifacts / "generated_artifacts" / "architecture.json").is_file()
+    assert "architecture diagram: produced" in log.read_text()
+    assert any(name.endswith("architecture.json") for name in uploads[0])
+
+
+def test_scan_logs_files_without_hunk_data(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    snapshot = json.loads((artifacts / "snapshot.json").read_text())
+    snapshot["pr"]["files"] += [{"path": "huge.sql", "status": "modified"}, {"path": "logo.png", "status": "added", "hunks": []}]
+    (artifacts / "snapshot.json").write_text(json.dumps(snapshot))
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert "2 of 3 files have no hunk data" in log.read_text()
+
+
+def test_scan_does_not_log_hunk_data_when_every_file_has_hunks(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert "no hunk data" not in log.read_text()
+
+
+def monorepo_scan(monkeypatch, tmp_path):
+    """Run scan() from a subdirectory of a real git checkout with only gh and paircli stubbed."""
+    toplevel = tmp_path.resolve() / "monorepo"
+    subdirectory = toplevel / "services" / "api"
+    subdirectory.mkdir(parents=True)
+    real_run = subprocess.run
+    real_run(["git", "init", "-q", str(toplevel)], check=True)
+
+    def fake_run(command, **kwargs):
+        if command[0] == "gh":
+            return subprocess.CompletedProcess(command, 0, stdout=HEAD + "\n", stderr="")
+        return real_run(command, **kwargs)
+
+    def fake_paircli(command, *, cwd, log, timeout=None):
+        if command[1] == "scan":
+            out = Path(command[command.index("--out") + 1])
+            out.mkdir(parents=True)
+            for name in ("report.md", "signals.json"):
+                (out / name).write_text("{}")
+            (out / "snapshot.json").write_text(json.dumps({"pr": {
+                "title": "Retry requests", "commits": [{"sha": HEAD}],
+                "files": [{"path": "handler.py", "status": "modified",
+                           "hunks": [{"new_start": 10, "new_lines": 5}]}],
+            }}))
+
+    monkeypatch.setenv("PAIRCLI_PLUGIN_HOME", str(tmp_path))
+    monkeypatch.delenv("PAIRCLI_UPLOAD_ENABLED", raising=False)
+    monkeypatch.setattr(onboarding.subprocess, "run", fake_run)
+    monkeypatch.setattr(onboarding, "run_command", fake_paircli)
+    uploads = []
+    monkeypatch.setattr(onboarding, "upload_archive",
+                        lambda url, archive, auth: uploads.append(zipfile.ZipFile(archive).namelist()) or "artifact-1")
+    monkeypatch.setattr(onboarding, "notify_scan_result", lambda *args, **kwargs: None)
+    agent_cwds = []
+
+    def agent(prompt, cwd):
+        agent_cwds.append(cwd)
+        return VALID_SUMMARY if len(agent_cwds) == 1 else "null"
+
+    monkeypatch.setattr(summary_module(), "_run_codex", agent)
+    return toplevel, subdirectory, agent_cwds, uploads
+
+
+def test_scan_from_a_subdirectory_of_the_repository_uses_the_toplevel(monkeypatch, tmp_path):
+    toplevel, subdirectory, agent_cwds, uploads = monorepo_scan(monkeypatch, tmp_path)
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, subdirectory, "codex") == 0, log.read_text()
+    artifacts = toplevel / ".paircli" / "pr-42" / HEAD
+    assert (artifacts / "summary.md").is_file() and not (subdirectory / ".paircli").exists()
+    # The restricted agent can only read inside its working directory, so it must start at the toplevel.
+    assert agent_cwds == [toplevel, toplevel]
+    assert len(uploads) == 1 and "overview.md" in uploads[0]
+    assert f".paircli/pr-42/{HEAD}/snapshot.json" in uploads[0]
+
+
+def test_artifact_root_requires_the_pr_folder_layout(tmp_path):
+    folder = tmp_path / ".paircli" / "pr-42" / HEAD
+    assert onboarding.artifact_root(folder) == tmp_path
+    for bad in (tmp_path / "pr-42" / HEAD, tmp_path / ".paircli" / "other" / HEAD,
+                tmp_path / ".paircli" / "pr-42" / "abc", Path("/x")):
+        with pytest.raises(RuntimeError, match="unexpected PR artifact folder"):
+            onboarding.artifact_root(bad)
 
 
 def test_stale_lock_is_reclaimed(monkeypatch, tmp_path):

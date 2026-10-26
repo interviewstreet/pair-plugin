@@ -46,6 +46,9 @@ def create_pr_archive(repo_dir: Path, artifact_dir: Path) -> Path:
             with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 _write_entry(archive, folder / "summary.md", "overview.md")
                 for path in sorted(folder.rglob("*")):
+                    # Unvalidated model output stays local; skip it before any symlink check.
+                    if path.relative_to(folder).parts[0] == "diagnostics":
+                        continue
                     if path.is_symlink():
                         raise ValueError(f"PR artifact contains a symlink: {path.relative_to(folder)}")
                     if path.is_file():

@@ -21,7 +21,11 @@ from urllib.request import Request, urlopen
 
 from pair_notification import notify_scan_result
 from paircli_archive import create_pr_archive
-from paircli_summary import write_summary
+from paircli_architecture import write_architecture
+from paircli_summary import (
+    EvidenceMissingError, STATUS_OUTPUT, agent_runner, write_fallback_summary, write_summary,
+)
+from paircli_snapshot import captured_pr, count_files, files_without_line_data
 from paircli_tls import compatible_tls_context
 from paircli_upload import upload_archive
 
@@ -788,7 +792,8 @@ def artifact_directory(pr_url: str, repo_dir: Path) -> Path:
         raise RuntimeError(f"invalid GitHub PR URL: {pr_url}")
     commands = (
         ["git", "rev-parse", "--show-toplevel"],
-        ["gh", "pr", "view", pr_url, "--json", "commits", "--jq", ".commits[-1].oid"],
+        # headRefOid is GitHub's true head; the commits list stops at 100 entries.
+        ["gh", "pr", "view", pr_url, "--json", "headRefOid", "--jq", ".headRefOid"],
     )
     results = []
     for command in commands:
@@ -805,6 +810,63 @@ def artifact_directory(pr_url: str, repo_dir: Path) -> Path:
     return Path(root) / ".paircli" / f"pr-{match.group(1)}" / head_commit.lower()
 
 
+def artifact_root(artifact_dir: Path) -> Path:
+    """The git toplevel of `.paircli/pr-N/<sha>`; agents and packaging must work from there.
+
+    The folder lives under the toplevel even when the hook ran in a subdirectory, and a restricted
+    agent can only read inside its working directory.
+    """
+    parents = artifact_dir.parents
+    if (len(parents) < 3 or parents[1].name != ".paircli" or not re.fullmatch(r"pr-[1-9][0-9]*", parents[0].name)
+            or not re.fullmatch(r"[0-9a-f]{40}", artifact_dir.name)):
+        raise RuntimeError(f"unexpected PR artifact folder: {artifact_dir}")
+    return parents[2]
+
+
+def run_summary_step(harness: str, pr_url: str, repo_dir: Path, artifact_dir: Path, log) -> Path:
+    """Write summary.md, falling back to the deterministic one so it can never block the upload."""
+    try:
+        pr = captured_pr(artifact_dir)
+        without_lines = files_without_line_data(pr)
+        if without_lines:
+            log.write(f"{len(without_lines)} of {count_files(pr)} files have no hunk data\n")
+    except Exception:
+        pass
+    try:
+        return write_summary(harness, pr_url, repo_dir, artifact_dir, log)
+    except EvidenceMissingError:
+        raise
+    except Exception as error:
+        log.write(f"summary generation failed unexpectedly ({type(error).__name__}: {error}); using fallback\n")
+        return write_fallback_summary(pr_url, artifact_dir, [f"{type(error).__name__}: {error}"], log)
+
+
+def summary_mode(artifact_dir: Path) -> str:
+    """Read which path produced summary.md (llm, llm-retry or fallback) for the scan log."""
+    try:
+        status = json.loads((artifact_dir / "diagnostics" / STATUS_OUTPUT).read_text(encoding="utf-8"))
+        return str(status["mode"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return "unknown"
+
+
+def run_diagram_step(harness: str, repo_dir: Path, artifact_dir: Path, log) -> Path | None:
+    """Try the architecture diagram after the summary; nothing here may fail the scan."""
+    try:
+        generate = agent_runner(harness)
+        return write_architecture(artifact_dir, lambda prompt: generate(prompt, repo_dir), log)
+    except Exception as error:
+        log.write(f"architecture unavailable ({type(error).__name__}: {error}); continuing without a diagram\n")
+        try:
+            # An older diagram must not be uploaded as if it described this run.
+            stale = artifact_dir / "generated_artifacts" / "architecture.json"
+            if not stale.parent.is_symlink():
+                stale.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
 def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
     """Generate CLI evidence, then have the triggering agent write summary.md."""
     home = onboarding_home()
@@ -813,6 +875,7 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
     try:
         with log.open("a", encoding="utf-8") as output:
             artifact_dir = artifact_directory(pr_url, repo_dir)
+            root = artifact_root(artifact_dir)
             try:
                 run_command(
                     [str(binary), "update", "--quiet", "--plugin-version", PLUGIN_VERSION],
@@ -828,9 +891,11 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
             )
             (artifact_dir / "summary.md").unlink(missing_ok=True)
             output.write(f"generating AI summary.md with {harness}\n")
-            summary = write_summary(harness, pr_url, repo_dir, artifact_dir, output)
-            output.write(f"wrote {summary}\n")
-            archive = create_pr_archive(repo_dir, artifact_dir)
+            summary = run_summary_step(harness, pr_url, root, artifact_dir, output)
+            output.write(f"wrote {summary} (summary mode: {summary_mode(artifact_dir)})\n")
+            diagram = run_diagram_step(harness, root, artifact_dir, output)
+            output.write(f"architecture diagram: {'produced' if diagram else 'not produced'}\n")
+            archive = create_pr_archive(root, artifact_dir)
             output.write(f"packaged {archive}\n")
             artifact_id = ""
             if os.environ.get("PAIRCLI_UPLOAD_ENABLED", "1") != "0":

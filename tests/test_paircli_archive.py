@@ -37,6 +37,19 @@ def test_packages_only_one_complete_pr_commit(tmp_path):
     assert (folder / "summary.md").read_text() == "summary"
 
 
+def test_excludes_unvalidated_diagnostics_from_zip(tmp_path):
+    folder = tmp_path / ".paircli" / "pr-42" / ("a" * 40)
+    (folder / "diagnostics").mkdir(parents=True)
+    (folder / "summary.md").write_text("summary")
+    (folder / "diagnostics" / "architecture-raw.txt").write_text("raw model output")
+    (folder / "diagnostics" / "architecture-errors.json").write_text("[]")
+
+    with zipfile.ZipFile(create_pr_archive(tmp_path, folder)) as archive:
+        assert sorted(archive.namelist()) == sorted(
+            ["overview.md", f".paircli/pr-42/{'a' * 40}/summary.md"]
+        )
+
+
 def test_rejects_symlinks_without_replacing_previous_archive(tmp_path):
     folder = tmp_path / ".paircli" / "pr-42" / ("a" * 40)
     folder.mkdir(parents=True)
