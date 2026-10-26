@@ -11,9 +11,13 @@ is the input of `finalize_v2(draft, head, snapshot, "deterministic")`, which fil
                           one `file` row per top-ranked citable file, one `pattern` row per repeated
                           change (identical change signature) or folded tests/docs/config set that
                           the skeleton found (its members get no file rows; `files` is a sample of
-                          up to 12 with real citations), plus one `routine` row per group that has
-                          routine files (lockfiles, generated, vendored, binary). A pattern row
-                          counts as one row of the group's budget. Every other non-routine file with
+                          up to 12 with real citations), one `moved` pattern row for 3 or more files
+                          that were only moved (renamed, no changed line; no citations, verified by the
+                          snapshot), plus one `routine` row per group that has routine files (lockfiles,
+                          generated, vendored, binary; it lists ALL of them in `pattern.members`, split by
+                          directory above 500, and a routine file with no group goes to the first group).
+                          A same-change row's label names its most distinctive net changed line. A
+                          pattern row counts as one row of the group's budget. Every other non-routine file with
                           no row (budget cut) goes into one `remainder` pattern row (3 to 500
                           members, split by directory above that); one or two leftovers get ordinary
                           rows beyond the budget. One node slot per remainder row is reserved
@@ -49,7 +53,9 @@ from paircli_architecture_v2 import (
     ID_PATTERN, MAX_EDGES, MAX_FILES_PER_NODE, MAX_GAPS, MAX_GROUPS, MAX_NODES, MAX_REFS, SnapshotIndex, common_directory,
     dicts,
 )
-from paircli_patterns import MAX_MEMBERS, MIN_MEMBERS, _split_members, pattern_label, verify_pattern
+from paircli_patterns import (
+    DIGITS, MAX_MEMBERS, MIN_MEMBERS, _split_members, label_hint, net_line_set, pattern_label, verify_pattern,
+)
 from paircli_skeleton import CATEGORY_PENALTY, _clean, _int, _line_kind, _plural, _slug, size_budget
 
 ARCHITECTURE_V2 = "architecture.v2.json"
@@ -62,8 +68,10 @@ MAX_PATTERN_SAMPLES = 12  # sample members listed (and cited) on a pattern row
 MAX_PATTERN_EDGE_REFS = 3  # sample citations on an edge that stands for several imports
 MODIFIED_SOURCE_BONUS = 1.0  # row selection: a modified source file outranks added boilerplate
 PATTERN_BONUS = 2.0
+MOVED_BONUS = 4.0  # a pure move has no changed lines but is the most important fact about its files
 CATEGORY_OF_FAMILY = {"tests": "test", "docs": "docs", "config": "config"}
-FAMILY_GROUP_LABELS = {"tests": "Test files", "docs": "Doc files", "config": "Config files", "remainder": "Other changed files"}
+FAMILY_GROUP_LABELS = {"tests": "Test files", "docs": "Doc files", "config": "Config files", "remainder": "Other changed files",
+                       "moved": "Moved files"}
 SAME_CHANGE_GROUP_LABELS = {"renamed": "Renamed and edited files", "deleted": "Repeated deletions",
                             "added": "Repeated additions"}
 CHANGE_LABELS = frozenset({*FAMILY_GROUP_LABELS.values(), *SAME_CHANGE_GROUP_LABELS.values(), "Repeated changes",
@@ -198,8 +206,9 @@ def _verified_patterns(raw, cite: _Citations, records: dict) -> list[dict]:
     result = []
     for item in dicts(raw):
         family = item.get("family")
+        # A moved file has no hunk to cite: the snapshot alone verifies it.
         members = sorted({path for path in item.get("members") or [] if isinstance(path, str) and path in records
-                          and cite.usable(path)})
+                          and (family == "moved" or cite.usable(path))})
         if len(members) < MIN_MEMBERS:
             continue
         signature = item.get("signature") if family == "same-change" else None
@@ -209,19 +218,81 @@ def _verified_patterns(raw, cite: _Citations, records: dict) -> list[dict]:
         if verify_pattern(candidate, cite.index.files):
             continue
         statuses = {records[path]["status"] for path in members}
-        status = (next(iter(statuses)) if family == "same-change" and len(statuses) == 1
+        status = ("renamed" if family == "moved"
+                  else next(iter(statuses)) if family == "same-change" and len(statuses) == 1
                   else "added" if statuses == {"added"} else "deleted" if statuses == {"deleted"} else "modified")
         result.append({
-            "family": family, "signature": signature, "members": members, "status": status,
+            "family": family, "signature": signature, "members": members, "status": status, "hint": None,
             "additions": sum(records[path]["additions"] for path in members),
             "deletions": sum(records[path]["deletions"] for path in members),
         })
     return result
 
 
+def _carries(hint: tuple[str, str], file) -> bool:
+    """The file's net changed lines contain the hint's snippet exactly as written."""
+    lines = net_line_set(file, raw=True)
+    return any(hint[1] in line for line in lines) if hint[0].endswith(" imports") else hint[1] in lines
+
+
+def _assign_hints(patterns: list[dict], cite: _Citations) -> None:
+    """Give each edited same-change pattern the snippet of its most distinctive net changed line (label text).
+
+    The hint comes from the pattern's first member. Patterns whose labels would then be identical are told
+    to avoid each other's lines, so two repeated changes that differ by one line get different labels.
+    """
+    targets = [pattern for pattern in patterns
+               if pattern["family"] == "same-change" and pattern["status"] in ("modified", "renamed")]
+    firsts = {id(pattern): cite.file(pattern["members"][0]) for pattern in targets}
+
+    def label(pattern: dict) -> str:
+        hint = pattern["hint"]
+        return pattern_label("same-change", len(pattern["members"]), pattern["status"],
+                             hint[1] if hint else None, hint[0] if hint else None)
+
+    def stabilise(pattern: dict) -> None:
+        # Members differ in their digits (that is what "same change" ignores): show `#` unless every member
+        # carries the snippet exactly as written.
+        hint = pattern["hint"]
+        if hint and hint[1] and not all(_carries(hint, cite.file(path)) for path in pattern["members"]):
+            pattern["hint"] = (hint[0], DIGITS.sub("#", hint[1]))
+
+    for pattern in targets:
+        pattern["hint"] = label_hint(firsts[id(pattern)])
+        stabilise(pattern)
+    by_label: dict[str, list[dict]] = {}
+    for pattern in targets:  # the member count does not tell two rows apart
+        by_label.setdefault(label(pattern).split(": ", 1)[-1], []).append(pattern)
+    for clash in (group for group in by_label.values() if len(group) > 1):
+        lines = {id(pattern): net_line_set(firsts[id(pattern)]) for pattern in clash}
+        for pattern in clash:
+            avoid = set().union(*(lines[id(other)] for other in clash if other is not pattern))
+            pattern["hint"] = label_hint(firsts[id(pattern)], avoid) or pattern["hint"]
+            stabilise(pattern)
+
+
+def _routine_pieces(paths: list[str]) -> list[list[str]]:
+    """The routine files of a group as sorted pieces of at most 500 (split by directory above that)."""
+    return [sorted(piece) for piece in _split_members(sorted(paths), MAX_MEMBERS)] if paths else []
+
+
+def _routine_node(group_id: str, piece: list[str], taken: set[str]) -> dict:
+    """One `routine` row: every file of the piece is a `pattern.members` entry, `files` is a sample of 15."""
+    return {
+        "id": _identifier(f"{group_id[:55]}-routine", taken, "routine"),
+        "label": _plural(len(piece), "routine file"), "group": group_id, "kind": "routine",
+        "description": f"{_plural(len(piece), 'routine file')} (lockfiles, generated, vendored or binary) "
+                       "changed; not shown individually.",
+        "files": [path for path in piece if len(path) <= MAX_PATH_CHARS][:MAX_FILES_PER_NODE],
+        "evidence": [], "pattern": {"family": "routine", "count": len(piece), "members": list(piece)},
+    }
+
+
 def _pattern_priority(pattern: dict) -> float:
     """Row-selection and ordering score: big repeated changes first; folded tests/docs/config lowest."""
     lines = math.log1p(pattern["additions"] + pattern["deletions"])
+    if pattern["family"] == "moved":
+        return round(MOVED_BONUS + PATTERN_BONUS + math.log1p(len(pattern["members"])), 4)
     if pattern["family"] == "same-change":
         return round(lines + PATTERN_BONUS + math.log1p(len(pattern["members"])), 4)
     return round(lines - CATEGORY_PENALTY.get(CATEGORY_OF_FAMILY.get(pattern["family"], ""), 0.0), 4)
@@ -233,8 +304,27 @@ def _file_priority(record: dict) -> float:
     return record.get("score", 0) + bonus
 
 
-def _describe_pattern(pattern: dict) -> str:
+def _describe_moved(pattern: dict, records: dict) -> str:
+    """"N files were moved ... (from X/ to Y/)", from the directories of the old and new paths."""
+    members = pattern["members"]
+    pairs: dict[tuple[str, str], int] = {}
+    for path in members:
+        old = records.get(path, {}).get("old_path") or ""
+        key = (posixpath.dirname(old), posixpath.dirname(path))
+        pairs[key] = pairs.get(key, 0) + 1
+    (old_dir, new_dir), top = min(pairs.items(), key=lambda item: (-item[1], item[0]))
+
+    def where(directory: str) -> str:
+        return f"{_clean(directory, 120)}/" if directory else "the repository root"
+
+    place = f"renamed within {where(new_dir)}" if old_dir == new_dir else f"from {where(old_dir)} to {where(new_dir)}"
+    return f"{len(members)} files were moved to a new path with no content change ({'' if top == len(members) else 'for example '}{place})."
+
+
+def _describe_pattern(pattern: dict, records: dict | None = None) -> str:
     count = len(pattern["members"])
+    if pattern["family"] == "moved":
+        return _describe_moved(pattern, records or {})
     directories = len({posixpath.dirname(path) for path in pattern["members"]})
     spans = f" Spans {directories} directories." if directories > 1 else ""
     if pattern["family"] == "same-change":
@@ -257,12 +347,15 @@ def _pattern_node(group_id: str, pattern: dict, records: dict, cite: _Citations,
     members = pattern["members"]
     ranked = sorted(members, key=lambda path: (-(records[path]["additions"] + records[path]["deletions"]), path))
     samples, refs = [], []
-    for path in ranked:
-        if len(samples) >= MAX_PATTERN_SAMPLES:
-            break
-        evidence = cite.evidence(path)
-        if evidence:
-            samples.append((path, evidence))
+    if pattern["family"] == "moved":  # nothing to cite: a sample of the members, no evidence
+        samples = [(path, []) for path in members if len(path) <= MAX_PATH_CHARS][:MAX_PATTERN_SAMPLES]
+    else:
+        for path in ranked:
+            if len(samples) >= MAX_PATTERN_SAMPLES:
+                break
+            evidence = cite.evidence(path)
+            if evidence:
+                samples.append((path, evidence))
     if not samples:
         return None
     # One citation per sample first, then more from the same files while the row has room.
@@ -270,12 +363,14 @@ def _pattern_node(group_id: str, pattern: dict, records: dict, cite: _Citations,
         for _path, evidence in samples:
             if len(refs) < MAX_REFS and len(evidence) > depth:
                 refs.append(evidence[depth])
-    label = pattern_label(pattern["family"], len(members), pattern["status"])
+    hint = pattern.get("hint")
+    label = pattern_label(pattern["family"], len(members), pattern["status"], hint[1] if hint else None,
+                          hint[0] if hint else None)
     name = f"same-{pattern['status']}" if pattern["family"] == "same-change" else pattern["family"]
     stem = f"{group_id[:30].rstrip('-_') or 'g'}-{name}"
     node = {
         "id": _identifier(f"{stem}-{_hash(pattern['family'] + chr(0) + members[0], 6)}", taken, "pattern"),
-        "label": label, "group": group_id, "kind": "pattern", "description": _describe_pattern(pattern),
+        "label": label, "group": group_id, "kind": "pattern", "description": _describe_pattern(pattern, records),
         "files": [path for path, _ in samples], "evidence": refs,
         "pattern": {"family": pattern["family"], "count": len(members)},
     }
@@ -321,7 +416,7 @@ def _remainder_plan(leftover: list[str], cite: _Citations) -> tuple[list[list[st
 
 
 def _remainder_pattern(members: list[str], records: dict) -> dict:
-    return {"family": "remainder", "signature": None, "members": members, "status": "modified",
+    return {"family": "remainder", "signature": None, "members": members, "status": "modified", "hint": None,
             "additions": sum(records[path]["additions"] for path in members),
             "deletions": sum(records[path]["deletions"] for path in members)}
 
@@ -409,6 +504,15 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
         prepared.append((group_id, group, routine, singles, patterns))
         for path in group["files"]:
             home.setdefault(path, group_id)
+    # A routine file whose group has no rows (or that has no group) goes to the first group, so every routine
+    # file is in some routine row.
+    placed = {item for entry in prepared for item in entry[2]}
+    stray = sorted(path for path, record in records.items() if record.get("routine") and path not in placed)
+    if stray:
+        first = prepared[0]
+        prepared[0] = (first[0], first[1], sorted(set(first[2]) | set(stray)), first[3], first[4])
+    extra_routine = sum(max(0, len(_routine_pieces(entry[2])) - 1) for entry in prepared)
+    _assign_hints(list({id(item): item for items in verified.values() for item in items}.values()), cite)
     non_routine = sorted(path for path, record in records.items() if not record.get("routine"))
 
     def select(reserve: int) -> list[list]:
@@ -434,11 +538,11 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
 
     # Every non-routine file lands in a row, a pattern or the remainder: pick the rows first, then
     # reserve the remainder's slots and pick again until the reservation holds.
-    reserve = 0
+    reserve = extra_routine  # a group with more than 500 routine files has several routine rows
     for _round in range(4):
         plans = select(reserve)
         pieces, tail = _remainder_plan(leftover_of(plans), cite)
-        need = len(pieces) + len(tail)
+        need = extra_routine + len(pieces) + len(tail)
         if need <= reserve:
             break
         reserve = need
@@ -450,7 +554,7 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
     pattern_rows = 0
     for (group_id, group, routine, _singles, _patterns), plan in zip(prepared, plans):
         groups.append({"id": group_id, "label": _clean(group.get("label"), 80) or "Changes"})
-        entry = block[group_id] = {"rows": [], "remainder": [], "routine": None}
+        entry = block[group_id] = {"rows": [], "remainder": [], "routine": []}
         for _priority, _order, path, pattern in plan:
             if pattern is not None:
                 node = _pattern_node(group_id, pattern, records, cite, node_ids)
@@ -468,15 +572,7 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
                 continue
             row_of[path] = node["id"]
             entry["rows"].append(node)
-        if routine:
-            entry["routine"] = {
-                "id": _identifier(f"{group_id[:55]}-routine", node_ids, "routine"),
-                "label": _plural(len(routine), "routine file"), "group": group_id, "kind": "routine",
-                "description": f"{_plural(len(routine), 'routine file')} (lockfiles, generated, vendored or binary) "
-                               "changed; not shown individually.",
-                "files": [path for path in routine if len(path) <= MAX_PATH_CHARS][:MAX_FILES_PER_NODE],
-                "evidence": [],
-            }
+        entry["routine"] = [_routine_node(group_id, piece, node_ids) for piece in _routine_pieces(routine)]
     # What no row or pattern holds, routine files aside: one remainder row (or an ordinary row for 1-2 files).
     pieces, tail = _remainder_plan([path for path in non_routine if path not in row_of and path not in pattern_of], cite)
     in_remainder: list[str] = []
@@ -489,7 +585,7 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
                 held[home[path]] = held.get(home[path], 0) + 1
         return min(held, key=lambda name: (-held[name], name)) if held else default_group
 
-    room = MAX_NODES - sum(len(entry["rows"]) + (entry["routine"] is not None) for entry in block.values())
+    room = MAX_NODES - sum(len(entry["rows"]) + len(entry["routine"]) for entry in block.values())
     for path in tail:  # one or two leftover files get ordinary rows, beyond the budget
         group_id = home.get(path) if home.get(path) in block else host([path])
         node = _file_node(group_id, path, records, cite, node_ids) if room > 0 else None
@@ -515,7 +611,7 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
         remainder_rows += 1
         block[group_id]["remainder"].append(node)
     for entry in block.values():
-        nodes.extend(entry["rows"] + entry["remainder"] + ([entry["routine"]] if entry["routine"] else []))
+        nodes.extend(entry["rows"] + entry["remainder"] + entry["routine"])
     nodes = nodes[:MAX_NODES]
     if not any(node["kind"] in ("file", "pattern") for node in nodes):
         return None
@@ -549,7 +645,7 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
                     "collapsed, not shown individually.")
     if folded:
         gaps.append(f"{_plural(folded, 'changed file')} folded into {_plural(pattern_rows, 'pattern row')} "
-                    "(the same change repeated, or tests, docs and config of one area).")
+                    "(the same change repeated, files moved without edits, or tests, docs and config of one area).")
     if in_remainder:
         gaps.append(f"{_plural(len(in_remainder), 'further changed file')} grouped into "
                     f"{_plural(remainder_rows, 'remainder row')}: listed in the details, no rows of their own.")

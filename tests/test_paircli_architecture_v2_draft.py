@@ -12,7 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paircli_architecture import MAX_BYTES, IDENTIFIER
-from paircli_architecture_v2 import finalize_v2, validate_v2
+from paircli_architecture_v2 import accounting, finalize_v2, validate_v2
 from paircli_architecture_v2_draft import (
     deterministic_v2_draft, remove_stale_architecture_v2, write_architecture_v2, write_no_architecture_v2,
 )
@@ -56,7 +56,7 @@ def test_a_single_file_pr_gives_a_valid_one_row_draft():
     _, draft, document = finalize([make_file("src/app.ts", added=source_lines(4), removed=["old"])])
     assert [group["id"] for group in draft["groups"]] == [group["id"] for group in document["groups"]]
     assert len(draft["nodes"]) == 1 and draft["edges"] == [] and draft["steps"] == []
-    assert document["nodes"][0]["stats"] == {"additions": 4, "deletions": 1, "files": 1, "api_added": 0, "api_removed": 0}
+    assert document["nodes"][0]["stats"] == {"additions": 4, "deletions": 1, "files": 1, "api_added": 0, "api_removed": 0, "after_return": 0}
     assert draft["gaps"][-1].startswith("Generated deterministically")
 
 
@@ -643,7 +643,7 @@ def test_a_deletion_heavy_pr_collapses_into_pattern_rows_and_collapsed_edges():
     assert features["pattern"]["count"] == 9
     second = next(edge for edge in document["edges"] if edge["source"] == features["id"])
     assert second["target"] == index["id"] and second["label"] == "imports (9)"
-    assert second["claim"] == '9 of the 9 files in "9 files: same edit" imported index.ts.'
+    assert second["claim"] == f'9 of the 9 files in "{features["label"]}" imported index.ts.'
     assert any("49 changed files folded into 2 pattern rows" in gap for gap in document["gaps"])
     assert len(draft["nodes"]) == 3
 
@@ -655,7 +655,7 @@ def test_a_mechanical_bump_in_one_directory_is_one_pattern_row():
     assert len(document["nodes"]) == 1
     node = document["nodes"][0]
     assert node["kind"] == "pattern" and node["pattern"]["count"] == 40
-    assert node["label"] == "40 files: same edit" and node["stats"]["additions"] == 40 == node["stats"]["deletions"]
+    assert node["label"] == '40 files: changes `"version": "1.3.0",`' and node["stats"]["additions"] == 40 == node["stats"]["deletions"]
     assert node["description"].startswith("40 files with the same change: modified. Each makes the same edit")
 
 
@@ -849,7 +849,7 @@ def test_pattern_members_may_be_renamed_and_hunkless_files_are_left_out():
                 for index in range(2)]
     _, _, document = finalize(renamed + hunkless)
     (node,) = patterns_of(document)
-    assert node["pattern"]["count"] == 4 and node["change"] == "modified" and node["label"] == "4 files: renamed and edited"
+    assert node["pattern"]["count"] == 4 and node["change"] == "modified" and node["label"] == "4 files: renamed, edits imports of `./b`"
     assert not any(path.startswith("src/new/h") for path in node["pattern"]["members"])
     assert any("no usable hunk data" in gap for gap in document["gaps"])
 
@@ -894,7 +894,9 @@ def test_pattern_edges_between_two_pattern_rows_collapse_into_one():
     assert len(patterns_of(document)) == 2 and len(document["edges"]) == 1
     edge = document["edges"][0]
     assert edge["label"] == "imports (5)" and len(edge["evidence"]) == 3 and edge["change"] == "added"
-    assert edge["claim"] == '5 of the 5 files in "5 files: same edit" import 5 of the 5 files in "5 files: added".'
+    callers_row = next(node for node in document["nodes"] if node["id"] == edge["source"])
+    assert callers_row["label"] == "5 files: adds imports of `../callees/e#`"
+    assert edge["claim"] == f'5 of the 5 files in "{callers_row["label"]}" import 5 of the 5 files in "5 files: added".'
     assert {document["nodes"][0]["id"], document["nodes"][1]["id"]} == {edge["source"], edge["target"]}
 
 
@@ -958,7 +960,8 @@ def test_cross_zone_patterns_are_not_named_after_a_zone():
     assert [group["label"] for group in document["groups"]][0] == "Repeated changes"
     assert all(group["label"].startswith("Repeated changes") for group in document["groups"])
     assert len({group["label"] for group in document["groups"]}) == len(document["groups"])
-    assert all(node["label"] == "120 files: same edit" for node in patterns_of(document))
+    assert all(node["label"].startswith("120 files: ") for node in patterns_of(document))
+    assert len({node["label"] for node in patterns_of(document)}) == 4, "four different edits, four different labels"
 
 
 def renamed_across_zones(zones=4, per_zone=12):
@@ -1090,12 +1093,251 @@ def test_a_remainder_row_has_no_import_edges_and_the_draft_is_deterministic():
 
 
 def test_hunkless_files_join_a_remainder_row_but_a_remainder_of_only_hunkless_files_is_not_drawn():
-    files = unlike_files(14) + [make_file(f"src/misc/h{index}.ts", "renamed", old_path=f"src/old/h{index}.ts", no_hunks=True)
-                                for index in range(4)]
+    files = unlike_files(14) + [make_file(f"src/misc/h{index}.ts", "modified", no_hunks=True) for index in range(4)]
     snapshot, _, document = finalize(files)
     (row,) = remainder_nodes(document)
     assert sum(path.startswith("src/misc/h") for path in row["pattern"]["members"]) == 4
     assert all(not name.startswith("src/misc/h") for name in row["files"])
-    only = [make_file(f"src/misc/h{index}.ts", "renamed", old_path=f"src/old/h{index}.ts", no_hunks=True) for index in range(4)]
+    only = [make_file(f"src/misc/h{index}.ts", "modified", no_hunks=True) for index in range(4)]
     _, _, document = finalize(unlike_files(3) + only)
     assert remainder_nodes(document) == [] and any("no usable hunk data" in gap for gap in document["gaps"])
+
+
+# --- moved rows ------------------------------------------------------------------------------------
+
+def pure_moves(count, directory="src/core", old_directory="src/old", start=0):
+    return [make_file(f"{directory}/file{index}.ts", "renamed", old_path=f"{old_directory}/file{index}.ts", no_hunks=True)
+            for index in range(start, start + count)]
+
+
+def rows_of(document, family):
+    return [node for node in patterns_of(document) if node["pattern"]["family"] == family]
+
+
+def test_fifteen_pure_moves_become_one_moved_row_with_no_citation():
+    files = pure_moves(15) + [make_file("src/live.ts", added=["const live = 1;"])]
+    snapshot, draft, document = finalize(files)
+    (row,) = rows_of(document, "moved")
+    assert row["pattern"]["count"] == 15 and row["pattern"]["members"] == sorted(file["path"] for file in files[:15])
+    assert row["label"] == "15 files: moved, not edited" and row["evidence"] == []
+    assert row["description"] == "15 files were moved to a new path with no content change (from src/old/ to src/core/)."
+    assert len(row["files"]) == 12 and set(row["files"]) <= set(row["pattern"]["members"])
+    assert row["stats"] == {"files": 15, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0}
+    assert (row["change"], row["state"]) == ("modified", "changed")
+    assert not any("no usable hunk data" in gap for gap in document["gaps"])
+    assert accounting(document, snapshot) == (16, 16, [])
+    assert "signature" not in row["pattern"]
+
+
+def test_fewer_than_three_pure_moves_stay_in_the_no_usable_hunk_data_gap():
+    files = pure_moves(2) + [make_file("src/live.ts", added=["const live = 1;"])]
+    snapshot, _, document = finalize(files)
+    assert rows_of(document, "moved") == []
+    assert any(gap.startswith("2 changed files with no usable hunk data") for gap in document["gaps"])
+    assert accounting(document, snapshot) == (1, 3, ["src/core/file0.ts", "src/core/file1.ts"])
+
+
+def test_a_move_that_also_edits_a_line_is_not_a_pure_move():
+    files = pure_moves(3) + [make_file(f"src/core/e{index}.ts", "renamed", old_path=f"src/old/e{index}.ts", added=[f"const e{LETTERS[index]} = 1;"])
+                             for index in range(3)]
+    snapshot, _, document = finalize(files)
+    (row,) = rows_of(document, "moved")
+    assert row["pattern"]["count"] == 3 and all(path.startswith("src/core/file") for path in row["pattern"]["members"])
+    assert accounting(document, snapshot)[0] == 6
+
+
+def test_moves_from_several_directories_say_for_example_and_share_one_row():
+    files = pure_moves(4, "web/new", "web/old") + pure_moves(2, "api/new", "api/old", start=10) + [make_file("api/live.ts", added=["const x = 1;"])]
+    _, _, document = finalize(files)
+    (row,) = rows_of(document, "moved")
+    assert row["pattern"]["count"] == 6
+    assert row["description"] == ("6 files were moved to a new path with no content change "
+                                  "(for example from web/old/ to web/new/).")
+
+
+def test_moves_from_and_to_the_repository_root_and_in_place_have_readable_descriptions():
+    to_root = [make_file(f"f{index}.ts", "renamed", old_path=f"old/f{index}.ts", no_hunks=True) for index in range(3)]
+    _, _, document = finalize(to_root + [make_file("src/live.ts", added=["const x = 1;"])])
+    assert "(from old/ to the repository root)" in rows_of(document, "moved")[0]["description"]
+    in_place = [make_file(f"src/n{index}.ts", "renamed", old_path=f"src/o{index}.ts", no_hunks=True) for index in range(3)]
+    _, _, document = finalize(in_place + [make_file("src/live.ts", added=["const x = 1;"])])
+    assert "(renamed within src/)" in rows_of(document, "moved")[0]["description"]
+
+
+def test_a_moved_row_gets_a_group_named_after_it_and_no_edges():
+    files = pure_moves(6, "web/new", "web/old") + pure_moves(6, "api/new", "api/old", start=20)
+    snapshot, _, document = finalize(files + [make_file("lib/live.ts", added=["const x = 1;"])])
+    (row,) = rows_of(document, "moved")
+    group = next(group for group in document["groups"] if group["id"] == row["group"])
+    assert group["label"] == "Moved files" and group["path"] == ""
+    assert document["edges"] == []
+
+
+def test_more_than_five_hundred_pure_moves_split_by_directory_and_the_node_cap_holds():
+    files = pure_moves(300, "src/a", "old/a") + pure_moves(300, "src/b", "old/b") + [make_file("src/live.ts", added=["const x = 1;"])]
+    snapshot, _, document = finalize(files)
+    rows = rows_of(document, "moved")
+    assert sorted(row["pattern"]["count"] for row in rows) == [300, 300] and len(document["nodes"]) <= 60
+    assert accounting(document, snapshot) == (601, 601, [])
+    big = pure_moves(520, "src/a", "old/a") + [make_file("src/live.ts", added=["const x = 1;"])]
+    snapshot, _, document = finalize(big)
+    assert all(row["pattern"]["count"] <= 500 for row in rows_of(document, "moved")) and accounting(document, snapshot)[0] == 521
+
+
+def test_a_moved_row_outranks_a_large_edit_for_the_group_budget():
+    files = pure_moves(5) + [make_file(f"src/core/own{index}.ts", added=source_lines(30 + index)) for index in range(40)]
+    _, _, document = finalize(files)
+    assert len(rows_of(document, "moved")) == 1
+
+
+def test_moved_files_next_to_edited_renames_the_rename_heavy_shape():
+    files = renamed_across_zones() + pure_moves(15, "src/core/zone9", "src/old/zone9")
+    snapshot, _, document = finalize(files)
+    assert sorted(node["pattern"]["count"] for node in patterns_of(document)) == [15, 24, 24]
+    assert accounting(document, snapshot) == (len(files), len(files), [])
+    validate_v2(document, HEAD, snapshot)
+
+
+# --- routine rows stand for all routine files ----------------------------------------------------------
+
+def test_a_routine_row_lists_every_routine_file_as_a_member_and_computes_stats_over_all():
+    files = [make_file("web/src/app.ts", added=source_lines(5))]
+    files += [make_file(f"web/vendor/lib{index}.js", added=["x", "y"]) for index in range(164)]
+    snapshot, draft, document = finalize(files)
+    (row,) = [node for node in document["nodes"] if node["kind"] == "routine"]
+    assert row["pattern"]["family"] == "routine" and row["pattern"]["count"] == 164 == len(row["pattern"]["members"])
+    assert len(row["files"]) == 15 and row["label"] == "164 routine files"
+    assert row["stats"]["files"] == 164 and row["stats"]["additions"] == 328 and row["state"] == "routine"
+    assert accounting(document, snapshot) == (165, 165, [])
+    assert sum(node["stats"]["files"] for node in document["nodes"]) == 165
+    assert "signature" not in row["pattern"]
+
+
+def test_one_routine_file_is_a_routine_row_of_one():
+    _, _, document = finalize([make_file("web/src/app.ts", added=source_lines(5)), make_file("web/package-lock.json", added=["x"])])
+    (row,) = [node for node in document["nodes"] if node["kind"] == "routine"]
+    assert row["pattern"] == {"family": "routine", "count": 1, "members": ["web/package-lock.json"]} and row["label"] == "1 routine file"
+
+
+def test_more_than_five_hundred_routine_files_split_into_several_rows_within_the_node_cap():
+    files = [make_file("web/src/app.ts", added=source_lines(5))]
+    files += [make_file(f"web/vendor/a/lib{index}.js", added=["x"]) for index in range(300)]
+    files += [make_file(f"web/vendor/b/lib{index}.js", added=["x"]) for index in range(300)]
+    snapshot, _, document = finalize(files)
+    rows = [node for node in document["nodes"] if node["kind"] == "routine"]
+    assert sorted(row["pattern"]["count"] for row in rows) == [300, 300] and len(document["nodes"]) <= 60
+    assert len({row["id"] for row in rows}) == 2
+    assert accounting(document, snapshot) == (601, 601, [])
+
+
+def test_routine_files_outside_every_group_still_get_a_row():
+    files = [make_file("web/src/app.ts", added=source_lines(5)), make_file("vendor/deep/lib.js", added=["x"]),
+             make_file("deploy/package-lock.json", added=["y"])]
+    snapshot, _, document = finalize(files)
+    assert accounting(document, snapshot) == (3, 3, [])
+    assert sum(node["pattern"]["count"] for node in document["nodes"] if node["kind"] == "routine") == 2
+
+
+# --- accounting: every file is in a row or in the "no usable hunk data" gap -------------------------------
+
+SCENARIOS = {
+    "single file": lambda: [make_file("src/app.ts", added=source_lines(4), removed=["old"])],
+    "12 files": lambda: many_files(12),
+    "34 files": lambda: many_files(34),
+    "253 files": lambda: many_files(253),
+    "1000 files": lambda: many_files(1000),
+    "unique files over the budget": lambda: unlike_files(40),
+    "deletion heavy": deletion_heavy_pr,
+    "version bumps": lambda: version_bumps(40),
+    "repeated edits": lambda: repeated_edits(60),
+    "handlers with comments": handler_pr,
+    "rename heavy": renamed_across_zones,
+    "rename heavy with pure moves": lambda: renamed_across_zones() + pure_moves(15, "src/core/zone9", "src/old/zone9"),
+    "only pure moves and one edit": lambda: pure_moves(20) + [make_file("src/live.ts", added=["const x = 1;"])],
+    "routine mix": lambda: [make_file("web/src/app.ts", added=source_lines(5))]
+        + [make_file(f"web/vendor/lib{index}.js", added=["x"]) for index in range(40)]
+        + [make_file("web/package-lock.json", added=["y"]), make_file("web/dist/app.min.js", added=["z"])],
+    "only deletions": lambda: [make_file(f"src/old{index}.ts", status="deleted", removed=source_lines(3)) for index in range(5)],
+    "tests docs and config": lambda: [make_file(f"src/app/__tests__/t{index}.test.ts", added=[f"it('{LETTERS[index]}', () => {{}});"]) for index in range(5)]
+        + [make_file(f"src/app/c{index}.config.json", added=[f'"k{LETTERS[index]}": 1']) for index in range(4)]
+        + [make_file("src/app/main.ts", added=source_lines(3))],
+}
+
+
+@pytest.mark.parametrize("name", sorted(SCENARIOS))
+def test_every_changed_file_is_in_a_row_so_the_totals_add_up(name):
+    files = SCENARIOS[name]()
+    snapshot, _, document = finalize(files)
+    covered_files, total, missing = accounting(document, snapshot)
+    assert (covered_files, total, missing) == (len(files), len(files), [])
+    assert sum(node["stats"]["files"] for node in document["nodes"]) == len(files), "no file is in two rows"
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_only_files_without_hunk_data_are_missing_and_the_gap_counts_them():
+    files = unlike_files(10) + [make_file(f"src/misc/h{index}.ts", "modified", no_hunks=True) for index in range(2)]
+    files += pure_moves(2)
+    snapshot, _, document = finalize(files)
+    covered_files, total, missing = accounting(document, snapshot)
+    assert total == 14 and set(missing) == {"src/misc/h0.ts", "src/misc/h1.ts", "src/core/file0.ts", "src/core/file1.ts"}
+    assert any(gap.startswith("4 changed files with no usable hunk data") for gap in document["gaps"])
+    assert covered_files == 10
+
+
+# --- labels that tell repeated changes apart ------------------------------------------------------------------
+
+def test_two_repeated_changes_that_differ_by_one_added_line_get_different_labels():
+    base = ['export function handler(input: string): string {', "  return input;", "}"]
+
+    def variant(prefix, extra):
+        return [make_file(f"src/{prefix}/m{index}.ts", start=2, removed=["// old"],
+                          added=base + ([extra] if extra else [])) for index in range(5)]
+    files = variant("a", None) + variant("b", 'logger.debug("renamed module", { zone: "a" });')
+    _, _, document = finalize(files)
+    labels = sorted(node["label"] for node in patterns_of(document))
+    assert len(labels) == 2 and labels[0] != labels[1], labels
+    assert any("logger.debug" in label for label in labels)
+    assert all(len(label) <= 80 and label.startswith("5 files: ") for label in labels)
+
+
+def test_a_label_names_the_distinctive_net_line_and_ignores_digits_that_vary_per_file():
+    files = [make_file(f"packages/pkg{index}/index.ts", start=2, removed=["const old = 1;"],
+                       added=[f'warn("old", {{ id: {index} }});', "const next = 2;"]) for index in range(6)]
+    _, _, document = finalize(files)
+    (row,) = patterns_of(document)
+    assert row["label"] == '6 files: changes `warn("old", { id: # });`', row["label"]
+    constant = [make_file(f"packages/pkg{index}/index.ts", start=2, removed=["const old = 1;"],
+                          added=['warn("old", { id: 7 });']) for index in range(6)]
+    (row,) = patterns_of(finalize(constant)[2])
+    assert row["label"] == '6 files: changes `warn("old", { id: 7 });`', "digits shared by every member are kept"
+
+
+def test_whole_file_changes_keep_their_status_labels():
+    _, _, document = finalize(deleted_templates(5) + [make_file("src/live.ts", added=["const x = 1;"])])
+    assert [node["label"] for node in patterns_of(document)] == ["5 files: deleted"]
+
+
+def test_labels_do_not_depend_on_the_order_of_the_files():
+    files = renamed_across_zones() + version_bumps(10)
+    first = sorted(node["label"] for node in finalize(files)[2]["nodes"])
+    assert first == sorted(node["label"] for node in finalize(list(reversed(files)))[2]["nodes"])
+
+
+# --- after_return in the draft document ---------------------------------------------------------------------
+
+def return_file(path, status="modified"):
+    lines = [{"kind": "ctx", "text": "function f() {", "old_no": 1, "new_no": 1},
+             {"kind": "ctx", "text": "  return 1;", "old_no": 2, "new_no": 2},
+             {"kind": "add", "text": "  log('unreachable');", "new_no": 3},
+             {"kind": "ctx", "text": "}", "old_no": 3, "new_no": 4}]
+    return {"path": path, "status": status, "hunks": [{"old_start": 1, "old_lines": 3, "new_start": 1, "new_lines": 4,
+                                                      "section": "", "lines": lines}]}
+
+
+def test_after_return_is_summed_over_every_member_of_a_pattern_row_and_a_routine_row():
+    files = [return_file(f"src/m{index}.ts") for index in range(5)] + [make_file("src/live.ts", added=["const x = 1;"])]
+    _, _, document = finalize(files)
+    (row,) = patterns_of(document)
+    assert row["stats"]["after_return"] == 5
+    live = next(node for node in document["nodes"] if node["kind"] == "file")
+    assert live["stats"]["after_return"] == 0

@@ -36,7 +36,7 @@ from paircli_snapshot import lines_available
 from paircli_summary import stage_model
 
 # Bump when a prompt or the patch shape changes: it invalidates every cached patch.
-PROMPT_VERSION = "architecture-llm-4"
+PROMPT_VERSION = "architecture-llm-5"
 DIAGNOSTICS_FOLDER = "architecture-llm"
 STATS_OUTPUT = "stats.json"
 CACHE_PARTS = (".paircli", "cache", "architecture-v2")
@@ -251,8 +251,12 @@ def count_of(value) -> int | None:
 
 def row_stats(facts: dict) -> dict:
     """A row's stats for the digest: the computed `stats` of `node_facts` (files, additions, deletions,
-    api_added, api_removed), never whatever the unenriched draft carries. A pattern row covers all members."""
-    return dict(facts["stats"])
+    api_added, api_removed, and after_return when above 0), never whatever the unenriched draft carries.
+    A pattern row covers all members."""
+    stats = dict(facts["stats"])
+    if not stats.get("after_return"):
+        stats.pop("after_return", None)
+    return stats
 
 
 def api_counts(facts: dict) -> dict:
@@ -468,9 +472,14 @@ DESCRIPTION_RULES = """Descriptions and facts (verify in the code before you wri
 - Say each of these plainly, only after reading the file around the cited lines, never as a guess: exported
   names removed or added (use api_removed and api_added from the row stats; write "removes N exported names;
   callers outside this PR may break" only when api_removed is above 0); an identifier used but not defined in
-  the changed code; code after return or throw that can never run, such as "the removed call sat after
-  return, so behaviour does not change"; an import of a name the target does not export, such as "the
-  imports name something the target does not export". If unsure, omit it.
+  the changed code; code after return or throw that can never run, only when a row's stats carry
+  after_return above 0 (code counts changed lines that directly follow a return, throw, raise, break or
+  continue): then you may say that N changed lines sit after a return or throw and may never run, after
+  verifying it in the file, and never state it otherwise; an import of a name the target does not export,
+  such as "the imports name something the target does not export". If unsure, omit it.
+- A "pattern" row whose family is "moved" stands for files that were only moved to a new path: their content
+  is unchanged. Say so, and say that they keep their old names and imports, but only after reading a sample
+  file at its new path; never describe what they contain from the digest alone.
 - Do not use "only", "just", "all", "every" or "none" about what a file or route serves, calls or contains
   unless the cited lines are its whole definition. Prefer "includes" and "such as"; when you list endpoints
   or exports, say they are examples."""
@@ -1137,7 +1146,7 @@ def group_cache_key(draft, group_id: str, snapshot, harness: str, model: str | N
             files = [name for name in node.get("files", []) if isinstance(name, str)]
             row = {"id": node.get("id"), "kind": node.get("kind"),
                    "files": [[name, hunk_hash(index.files.get(name))] for name in files]}
-            pattern = node.get("pattern") if node.get("kind") == "pattern" else None
+            pattern = node.get("pattern") if node.get("kind") in ("pattern", "routine") else None
             if isinstance(pattern, dict):
                 # A pattern row stands for all its members: a changed member list must not reuse a cached patch.
                 row["pattern"] = [pattern.get("family"), pattern.get("signature"), stable_hash(pattern.get("members"))]

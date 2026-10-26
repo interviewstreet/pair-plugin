@@ -52,7 +52,7 @@ COMPONENT_KEYS = ("id", "label", "group", "kind", "description", "members", "evi
 EDGE_KEYS = ("id", "source", "target", "label", "claim", "change", "evidence")
 STEP_KEYS = ("id", "when", "edge", "components", "text", "flags", "evidence")
 EVIDENCE_KEYS = ("type", "path", "start", "end", "side")
-STATS_KEYS = ("files", "additions", "deletions", "api_added", "api_removed")
+STATS_KEYS = ("files", "additions", "deletions", "api_added", "api_removed", "after_return")
 STEP_REQUIRED = frozenset(STEP_KEYS) - {"edge"}
 
 ID_PATTERN = re.compile(IDENTIFIER)
@@ -1095,8 +1095,13 @@ Rules:
    named count or stats, verbatim; sampled members are not the whole set. A count that does not match is rejected.
 9. No "only", "just", "all", "every" or "none" about what a file or route serves, calls or contains unless the
    cited lines are its whole definition. Prefer "includes" and "such as"; call listed endpoints or exports examples.
-10. Verified facts, only after reading the file around the cited lines, otherwise omit them: "the removed call
-   sat after return, so behaviour does not change"; "the imports name something the target does not export".
+10. Verified facts, only after reading the file around the cited lines, otherwise omit them: "the imports name
+   something the target does not export". When a node's stats carry after_return above 0 (code counts changed
+   lines that directly follow a return, throw, raise, break or continue) you may say that N changed lines sit
+   after a return or throw and may never run, after verifying it in the file; never state it otherwise.
+11. A node whose pattern family is "moved" stands for files that were only moved to a new path: their content is
+   unchanged. Say so, and say that they keep their old names and imports, but only after reading a sample
+   file at its new path.
 """
     if errors:
         prompt += f"""

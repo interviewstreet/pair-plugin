@@ -134,13 +134,13 @@ def test_golden_computed_fields():
     document = valid()
     nodes = {item["id"]: item for item in document["nodes"]}
     assert {name: (item["change"], item["state"], item["stats"]) for name, item in nodes.items()} == {
-        "reviews-ts": ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1, "api_added": 0, "api_removed": 0}),
-        "session-ts": ("added", "changed", {"files": 1, "additions": 5, "deletions": 0, "api_added": 0, "api_removed": 0}),
-        "store-ts": ("modified", "changed", {"files": 1, "additions": 1, "deletions": 0, "api_added": 0, "api_removed": 0}),
-        "legacy-sql": ("removed", "changed", {"files": 1, "additions": 0, "deletions": 4, "api_added": 0, "api_removed": 0}),
-        "pg": ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0}),
-        "tooling": ("unchanged", "routine", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0}),
-        "names-ts": ("modified", "changed", {"files": 1, "additions": 1, "deletions": 1, "api_added": 0, "api_removed": 0}),
+        "reviews-ts": ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1, "api_added": 0, "api_removed": 0, "after_return": 0}),
+        "session-ts": ("added", "changed", {"files": 1, "additions": 5, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0}),
+        "store-ts": ("modified", "changed", {"files": 1, "additions": 1, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0}),
+        "legacy-sql": ("removed", "changed", {"files": 1, "additions": 0, "deletions": 4, "api_added": 0, "api_removed": 0, "after_return": 0}),
+        "pg": ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0}),
+        "tooling": ("unchanged", "routine", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0}),
+        "names-ts": ("modified", "changed", {"files": 1, "additions": 1, "deletions": 1, "api_added": 0, "api_removed": 0, "after_return": 0}),
     }
     assert {item["id"]: item["change"] for item in document["edges"]} == {
         "e1": "modified", "e2": "removed", "e3": "added", "e4": "modified", "e5": "unchanged"}
@@ -255,7 +255,7 @@ def test_model_supplied_computed_values_are_overwritten():
     source = draft()
     source.update({"schema_version": 9, "head_sha": OTHER_HEAD, "generated_by": "deterministic"})
     source["groups"][0].update({"path": "nope", "column": 5, "order": 9})
-    source["nodes"][0].update({"change": "removed", "state": "context", "stats": {"files": 9, "additions": 9, "deletions": 9, "api_added": 0, "api_removed": 0}})
+    source["nodes"][0].update({"change": "removed", "state": "context", "stats": {"files": 9, "additions": 9, "deletions": 9, "api_added": 0, "api_removed": 0, "after_return": 0}})
     source["edges"][0]["change"] = "added"
     source["steps"][0]["flags"] = ["x"]
     expected = valid()
@@ -292,20 +292,20 @@ def test_enrich_does_not_crash_on_malformed_drafts(malformed):
 
 
 @pytest.mark.parametrize("name, files, kind, expected", [
-    ("added", [SESSION], "service", ("added", "changed", {"files": 1, "additions": 5, "deletions": 0, "api_added": 0, "api_removed": 0})),
-    ("added file kind", [SESSION], "file", ("added", "changed", {"files": 1, "additions": 5, "deletions": 0, "api_added": 0, "api_removed": 0})),
-    ("removed", [LEGACY], "database", ("removed", "changed", {"files": 1, "additions": 0, "deletions": 4, "api_added": 0, "api_removed": 0})),
-    ("modified", [REVIEWS], "service", ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1, "api_added": 0, "api_removed": 0})),
-    ("renamed", [NAMES], "file", ("modified", "changed", {"files": 1, "additions": 1, "deletions": 1, "api_added": 0, "api_removed": 0})),
-    ("added and deleted", [SESSION, LEGACY], "file", ("modified", "changed", {"files": 2, "additions": 5, "deletions": 4, "api_added": 0, "api_removed": 0})),
-    ("added and modified", [SESSION, STORE], "file", ("modified", "changed", {"files": 2, "additions": 6, "deletions": 0, "api_added": 0, "api_removed": 0})),
-    ("hunk-less file", ["docs/notes.md"], "file", ("modified", "changed", {"files": 1, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0})),
-    ("unchanged context", [], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0})),
-    ("unchanged routine", [], "routine", ("unchanged", "routine", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0})),
+    ("added", [SESSION], "service", ("added", "changed", {"files": 1, "additions": 5, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("added file kind", [SESSION], "file", ("added", "changed", {"files": 1, "additions": 5, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("removed", [LEGACY], "database", ("removed", "changed", {"files": 1, "additions": 0, "deletions": 4, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("modified", [REVIEWS], "service", ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("renamed", [NAMES], "file", ("modified", "changed", {"files": 1, "additions": 1, "deletions": 1, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("added and deleted", [SESSION, LEGACY], "file", ("modified", "changed", {"files": 2, "additions": 5, "deletions": 4, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("added and modified", [SESSION, STORE], "file", ("modified", "changed", {"files": 2, "additions": 6, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("hunk-less file", ["docs/notes.md"], "file", ("modified", "changed", {"files": 1, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("unchanged context", [], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("unchanged routine", [], "routine", ("unchanged", "routine", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0})),
     # A routine row is collapsed in the view even when its files changed.
-    ("changed routine", ["package-lock.json"], "routine", ("modified", "routine", {"files": 1, "additions": 1, "deletions": 0, "api_added": 0, "api_removed": 0})),
-    ("file outside the PR is ignored", ["elsewhere.ts"], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0})),
-    ("repeated file counts once", [REVIEWS, REVIEWS], "service", ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1, "api_added": 0, "api_removed": 0})),
+    ("changed routine", ["package-lock.json"], "routine", ("modified", "routine", {"files": 1, "additions": 1, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("file outside the PR is ignored", ["elsewhere.ts"], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0})),
+    ("repeated file counts once", [REVIEWS, REVIEWS], "service", ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1, "api_added": 0, "api_removed": 0, "after_return": 0})),
 ])
 def test_node_change_state_and_stats(name, files, kind, expected):
     source = {"nodes": [node("n", "g", kind, files)]}
@@ -953,7 +953,7 @@ def test_a_pattern_document_is_valid_and_its_computed_fields_cover_all_members()
     assert list(node) == ["id", "label", "group", "kind", "description", "files", "evidence", "pattern",
                           "change", "state", "stats"]
     assert (node["change"], node["state"]) == ("removed", "changed")
-    assert node["stats"] == {"files": 4, "additions": 0, "deletions": 16, "api_added": 0, "api_removed": 4}
+    assert node["stats"] == {"files": 4, "additions": 0, "deletions": 16, "api_added": 0, "api_removed": 4, "after_return": 0}
     tests = document["nodes"][pattern_index(document, "tests")]
     assert tests["change"] == "modified" and tests["stats"]["files"] == 3 and "signature" not in tests["pattern"]
 
@@ -1248,3 +1248,208 @@ def test_normalize_never_raises_on_a_malformed_overview():
         document["overview"] = bad
         cleaned, warnings = normalize_v2(document)
         assert isinstance(cleaned, dict) and "overview" in cleaned
+
+
+# --- moved rows, routine rows with members, after_return and accounting -------------------------------
+
+from paircli_architecture_v2 import accounting  # noqa: E402
+
+
+def moved_world():
+    """A real draft of 5 pure moves, one edited file and 4 lockfiles, finalized and valid."""
+    files = [make_file(f"src/new/m{number}.ts", "renamed", old_path=f"src/old/m{number}.ts", no_hunks=True) for number in range(5)]
+    files += [make_file("src/app/service.ts", added=source_lines(3))]
+    files += [make_file(f"pkg{number}/package-lock.json", added=[f'"v": {number}']) for number in range(4)]
+    snap = make_snapshot(files, head=HEAD)
+    draft = deterministic_v2_draft(build_skeleton(snap, HEAD), snap, HEAD)
+    document, warnings = finalize_v2(draft, HEAD, snap, "deterministic")
+    assert warnings == []
+    return document, snap
+
+
+def family_row(document, family, kind="pattern"):
+    return next(node for node in document["nodes"] if node["kind"] == kind and node["pattern"]["family"] == family)
+
+
+def world_errors(mutate):
+    document, snap = moved_world()
+    mutate(document)
+    with pytest.raises(ArchitectureError) as caught:
+        validate_v2(document, HEAD, snap)
+    return [(error["path"], error["reason"]) for error in caught.value.errors]
+
+
+def test_a_moved_row_is_valid_with_no_citation_and_has_computed_stats():
+    document, snap = moved_world()
+    assert validate_v2(document, HEAD, snap) is None
+    row = family_row(document, "moved")
+    assert row["evidence"] == [] and row["files"] == sorted(row["pattern"]["members"])
+    assert row["label"] == "5 files: moved, not edited" and "no content change" in row["description"]
+    assert (row["change"], row["state"]) == ("modified", "changed")
+    assert row["stats"] == {"files": 5, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0}
+    assert list(row["pattern"]) == ["family", "count", "members"]
+
+
+MOVED_FAULTS = [
+    ("a member with changed lines", lambda d: family_row(d, "moved")["pattern"]["members"].__setitem__(0, "src/app/service.ts"),
+     "pattern.members[0]"),
+    ("count mismatch", lambda d: family_row(d, "moved")["pattern"].update(count=4), "pattern.count"),
+    ("too few members", lambda d: family_row(d, "moved")["pattern"].update(members=family_row(d, "moved")["pattern"]["members"][:2], count=2),
+     "pattern.members"),
+    ("signature on a moved row", lambda d: family_row(d, "moved")["pattern"].update(signature=None), "pattern.signature"),
+    ("a ghost member", lambda d: family_row(d, "moved")["pattern"]["members"].__setitem__(1, "src/new/ghost.ts"), "pattern.members[1]"),
+    ("a sample that is not a member", lambda d: family_row(d, "moved")["files"].__setitem__(0, "src/app/service.ts"), "files[0]"),
+    ("more than 12 samples", lambda d: family_row(d, "moved")["files"].extend(f"src/new/x{n}.ts" for n in range(8)), "files"),
+    ("stats edited", lambda d: family_row(d, "moved")["stats"].update(additions=1), "stats"),
+    ("change edited", lambda d: family_row(d, "moved").update(change="added"), "change"),
+]
+
+
+@pytest.mark.parametrize("name, mutate, expected", MOVED_FAULTS, ids=[fault[0] for fault in MOVED_FAULTS])
+def test_validate_rejects_a_bad_moved_row(name, mutate, expected):
+    errors = world_errors(mutate)
+    assert any(expected in path for path, _ in errors), errors
+
+
+def test_a_moved_member_must_still_be_a_pure_move_in_the_snapshot():
+    document, snap = moved_world()
+    victim = next(file for file in snap["pr"]["files"] if file["path"] == "src/new/m0.ts")
+    victim["old_path"] = victim["path"]
+    assert any("not a pure move" in error["reason"] for error in errors_of(document, snap=snap))
+    document, snap = moved_world()
+    victim = next(file for file in snap["pr"]["files"] if file["path"] == "src/new/m0.ts")
+    victim["status"] = "modified"
+    assert any("pattern.members[0]" in error["path"] for error in errors_of(document, snap=snap))
+    document, snap = moved_world()
+    victim = next(file for file in snap["pr"]["files"] if file["path"] == "src/new/m0.ts")
+    victim["hunks"] = [hunk(1, 1, "+")]
+    assert any("pattern.members[0]" in error["path"] for error in errors_of(document, snap=snap))
+
+
+def test_only_a_moved_row_is_exempt_from_citations():
+    document, snap = moved_world()
+    service = next(node for node in document["nodes"] if node["files"] == ["src/app/service.ts"])
+    service["evidence"] = []                                   # an ordinary file row still needs one
+    assert any(error["path"].endswith("evidence") for error in errors_of(document, snap=snap))
+    document, snap = moved_world()
+    moved = family_row(document, "moved")
+    moved["evidence"] = [ref("src/app/service.ts", 1, 1)]      # a moved row may carry citations, valid or not
+    assert validate_v2(document, HEAD, snap) is None
+
+
+def test_a_moved_row_is_not_dropped_by_enrich_and_a_member_in_two_rows_is_rejected():
+    document, snap = moved_world()
+    again, warnings = finalize_v2(document, HEAD, snap, "deterministic")
+    assert warnings == [] and again == document
+
+    def share(doc):
+        moved = family_row(doc, "moved")
+        second = copy.deepcopy(moved)
+        second["id"] = "moved-two"
+        doc["nodes"].append(second)
+    assert any("already a member of" in reason for _, reason in world_errors(share))
+
+
+def test_a_routine_row_stands_for_all_its_members_and_needs_no_evidence():
+    document, snap = moved_world()
+    row = family_row(document, "routine", kind="routine")
+    assert row["pattern"] == {"family": "routine", "count": 4, "members": sorted(row["pattern"]["members"])}
+    assert row["stats"]["files"] == 4 and row["state"] == "routine" and row["evidence"] == []
+    assert len(row["files"]) <= 15 and set(row["files"]) <= set(row["pattern"]["members"])
+    assert list(row) == ["id", "label", "group", "kind", "description", "files", "evidence", "pattern", "change", "state", "stats"]
+
+
+ROUTINE_FAULTS = [
+    ("a member that is not routine", lambda d: family_row(d, "routine", "routine")["pattern"]["members"].__setitem__(0, "src/app/service.ts"),
+     "pattern.members[0]"),
+    ("count mismatch", lambda d: family_row(d, "routine", "routine")["pattern"].update(count=9), "pattern.count"),
+    ("an empty member list", lambda d: family_row(d, "routine", "routine")["pattern"].update(members=[], count=0), "pattern.members"),
+    ("a signature", lambda d: family_row(d, "routine", "routine")["pattern"].update(signature=None), "pattern.signature"),
+    ("a wrong family on a routine row", lambda d: family_row(d, "routine", "routine")["pattern"].update(family="tests"),
+     "pattern.family"),
+    ("routine family on a pattern row", lambda d: family_row(d, "moved")["pattern"].update(family="routine"), "pattern.family"),
+    ("stats of the sample only", lambda d: family_row(d, "routine", "routine")["stats"].update(files=1), "stats"),
+    ("a sample that is not a member", lambda d: family_row(d, "routine", "routine")["files"].__setitem__(0, "src/app/service.ts"), "files[0]"),
+    ("more than 15 samples", lambda d: family_row(d, "routine", "routine")["files"].extend(f"pkg{n}/x.lock" for n in range(20)), "files"),
+]
+
+
+@pytest.mark.parametrize("name, mutate, expected", ROUTINE_FAULTS, ids=[fault[0] for fault in ROUTINE_FAULTS])
+def test_validate_rejects_a_bad_routine_row(name, mutate, expected):
+    errors = world_errors(mutate)
+    assert any(expected in path for path, _ in errors), errors
+
+
+def test_a_routine_member_in_another_row_is_rejected_and_a_routine_rows_own_files_are_not():
+    def share(doc):
+        service = next(node for node in doc["nodes"] if node["files"] == ["src/app/service.ts"])
+        service["files"] = [family_row(doc, "routine", "routine")["pattern"]["members"][0]]
+    errors = world_errors(share)
+    assert any("is a member of the pattern row" in reason for _, reason in errors), errors
+    document, snap = moved_world()
+    assert validate_v2(document, HEAD, snap) is None  # the routine row lists its own members in `files`
+
+
+def test_a_routine_row_without_a_pattern_is_still_accepted_for_older_documents():
+    document, snap = moved_world()
+    row = family_row(document, "routine", "routine")
+    del row["pattern"]
+    row["stats"] = {"files": 4, "additions": 4, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0}
+    again, warnings = finalize_v2(document, HEAD, snap, "deterministic")
+    assert warnings == [] and again["nodes"][document["nodes"].index(row)]["stats"]["files"] == len(row["files"])
+
+
+def test_normalize_keeps_pattern_on_routine_rows():
+    document, _ = moved_world()
+    position = document["nodes"].index(family_row(document, "routine", "routine"))
+    cleaned, warnings = normalize_v2(document)
+    assert cleaned["nodes"][position]["pattern"]["family"] == "routine" and warnings == []
+    document["nodes"][position]["pattern"]["extra"] = 1
+    cleaned, warnings = normalize_v2(document)
+    assert "extra" not in cleaned["nodes"][position]["pattern"]
+    assert f"nodes[{position}].pattern.extra: removed unexpected key" in warnings
+
+
+def after_return_snapshot():
+    lines = [{"kind": "ctx", "text": "  return 1;"}, {"kind": "add", "text": "  log();"}, {"kind": "ctx", "text": "}"}]
+    twice = [{"kind": "ctx", "text": "  throw e;"}, {"kind": "del", "text": "  gone();"}, {"kind": "ctx", "text": "}"}]
+    files = [changed("src/a.ts", hunks=[{"old_start": 1, "old_lines": 2, "new_start": 1, "new_lines": 3, "lines": lines}]),
+             changed("src/b.ts", hunks=[{"old_start": 1, "old_lines": 3, "new_start": 1, "new_lines": 2, "lines": twice}]),
+             changed("src/c.ts", hunks=[hunk(1, 1, " + ")])]
+    return snapshot(files)
+
+
+def test_after_return_is_a_computed_stat_per_node_and_summed_over_members():
+    snap = after_return_snapshot()
+    nodes = [node("a", "g", "file", ["src/a.ts"], [ref("src/a.ts", 2)]), node("ab", "g", "service", ["src/a.ts", "src/b.ts"], [ref("src/a.ts", 2), ref("src/b.ts", 1, 1, "old")]),
+             node("c", "g", "file", ["src/c.ts"], [ref("src/c.ts", 2)])]
+    document, warnings = finalize_v2({"title": "t", "description": "d", "groups": [{"id": "g", "label": "G"}], "nodes": nodes,
+                                      "edges": [], "steps": [], "gaps": []}, HEAD, snap, "llm")
+    assert warnings == []
+    assert [item["stats"]["after_return"] for item in document["nodes"]] == [1, 2, 0]
+
+
+def test_after_return_cannot_be_edited_or_dropped():
+    snap = after_return_snapshot()
+    document, _ = finalize_v2({"title": "t", "description": "d", "groups": [{"id": "g", "label": "G"}],
+                               "nodes": [node("a", "g", "file", ["src/a.ts"], [ref("src/a.ts", 2)])], "edges": [], "steps": [],
+                               "gaps": []}, HEAD, snap, "llm")
+    document["nodes"][0]["stats"]["after_return"] = 0
+    assert "nodes[0].stats" in paths_of(document, snap=snap)
+    document["nodes"][0]["stats"].pop("after_return")
+    assert "nodes[0].stats" in paths_of(document, snap=snap)
+
+
+def test_accounting_counts_the_files_the_rows_stand_for_without_the_validator():
+    document, snap = moved_world()
+    assert accounting(document, snap) == (len(snap["pr"]["files"]), len(snap["pr"]["files"]), [])
+    broken = copy.deepcopy(document)
+    family_row(broken, "moved")["pattern"]["members"].pop()          # no longer valid; accounting does not care
+    broken["nodes"] = [node for node in broken["nodes"] if node["kind"] != "routine"]
+    covered, total, missing = accounting(broken, snap)
+    assert (covered, total) == (len(snap["pr"]["files"]) - 5, len(snap["pr"]["files"]))
+    assert missing == sorted(missing) and "src/new/m4.ts" in missing and "pkg0/package-lock.json" in missing
+    assert accounting({}, snap) == (0, len(snap["pr"]["files"]), sorted(file["path"] for file in snap["pr"]["files"]))
+    assert accounting("junk", {}) == (0, 0, [])
+    twice = snapshot(snap["pr"]["files"] + snap["pr"]["files"][:2])
+    assert accounting(document, twice)[1] == len(snap["pr"]["files"]), "a repeated path counts once"

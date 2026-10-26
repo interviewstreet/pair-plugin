@@ -19,12 +19,12 @@ Principle (unchanged): the model chooses and narrates, code computes and verifie
     "kind": "component", "description": "Holds cells and outputs; trust is copied from the cell.",
     "members": ["notebook-model-store-ts-a1b2c3"],
     "evidence": [{"type": "diff", "path": "packages/ade/.../NotebookModelStore.ts", "start": 10, "end": 40, "side": "new"}],
-    "change": "added", "state": "changed", "stats": {"files": 1, "additions": 556, "deletions": 0, "api_added": 9, "api_removed": 0}
+    "change": "added", "state": "changed", "stats": {"files": 1, "additions": 556, "deletions": 0, "api_added": 9, "api_removed": 0, "after_return": 0}
   }, {
     "id": "jupyter", "label": "Jupyter server + kernel", "group": "server", "kind": "context",
     "description": "Child process the server starts on localhost.", "members": [],
     "evidence": [{"type": "diff", "path": "apps/server/src/routes/notebook.services.ts", "start": 200, "end": 230, "side": "new"}],
-    "change": "unchanged", "state": "context", "stats": {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0}
+    "change": "unchanged", "state": "context", "stats": {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0}
   }],
   "edges": [{"id": "o-spawn", "source": "notebook-service", "target": "jupyter", "label": "spawn, proxy",
              "claim": "NotebookService starts Jupyter on 127.0.0.1 and proxies allowlisted routes.",
@@ -52,7 +52,12 @@ Principle (unchanged): the model chooses and narrates, code computes and verifie
 - **Coverage is computed.** Every detailed node of kind `file` or `pattern` that no component
   claims is collected by code into one computed component `other` ("Other changes", label
   fixed, `kind: component`) so totals always add up. `routine` nodes are folded into `other`
-  too. If nothing is left over there is no `other`.
+  too; a routine row stands for all its routine files (see the contract), so the sum of the
+  components' `stats.files` equals the PR's changed-file count minus the files with no usable hunk
+  data that the detailed graph reports as a gap. If nothing is left over there is no `other`.
+- **Stats** are the five detailed stats plus `after_return` (a lexical count of changed lines
+  that directly follow a return, throw, raise, break or continue; see the contract). Component
+  stats are the sum of the members' stats, computed by code.
 - **Counts**: 1 to 20 components in total including `other`; at most 8 groups; at most 30
   edges; at most 10 steps (aim for 4 to 8).
 - **Component evidence**: a component with members takes its evidence from its members (code
@@ -103,9 +108,15 @@ Principle (unchanged): the model chooses and narrates, code computes and verifie
 - **No narrow "only" claims**: no "only", "just", "all", "every" or "none" about what a file or
   route serves, calls or contains unless the cited lines are its whole definition; prefer
   "includes" and "such as", and call listed endpoints or exports examples.
-- **Verified facts or nothing**: statements such as "the removed call sat after return, so
-  behaviour does not change" or "the imports name something the target does not export" need the
-  model to have read the file around the cited lines; when unsure it omits them.
+- **Verified facts or nothing**: statements such as "the imports name something the target does
+  not export" need the model to have read the file around the cited lines; when unsure it omits
+  them. `after_return` is the only computed hint for dead code: when a node's `stats` carry it
+  above 0 the model may say that that many changed lines sit after a return or throw and may never
+  run, after verifying it in the file, and never states it otherwise.
+- **Moved files**: a node whose `pattern.family` is `moved` stands for files that were only moved
+  to a new path. The digest lists it with its family and count; the model says that their content
+  is unchanged and that they keep their old names and imports, after reading a sample file at its
+  new path.
 - **Gaps** (detailed document, merge call): the model writes at most 2 generic limits ("runtime
   behaviour not visible in the diff"), never statements about specific files, directories, areas
   or counts. `apply_merge` drops (with a warning) any model gap containing a path-like token

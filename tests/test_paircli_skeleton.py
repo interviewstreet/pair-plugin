@@ -826,3 +826,28 @@ def test_patterns_are_deterministic_and_fast_for_a_thousand_files():
     first = build(files)[1]
     assert time.perf_counter() - started < 1.0
     assert json.dumps(first, sort_keys=True) == json.dumps(build(files)[1], sort_keys=True)
+
+
+def test_pure_moves_form_a_moved_pattern_assigned_to_the_group_holding_most_of_them():
+    moves = [make_file(f"src/new/m{index}.ts", "renamed", old_path=f"src/old/m{index}.ts", no_hunks=True) for index in range(5)]
+    files = moves + [make_file("web/own.ts", added=source_lines(3))]
+    _, skeleton = build(files)
+    ((path, pattern),) = group_patterns(skeleton)
+    assert path == "src" and pattern["family"] == "moved" and pattern["signature"] is None
+    assert pattern["status"] == "renamed" and pattern["count"] == 5 == len(pattern["members"])
+    assert (pattern["additions"], pattern["deletions"]) == (0, 0) and pattern["members"] == sorted(pattern["members"])
+    assert {item["path"] for item in skeleton["files"] if item["in_pattern"]} == set(pattern["members"])
+
+
+def test_fewer_than_three_pure_moves_and_edited_renames_make_no_moved_pattern():
+    files = [make_file(f"src/new/m{index}.ts", "renamed", old_path=f"src/old/m{index}.ts", no_hunks=True) for index in range(2)]
+    files += [make_file(f"src/new/e{index}.ts", "renamed", old_path=f"src/old/e{index}.ts", added=[f"const e{'xyz'[index]} = 1;"]) for index in range(3)]
+    _, skeleton = build(files)
+    assert [pattern["family"] for _, pattern in group_patterns(skeleton)] == []
+
+
+def test_a_moved_test_file_belongs_to_the_moved_pattern_not_to_the_tests_fold():
+    moves = [make_file(f"src/new/__tests__/t{index}.test.ts", "renamed", old_path=f"src/old/__tests__/t{index}.test.ts", no_hunks=True)
+             for index in range(4)]
+    _, skeleton = build(moves + [make_file("src/new/own.ts", added=source_lines(3))])
+    assert [pattern["family"] for _, pattern in group_patterns(skeleton)] == ["moved"]

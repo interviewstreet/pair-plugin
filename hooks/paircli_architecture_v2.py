@@ -11,7 +11,7 @@ import json
 import re
 
 from paircli_architecture import IDENTIFIER, KINDS, MAX_BYTES, ArchitectureError
-from paircli_patterns import api_surface, verify_pattern
+from paircli_patterns import after_return, api_surface, verify_pattern
 from paircli_snapshot import snapshot_binds_head
 
 SCHEMA_VERSION = 2
@@ -38,13 +38,15 @@ ALL_TOP_KEYS = TOP_KEYS + OPTIONAL_TOP_KEYS
 GROUP_KEYS = ("id", "label", "path", "column", "order")
 NODE_KEYS = ("id", "label", "group", "kind", "description", "files", "evidence", "pattern",
              "change", "state", "stats")
-# `pattern` is required on a pattern row and not allowed on any other.
+# `pattern` is required on a pattern row, optional on a routine row (which then stands for all its members)
+# and not allowed on any other.
 OPTIONAL_NODE_KEYS = frozenset({"pattern"})
+PATTERN_KINDS = ("pattern", "routine")
 PATTERN_KEYS = ("family", "count", "signature", "members")
 EDGE_KEYS = ("id", "source", "target", "label", "claim", "change", "evidence")
 STEP_KEYS = ("id", "when", "edge", "nodes", "text", "flags", "evidence")
 EVIDENCE_KEYS = ("type", "path", "start", "end", "side")
-STATS_KEYS = ("additions", "deletions", "files", "api_added", "api_removed")
+STATS_KEYS = ("additions", "deletions", "files", "api_added", "api_removed", "after_return")
 # `edge` is the only optional key; everything else must be present.
 STEP_REQUIRED = frozenset(STEP_KEYS) - {"edge"}
 
@@ -140,7 +142,7 @@ def normalize_v2(document):
                 if isinstance(item.get("stats"), dict):
                     item["stats"] = strip(item["stats"], STATS_KEYS, f"{path}.stats")
             if isinstance(item, dict) and name == "nodes" and "pattern" in item:
-                if item.get("kind") == "pattern":
+                if item.get("kind") in PATTERN_KINDS:
                     item["pattern"] = strip(item["pattern"], PATTERN_KEYS, f"{path}.pattern")
                 else:
                     del item["pattern"]
@@ -184,6 +186,14 @@ class SnapshotIndex:
                     self.old_paths.setdefault(file["old_path"], file)
         self._lines: dict[str, dict] = {}
         self._api: dict[str, dict] = {}
+        self._after_return: dict[str, int] = {}
+
+    def after_return(self, file: dict) -> int:
+        """`after_return` of one changed file, computed once."""
+        cached = self._after_return.get(file["path"])
+        if cached is None:
+            cached = self._after_return[file["path"]] = after_return(file)
+        return cached
 
     def api(self, file: dict) -> dict:
         """`api_surface` of one changed file, computed once."""
@@ -232,8 +242,9 @@ class SnapshotIndex:
 # --- computed fields ---------------------------------------------------------------------
 
 def pattern_members(node: dict) -> list | None:
-    """The member list of a pattern row (any entries, unchecked), or None for any other row."""
-    pattern = node.get("pattern") if node.get("kind") == "pattern" else None
+    """The member list of a pattern row or of a routine row that carries a `pattern` (any entries,
+    unchecked), or None for any other row."""
+    pattern = node.get("pattern") if node.get("kind") in PATTERN_KINDS else None
     members = pattern.get("members") if isinstance(pattern, dict) else None
     return members if isinstance(members, list) else None
 
@@ -241,7 +252,7 @@ def pattern_members(node: dict) -> list | None:
 def node_facts(node: dict, index: SnapshotIndex) -> dict:
     """`change`, `state` and `stats` of one node from the snapshot status and hunk lines of its files.
 
-    A pattern row covers all its `pattern.members`; `files` is only a sample of them.
+    A pattern row (and a routine row with a `pattern`) covers all its `pattern.members`; `files` is only a sample.
     """
     members = pattern_members(node)
     names = members if members is not None else node.get("files") if isinstance(node.get("files"), list) else []
@@ -263,7 +274,27 @@ def node_facts(node: dict, index: SnapshotIndex) -> dict:
                       "additions": sum(count["additions"] for count in counts),
                       "deletions": sum(count["deletions"] for count in counts),
                       "api_added": sum(item["added"] for item in api),
-                      "api_removed": sum(item["removed"] for item in api)}}
+                      "api_removed": sum(item["removed"] for item in api),
+                      "after_return": sum(index.after_return(file) for file in resolved)}}
+
+
+def accounting(document, snapshot) -> tuple[int, int, list[str]]:
+    """`(covered, total, missing_paths)`: which changed files the document's rows stand for.
+
+    Independent of the validator: a file is covered when some node lists it, as a `pattern.members` entry
+    (pattern rows, and routine rows that carry a pattern) or else in its `files`. `total` is the number of
+    distinct changed paths in the snapshot; `missing_paths` is sorted. Files the draft reports as having no
+    usable hunk data, or not shown because the diagram is full, are the usual missing ones.
+    """
+    index = SnapshotIndex(snapshot)
+    covered: set[str] = set()
+    for node in dicts(document.get("nodes") if isinstance(document, dict) else None):
+        members = pattern_members(node)
+        names = members if members is not None else node.get("files")
+        if isinstance(names, list):
+            covered.update(name for name in names if isinstance(name, str) and name in index.files)
+    missing = sorted(set(index.files) - covered)
+    return len(covered), len(index.files), missing
 
 
 def edge_change(edge: dict, index: SnapshotIndex) -> str:
@@ -535,6 +566,12 @@ def check_evidence(refs, path: str, index: SnapshotIndex, check) -> list[tuple]:
     return [ref for ref in valid if ref is not None]
 
 
+def is_moved_row(node: dict) -> bool:
+    """A `pattern` row of family `moved`: files moved to a new path without any content change."""
+    pattern = node.get("pattern") if node.get("kind") == "pattern" else None
+    return isinstance(pattern, dict) and pattern.get("family") == "moved"
+
+
 def check_pattern(node: dict, path: str, index: SnapshotIndex, check) -> None:
     """Validate a pattern row's `pattern` object, recomputing every claim from the snapshot."""
     for error in verify_pattern(node.get("pattern"), index.files):
@@ -544,8 +581,13 @@ def check_pattern(node: dict, path: str, index: SnapshotIndex, check) -> None:
         return
     for key in sorted(set(pattern) - set(PATTERN_KEYS), key=str):
         check(False, join(path, f"pattern.{str(key)[:64]}"), "unexpected key")
-    # `remainder` rows are verified by verify_pattern (3 to 500 existing, unique members, no signature
-    # key); check_pattern_ownership keeps them disjoint from every other row.
+    # `remainder`, `moved` and `routine` rows are verified by verify_pattern (existing, unique members, no
+    # signature key); check_pattern_ownership keeps them disjoint from every other row.
+    family = pattern.get("family")
+    if node.get("kind") == "routine":
+        check(family == "routine", join(path, "pattern.family"), 'a routine row\'s pattern family must be "routine"')
+    else:
+        check(family != "routine", join(path, "pattern.family"), '"routine" is the family of kind "routine" rows only')
     if pattern.get("family") != "same-change":
         check(pattern.get("signature") is None, join(path, "pattern.signature"),
               "only a same-change pattern has a signature")
@@ -570,7 +612,7 @@ def check_pattern_ownership(nodes: list, check) -> None:
                 check(False, f"nodes[{position}].pattern.members[{offset}]",
                       f"{name} is already a member of nodes[{first}]")
     for position, node in enumerate(nodes):
-        if not isinstance(node, dict) or node.get("kind") == "pattern" or not isinstance(node.get("files"), list):
+        if not isinstance(node, dict) or pattern_members(node) is not None or not isinstance(node.get("files"), list):
             continue
         for offset, name in enumerate(node["files"]):
             if isinstance(name, str) and name in owner:
@@ -641,8 +683,8 @@ def check_graph(document: dict, index: SnapshotIndex, check) -> Graph:
         path = f"nodes[{position}]"
         if not check(isinstance(node, dict), path, "must be an object"):
             continue
-        keys_ok(node, tuple(key for key in NODE_KEYS if key not in OPTIONAL_NODE_KEYS or node.get("kind") == "pattern"),
-                path)
+        wants_pattern = node.get("kind") == "pattern" or (node.get("kind") == "routine" and "pattern" in node)
+        keys_ok(node, tuple(key for key in NODE_KEYS if key not in OPTIONAL_NODE_KEYS or wants_pattern), path)
         name = identifier(node, path, node_ids)
         if name is not None and name not in graph.nodes:
             graph.nodes[name] = node
@@ -660,7 +702,7 @@ def check_graph(document: dict, index: SnapshotIndex, check) -> Graph:
                 where = f"{path}.files[{offset}]"
                 if check(is_text(name_of_file, 300), where, "must be 1-300 characters"):
                     check(files.index(name_of_file) == offset, where, "duplicate file")
-        if is_pattern and "pattern" in node:
+        if node.get("kind") in PATTERN_KINDS and "pattern" in node:
             check_pattern(node, path, index, check)
         refs_by_node[position] = check_evidence(node.get("evidence"), join(path, "evidence"), index, check)
         facts = facts_by_node[position] = node_facts(node, index)
@@ -705,7 +747,9 @@ def check_graph(document: dict, index: SnapshotIndex, check) -> Graph:
         # Unchanged and external nodes only appear because an edge points at them.
         exempt = (facts_by_node[position]["change"] == "unchanged" or node.get("kind") == "external") \
             and isinstance(node.get("id"), str) and node["id"] in cited_endpoints
-        check(bool(refs) or exempt, join(path, "evidence"), "needs at least one valid diff citation")
+        # A moved row is verified by the snapshot alone (status, old path, no changed line): nothing to cite.
+        moved = is_moved_row(node)
+        check(bool(refs) or exempt or moved, join(path, "evidence"), "needs at least one valid diff citation")
         cited_files = {file["path"] for file, _side, _start, _end in refs}
         files = node.get("files")
         limit = MAX_PATTERN_SAMPLES if node.get("kind") == "pattern" else MAX_FILES_PER_NODE
@@ -713,7 +757,7 @@ def check_graph(document: dict, index: SnapshotIndex, check) -> Graph:
             if not isinstance(name_of_file, str):
                 continue
             where = f"{path}.files[{offset}]"
-            if check(name_of_file in index.files, where, "must be a file changed in this PR"):
+            if check(name_of_file in index.files, where, "must be a file changed in this PR") and not moved:
                 check(name_of_file in cited_files, where, "needs a valid diff citation of this file")
 
     layout = compute_layout(groups, nodes, edges)

@@ -227,11 +227,11 @@ def test_enrich_computes_component_facts(world):
     overview = enrich_overview(normalize_overview(golden_draft(snapshot))[0], document, snapshot, "llm")
     store, legacy, db = (component(overview, name) for name in ("store", "legacy", "db"))
     assert (store["change"], store["state"]) == ("added", "changed")
-    assert store["stats"] == {"files": 1, "additions": 13, "deletions": 0, "api_added": 0, "api_removed": 0}
+    assert store["stats"] == {"files": 1, "additions": 13, "deletions": 0, "api_added": 0, "api_removed": 0, "after_return": 0}
     assert (component(overview, "view")["change"], legacy["change"]) == ("modified", "removed")
     assert legacy["stats"]["deletions"] == 6
     assert (db["change"], db["state"], db["members"]) == ("unchanged", "context", [])
-    assert db["stats"] == {key: 0 for key in ("files", "additions", "deletions", "api_added", "api_removed")}
+    assert db["stats"] == {key: 0 for key in ("files", "additions", "deletions", "api_added", "api_removed", "after_return")}
     assert db["evidence"] == [cite(snapshot, SERVICE, "add", offset=3)]
     assert store["evidence"] == document["nodes"][0]["evidence"]
     assert list(store) == ["id", "label", "group", "kind", "description", "members", "evidence", "change", "state", "stats"]
@@ -307,7 +307,7 @@ def test_enrich_uses_the_own_stats_of_pattern_members(world):
                              "members": ["tests-pattern", ids(STORE)[0]]}], "edges": [], "steps": []}
     overview = enrich_overview(draft, document, snapshot, "llm")
     stats = component(overview, "pat")["stats"]
-    assert stats == {"files": 4, "additions": 43, "deletions": 9, "api_added": 4, "api_removed": 2}
+    assert stats == {"files": 4, "additions": 43, "deletions": 9, "api_added": 4, "api_removed": 2, "after_return": 0}
     assert component(overview, "pat")["change"] == "modified"
     assert "tests-pattern" not in component(overview, "other")["members"]
 
@@ -1493,7 +1493,11 @@ PROMPT_RULES = (
     "cite the lines that start or call it",
     "A security or trust boundary the diff adds (an allowlist, auth check, sandbox, proxy, permission gate)",
     "says plainly what it allows or blocks",
-    "the removed call sat after return, so behaviour does not change",
+    "When a node's stats carry after_return above 0",
+    "you may say that N changed lines sit after a return or throw and may never run",
+    "never state it otherwise",
+    "stands for files that were only moved to a new path: their content is unchanged",
+    "they keep their old names and imports, but only after reading a sample file at its new path",
     "the imports name something the target does not export",
     "otherwise omit them",
 )
@@ -1506,3 +1510,54 @@ def test_overview_prompt_carries_the_new_rules_and_stays_small(tmp_path):
             assert phrase.lower() in flat.lower(), phrase
         assert len(flat.encode()) < 8 * 1024
     assert "mention only identifiers, flags and paths" in flat.lower() and "counts you" not in flat
+
+
+# --- moved, routine and after_return in the overview -------------------------------------------------
+
+def moved_routine_world():
+    """Pure moves, edited files with a line after a return, and 164 routine files, as a finalized v2 document."""
+    returning = [{"kind": "ctx", "text": "  return 1;", "old_no": 1, "new_no": 1},
+                 {"kind": "add", "text": "  log('never');", "new_no": 2}]
+    files = [make_file(f"src/core/file{index}.ts", "renamed", old_path=f"src/old/file{index}.ts", no_hunks=True) for index in range(15)]
+    files += [{"path": f"src/app/r{index}.ts", "status": "modified", "hunks": [
+        {"old_start": 1, "old_lines": 1, "new_start": 1, "new_lines": 2, "section": "", "lines": returning}]} for index in range(2)]
+    files += [make_file("src/app/main.ts", added=source_lines(4))]
+    files += [make_file(f"src/vendor/lib{index}.js", added=["x", "y"]) for index in range(164)]
+    snapshot = make_snapshot(files)
+    document, warnings = finalize_v2(deterministic_v2_draft(build_skeleton(snapshot, HEAD), snapshot, HEAD), HEAD, snapshot, "deterministic")
+    assert warnings == []
+    return snapshot, document
+
+
+def test_the_digest_lists_a_moved_row_with_its_family_and_count_and_after_return_when_nonzero():
+    snapshot, document = moved_routine_world()
+    digest = build_overview_digest(document, snapshot)
+    rows = {item["label"]: item for item in digest["nodes"]}
+    moved = rows["15 files: moved, not edited"]
+    assert moved["pattern"]["family"] == "moved" and moved["pattern"]["count"] == 15
+    assert moved["stats"] == {"files": 15} and moved["no_line_data"] is True
+    assert "(from src/old/ to src/core/)" in moved["description"]
+    returning = [item for item in digest["nodes"] if item["stats"].get("after_return")]
+    assert returning and all(item["stats"]["after_return"] > 0 for item in returning)
+    assert all("after_return" not in item["stats"] for item in digest["nodes"] if item not in returning)
+    routine = next(item for item in digest["nodes"] if item["kind"] == "routine")
+    assert routine["claimable"] is False and routine["stats"]["files"] == 164
+
+
+def test_the_overview_totals_add_up_because_other_collects_the_routine_rows():
+    snapshot, document = moved_routine_world()
+    total = len(snapshot["pr"]["files"])
+    overview, warnings = finalize_overview(deterministic_overview(document, snapshot), document, HEAD, snapshot, "deterministic")
+    assert warnings == []
+    assert sum(item["stats"]["files"] for item in overview["components"]) == total
+    other = next(item for item in overview["components"] if item["id"] == "other")
+    assert other["stats"]["files"] == 164 and other["stats"]["additions"] == 328
+    assert sum(item["stats"]["after_return"] for item in overview["components"]) == 2
+
+
+def test_overview_component_stats_carry_after_return_and_reject_a_wrong_one():
+    snapshot, document = moved_routine_world()
+    overview, _ = finalize_overview(deterministic_overview(document, snapshot), document, HEAD, snapshot, "deterministic")
+    position = next(n for n, item in enumerate(overview["components"]) if item["stats"]["after_return"])
+    overview["components"][position]["stats"]["after_return"] += 1
+    assert any("stats" in item["path"] for item in errors_of(overview, document, snapshot))

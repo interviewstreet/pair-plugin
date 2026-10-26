@@ -7,7 +7,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paircli_patterns import (
-    api_surface, api_total, category_members, change_signature, cluster_same_change, pattern_label, verify_pattern,
+    MAX_LABEL_CHARS, after_return, api_surface, api_total, category_members, change_signature, cluster_moved,
+    cluster_same_change, is_pure_move, label_hint, net_line_set, pattern_label, verify_pattern,
 )
 from snapshot_factory import letters, make_file, make_hunk
 
@@ -489,11 +490,11 @@ def test_api_javascript_extensions():
         assert surface(path, added=["export const one = 1;"])["added"] == 1, path
 
 
-def test_api_typescript_removed_and_readded_counts_both():
+def test_api_typescript_a_name_on_both_sides_is_unchanged():
     result = surface("a.ts", added=["export function f(a: string) {}", "export const g = 1;"],
                      removed=["export function f(a: number) {}", "export function h() {}"])
-    assert (result["added"], result["removed"]) == (2, 2)
-    assert result["removed_names"] == ["f", "h"]
+    assert (result["added"], result["removed"]) == (1, 1)
+    assert result["added_names"] == ["g"] and result["removed_names"] == ["h"]
 
 
 def test_api_names_counted_once_per_side():
@@ -600,3 +601,271 @@ def test_determinism_and_order_independence():
     assert first == cluster_same_change(list(reversed(files)))
     assert category_members(files, "tests") == category_members(list(reversed(files)), "tests")
     assert [change_signature(file) for file in files] == [change_signature(file) for file in files]
+
+
+# --- moved files ----------------------------------------------------------------------------------
+
+def move(index, directory="src/new", old_directory="src/old", **kwargs):
+    return make_file(f"{directory}/m{index}.ts", "renamed", old_path=f"{old_directory}/m{index}.ts", no_hunks=True, **kwargs)
+
+
+def test_a_pure_move_is_a_renamed_file_with_a_different_old_path_and_no_changed_line():
+    assert is_pure_move(move(1))
+    context_only = make_file("src/new/c.ts", "renamed", old_path="src/old/c.ts", hunks=[make_hunk(1, context=2)])
+    assert is_pure_move(context_only), "context lines are not changes"
+    assert not is_pure_move(make_file("src/new/e.ts", "renamed", old_path="src/old/e.ts", added=["x();"]))
+    assert not is_pure_move(make_file("src/new/e.ts", "renamed", old_path="src/old/e.ts", removed=["x();"]))
+    assert not is_pure_move(make_file("src/a.ts", "renamed", old_path="src/a.ts", no_hunks=True)), "same path"
+    assert not is_pure_move(make_file("src/a.ts", "renamed", no_hunks=True)), "no old path"
+    assert not is_pure_move(make_file("src/a.ts", "renamed", old_path="", no_hunks=True))
+    assert not is_pure_move(make_file("src/a.ts", "modified", old_path="src/b.ts", no_hunks=True)), "status matters"
+    assert not is_pure_move(make_file("src/a.ts", "added", no_hunks=True))
+    for garbage in (None, 3, "x", [], {}, {"path": "a", "status": "renamed", "old_path": "b", "hunks": 7}):
+        assert is_pure_move(garbage) in (False, True)  # never raises
+    assert is_pure_move({"path": "a", "status": "renamed", "old_path": "b", "hunks": 7})
+
+
+def test_cluster_moved_needs_three_and_is_pr_wide_and_sorted():
+    files = [move(index, directory=f"pkg{index % 2}") for index in range(6)] + [changed("src/edit.ts", added=["a();"])]
+    (cluster,) = cluster_moved(files)
+    assert cluster["members"] == sorted(file["path"] for file in files[:6]) and cluster["signature"] is None
+    assert (cluster["status"], cluster["additions"], cluster["deletions"]) == ("renamed", 0, 0)
+    assert cluster_moved(files[:2]) == []
+    assert cluster_moved([move(0), move(1), changed("src/e.ts", status="renamed", old_path="x.ts", added=["a"])]) == []
+    assert [c["members"] for c in cluster_moved(files, skip={files[0]["path"]})] == [sorted(f["path"] for f in files[1:6])]
+    assert cluster_moved([move(0), move(0), move(1), move(2)]) != [] and len(cluster_moved([move(0), move(0), move(1)])) == 0
+
+
+def test_cluster_moved_splits_above_the_cap_by_directory_and_is_deterministic():
+    files = [move(index, directory="src/a", old_directory="old/a") for index in range(300)]
+    files += [move(index, directory="src/b", old_directory="old/b") for index in range(300)]
+    clusters = cluster_moved(files)
+    assert [len(c["members"]) for c in clusters] == [300, 300]
+    assert {path.split("/")[1] for path in clusters[0]["members"]} in ({"a"}, {"b"})
+    assert clusters == cluster_moved(list(reversed(files)))
+    assert cluster_moved(files, max_members=100) and all(len(c["members"]) <= 100 for c in cluster_moved(files, max_members=100))
+    assert cluster_moved("nope") == [] and cluster_moved([None, 3]) == []
+
+
+def test_verify_moved_family():
+    files = {file["path"]: file for file in (move(index) for index in range(4))}
+    members = sorted(files)
+    assert verify_pattern({"family": "moved", "count": 4, "members": members}, files) == []
+    assert verify_pattern({"family": "moved", "count": 3, "members": members[:3]}, files) == []
+    assert "pattern.members" in reasons(verify_pattern({"family": "moved", "count": 2, "members": members[:2]}, files))
+    assert "pattern.signature" in reasons(verify_pattern(
+        {"family": "moved", "count": 3, "members": members[:3], "signature": None}, files))
+    edited = dict(files)
+    edited[members[1]] = make_file(members[1], "renamed", old_path="src/old/m1.ts", added=["x();"])
+    assert list(reasons(verify_pattern({"family": "moved", "count": 4, "members": members}, edited))) == ["pattern.members[1]"]
+    modified = dict(files)
+    modified[members[2]] = make_file(members[2], "modified", old_path="src/old/m2.ts", no_hunks=True)
+    assert "pattern.members[2]" in reasons(verify_pattern({"family": "moved", "count": 4, "members": members}, modified))
+    same = dict(files)
+    same[members[0]] = make_file(members[0], "renamed", old_path=members[0], no_hunks=True)
+    assert "pattern.members[0]" in reasons(verify_pattern({"family": "moved", "count": 4, "members": members}, same))
+    big = {f"n{index}.ts": make_file(f"n{index}.ts", "renamed", old_path=f"o{index}.ts", no_hunks=True) for index in range(501)}
+    assert verify_pattern({"family": "moved", "count": 500, "members": sorted(big)[:500]}, big) == []
+    assert "pattern.members" in reasons(verify_pattern({"family": "moved", "count": 501, "members": sorted(big)}, big))
+
+
+def test_verify_routine_family_takes_one_member_and_only_routine_files():
+    files = {"package-lock.json": changed("package-lock.json", added=["x"]), "dist/app.min.js": changed("dist/app.min.js", added=["y"]),
+             "src/app.ts": changed("src/app.ts", added=["z"])}
+    assert verify_pattern({"family": "routine", "count": 1, "members": ["package-lock.json"]}, files) == []
+    assert verify_pattern({"family": "routine", "count": 2, "members": ["package-lock.json", "dist/app.min.js"]}, files) == []
+    assert "pattern.members" in reasons(verify_pattern({"family": "routine", "count": 0, "members": []}, files))
+    bad = verify_pattern({"family": "routine", "count": 2, "members": ["package-lock.json", "src/app.ts"]}, files)
+    assert list(reasons(bad)) == ["pattern.members[1]"] and "not a routine file" in bad[0]["reason"]
+    assert "pattern.signature" in reasons(verify_pattern(
+        {"family": "routine", "count": 1, "members": ["package-lock.json"], "signature": None}, files))
+    assert "pattern.members" in reasons(verify_pattern({"family": "tests", "count": 1, "members": ["tests/a.test.ts"]}, files))
+
+
+# --- labels ---------------------------------------------------------------------------------------
+
+def test_label_families_moved_and_routine():
+    assert pattern_label("moved", 15) == "15 files: moved, not edited"
+    assert pattern_label("routine", 164) == "164 routine files" and pattern_label("routine", 1) == "1 routine file"
+
+
+def test_same_change_label_carries_the_verb_and_a_short_snippet():
+    assert pattern_label("same-change", 16, "modified", 'logger.debug("renamed module", { zone: 1 });', "adds") == \
+        '16 files: adds `logger.debug("renamed module", { zo\u2026`'
+    assert pattern_label("same-change", 40, "deleted") == "40 files: deleted"
+    assert pattern_label("same-change", 35, "renamed", None, "edits imports") == "35 files: renamed, edits imports"
+    assert pattern_label("same-change", 35, "renamed", "../new/shared", "edits imports") == \
+        "35 files: renamed, edits imports of `../new/shared`"
+    assert pattern_label("same-change", 8, "modified", "x();", "removes") == "8 files: removes `x();`"
+    assert pattern_label("same-change", 8, "modified", "x();", "wipes") == "8 files: same edit", "unknown verb is ignored"
+    assert pattern_label("same-change", 8, "modified", "", "adds") == "8 files: adds"
+    assert pattern_label("same-change", 8, "modified", "a`b`c", "changes") == "8 files: changes `a'b'c`"
+    assert pattern_label("same-change", 8, "modified", "  spaced\n   out  ", "adds") == "8 files: adds `spaced out`"
+
+
+def test_label_never_exceeds_80_characters_and_shrinks_the_snippet():
+    for count in (3, 99, 123456789):
+        for status in ("modified", "renamed"):
+            for verb in ("adds", "removes", "changes", "adds imports", "removes imports", "edits imports"):
+                label = pattern_label("same-change", count, status, "x" * 200, verb)
+                assert len(label) <= MAX_LABEL_CHARS, label
+                assert label.count("`") in (0, 2)
+    assert len(pattern_label("same-change", 5, "modified", "y" * 200, "adds").split("`")[1]) == 36
+
+
+def test_label_hint_picks_the_longest_net_added_line():
+    file = changed("src/a.ts", added=["short();", "logger.debug('a longer distinctive line');", "}"], removed=["gone();"])
+    assert label_hint(file) == ("changes", "logger.debug('a longer distinctive line');")
+    assert label_hint(changed("src/a.ts", added=["only();", "more_here();"])) == ("adds", "more_here();")
+    assert label_hint(changed("src/a.ts", status="deleted", removed=["first();", "second_one();"])) == ("removes", "second_one();")
+    assert label_hint(changed("src/a.ts", added=["x();"], removed=["x();"])) is None
+    assert label_hint(changed("src/a.ts", added=["}", "});", "{"])) is None, "punctuation alone is no snippet"
+    assert label_hint(changed("src/a.ts", added=["x(); // reviewed"], removed=["x();"])) is None, "comment-only edit"
+    assert label_hint("junk") is None
+
+
+def test_label_hint_prefers_code_over_imports_and_names_the_module_when_only_imports_changed():
+    mixed = changed("src/a.ts", added=["import { shared } from '../core/shared';", "call();"])
+    assert label_hint(mixed) == ("adds", "call();")
+    assert label_hint(changed("src/a.ts", added=["import { shared } from '../core/shared';"],
+                              removed=["import { shared } from '../old/shared';"])) == ("edits imports", "../core/shared")
+    assert label_hint(changed("src/a.ts", removed=["import { shared } from '../old/shared';"])) == \
+        ("removes imports", "../old/shared")
+    assert label_hint(changed("a.py", added=["from pkg.mod import thing"])) == ("adds imports", "pkg.mod")
+    assert label_hint(changed("a.py", added=["import os"])) == ("adds imports", "os")
+
+
+def test_label_hint_avoids_the_lines_of_a_sibling_when_it_can():
+    common = ["const shared_setup = prepare_everything();"]
+    first = changed("src/a.ts", added=common + ["extra();"])
+    second = changed("src/b.ts", added=common)
+    assert label_hint(first)[1] == "const shared_setup = prepare_everything();"
+    assert label_hint(first, avoid=net_line_set(second))[1] == "extra();"
+    assert label_hint(second, avoid=net_line_set(first))[1] == "const shared_setup = prepare_everything();", "nothing else left"
+    assert net_line_set(changed("a.ts", added=["v1();", "w22();"]), raw=True) == {"v1();", "w22();"}
+    assert net_line_set(changed("a.ts", added=["v1();"])) == {"v#();"}
+
+
+# --- after_return ---------------------------------------------------------------------------------
+
+def hunk_of(lines):
+    """A hunk from (kind, text) pairs, numbered consecutively; kinds are ctx, add, del."""
+    old = new = 1
+    items = []
+    for kind, text in lines:
+        item = {"kind": kind, "text": text}
+        if kind != "add":
+            item["old_no"], old = old, old + 1
+        if kind != "del":
+            item["new_no"], new = new, new + 1
+        items.append(item)
+    return {"old_start": 1, "old_lines": old - 1, "new_start": 1, "new_lines": new - 1, "section": "", "lines": items}
+
+
+def after(path, lines):
+    return after_return(make_file(path, hunks=[hunk_of(lines)]))
+
+
+def test_after_return_counts_an_added_call_right_after_a_return():
+    lines = [("ctx", "function f() {"), ("ctx", "  return 1;"), ("add", "  log('never');"), ("ctx", "}")]
+    assert after("src/a.ts", lines) == 1
+
+
+def test_after_return_counts_a_deleted_call_right_after_a_return_on_the_old_side():
+    lines = [("ctx", "function f() {"), ("ctx", "  throw new Error('x');"), ("del", "  cleanup();"), ("ctx", "}")]
+    assert after("src/a.ts", lines) == 1
+
+
+@pytest.mark.parametrize("terminator", ["return", "return value;", "throw err;", "raise ValueError", "break", "continue;"])
+def test_after_return_recognises_every_terminator(terminator):
+    assert after("src/a.ts", [("ctx", f"    {terminator}"), ("add", "    next();")]) == 1
+
+
+def test_after_return_skips_blank_and_comment_lines_between():
+    lines = [("ctx", "  return 1;"), ("ctx", ""), ("ctx", "  // later"), ("ctx", "  /* more */"), ("ctx", "  * continued"), ("add", "  log();")]
+    assert after("src/a.ts", lines) == 1
+    assert after("a.py", [("ctx", "    return 1"), ("ctx", "    # note"), ("add", "    log()")]) == 1
+
+
+def test_after_return_needs_the_same_indentation_and_ignores_new_branches():
+    assert after("src/a.ts", [("ctx", "    return 1;"), ("add", "  log();")]) == 0, "outer block: reachable"
+    assert after("src/a.ts", [("ctx", "  return 1;"), ("add", "    log();")]) == 0, "deeper: not a plain follower"
+    assert after("src/a.ts", [("ctx", "  return 1;"), ("add", "  }")]) == 0
+    assert after("src/a.ts", [("ctx", "  return 1;"), ("add", "  } else {")]) == 0
+    assert after("src/a.ts", [("ctx", "  break;"), ("add", "  case 2:")]) == 0
+    assert after("src/a.ts", [("ctx", "  break;"), ("add", "  default:")]) == 0
+    assert after("a.py", [("ctx", "    return 1"), ("add", "    else:")]) == 0
+    assert after("a.py", [("ctx", "    return 1"), ("add", "    except KeyError:")]) == 0
+    assert after("a.rb", [("ctx", "  return 1"), ("add", "  end")]) == 0
+    assert after("src/a.ts", [("ctx", "  return 1;"), ("add", "  ")]) == 0, "blank line"
+
+
+def test_after_return_looks_at_the_last_code_line_not_the_one_before():
+    lines = [("ctx", "  return 1;"), ("add", "  first();"), ("add", "  second();")]
+    assert after("src/a.ts", lines) == 1, "only the line that directly follows"
+    assert after("src/a.ts", [("add", "  return 1;"), ("ctx", "  other();"), ("add", "  third();")]) == 0
+
+
+def test_after_return_reads_each_side_on_its_own():
+    # old side: return, del-line follows. new side: the return was replaced, so the added line follows `ok();`
+    lines = [("ctx", "  return 1;"), ("del", "  old();")]
+    assert after("src/a.ts", lines) == 1
+    lines = [("del", "  return 1;"), ("add", "  ok();"), ("add", "  more();")]
+    assert after("src/a.ts", lines) == 0, "an added line after a deleted return is not after a return"
+
+
+def test_after_return_first_line_of_a_hunk_and_unknown_languages_count_nothing():
+    assert after("src/a.ts", [("add", "  log();"), ("ctx", "  return 1;")]) == 0
+    assert after("src/a.md", [("ctx", "return 1;"), ("add", "log();")]) == 0
+    assert after("Makefile", [("ctx", "return 1;"), ("add", "log();")]) == 0
+    assert after("src/a.c", [("ctx", "return 1;"), ("add", "log();")]) == 0, "only the listed languages"
+
+
+@pytest.mark.parametrize("path", ["a.ts", "a.tsx", "a.js", "a.jsx", "a.mjs", "a.cjs", "a.go", "a.java", "a.rs", "a.kt", "a.cs", "a.php", "a.swift"])
+def test_after_return_languages(path):
+    assert after(path, [("ctx", "\treturn x"), ("add", "\tlog()")]) == 1
+
+
+def test_after_return_sums_over_hunks_and_never_raises():
+    hunks = [hunk_of([("ctx", "  return 1;"), ("add", "  a();")]), hunk_of([("ctx", "  throw e;"), ("del", "  b();")])]
+    assert after_return(make_file("src/a.ts", hunks=hunks)) == 2
+    for garbage in (None, 3, "x", {}, {"path": 5}, {"path": "a.ts", "hunks": 7}, {"path": "a.ts", "hunks": [None, {"lines": 3}]}):
+        assert after_return(garbage) == 0
+
+
+# --- api surface counts the NET change --------------------------------------------------------------
+
+def test_api_comment_only_edit_of_an_export_line_counts_nothing():
+    result = surface("a.ts", added=["export function f() {} // reviewed"], removed=["export function f() {}"])
+    assert (result["added"], result["removed"]) == (0, 0)
+    assert result["added_names"] == [] and result["removed_names"] == []
+    python = surface("a.py", added=["def f():  # reviewed"], removed=["def f():"])
+    assert (python["added"], python["removed"]) == (0, 0)
+
+
+def test_api_a_real_rename_still_counts_once_each_way():
+    result = surface("a.ts", added=["export function renamed() {}"], removed=["export function original() {}"])
+    assert (result["added"], result["removed"]) == (1, 1)
+    assert (result["added_names"], result["removed_names"]) == (["renamed"], ["original"])
+
+
+def test_api_names_are_compared_exactly_digits_are_not_normalised():
+    result = surface("a.ts", added=["export const version2 = 1;"], removed=["export const version1 = 1;"])
+    assert (result["added"], result["removed"]) == (1, 1)
+    go = surface("a.go", added=["func Handler2() {}"], removed=["func Handler1() {}"])
+    assert (go["added"], go["removed"]) == (1, 1)
+
+
+def test_api_a_name_re_listed_identically_on_both_sides_is_unchanged():
+    result = surface("a.ts", added=["export { a, b };"], removed=["export { a, c };"])
+    assert (result["added_names"], result["removed_names"]) == (["b"], ["c"])
+    same = surface("a.ts", added=["export { a, b }; // tidy"], removed=["export { a, b };"])
+    assert (same["added"], same["removed"]) == (0, 0)
+    go = surface("a.go", added=["func Run(ctx context.Context) error {"], removed=["func Run() error {"])
+    assert (go["added"], go["removed"]) == (0, 0), "a changed signature keeps the exported name"
+
+
+def test_api_total_sums_the_net_counts():
+    files = [changed("a.ts", added=["export const x = 1; // c"], removed=["export const x = 1;"]),
+             changed("b.ts", added=["export const y = 1;"])]
+    assert api_total(files) == {"added": 1, "removed": 0}

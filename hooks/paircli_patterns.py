@@ -8,8 +8,11 @@ odd shapes; unreadable input counts as "no changed lines".
   cluster_same_change(files, ...)   files that share one signature, 3 or more at a time
   category_members(files, cat, ...) the tests / docs / config files of a group
   verify_pattern(pattern, by_path)  structured errors for a node's `pattern` object (validator use)
-  pattern_label(family, count, ...) the short row label
-  api_surface(file), api_total(fs)  lexical counts of exported names added and removed
+  pattern_label(family, count, ...) the short row label (same-change rows may carry a snippet of the change)
+  label_hint(file, avoid)           (verb, snippet) naming a file's most distinctive net changed line
+  is_pure_move(file), cluster_moved(files, ...)   renamed files with no changed line, 3 or more at a time
+  after_return(file)                lexical hint: changed lines directly after a return/throw/raise/break/continue
+  api_surface(file), api_total(fs)  lexical counts of exported names added and removed (net, by name)
 
 Change signature: sha256 over the file status and the sorted sets of its NET added and NET deleted lines (how
 often a line repeats is ignored). Each changed line is trimmed and loses a trailing line comment; lines that are
@@ -33,8 +36,21 @@ API surface (see docs/architecture-v2-contract.md): lexical, one language per fi
                          `var`, `const` with an uppercase name, including `var A, B = ...`, plus names at
                          one indent level inside a `var (`/`const (`/`type (` block whose opening line is
                          in the hunk. A block that opens before the hunk is not seen.
-Names are counted once per side per file, in order of appearance. A name removed and re-added in one
-file counts in both `removed` and `added`. `added_names` / `removed_names` keep the first 20.
+Names are counted once per side per file, in order of appearance, then netted by exact NAME: a name that
+appears on both sides of a file is unchanged (a comment-only edit of an export line, a changed signature or
+re-listing the same name in `export { ... }` count as 0/0), while a renamed export is one removed and one
+added name. Digits are not normalised: `v1` to `v2` is a real rename. `added_names` / `removed_names` keep
+the first 20.
+
+Moved files: a file whose status is `renamed`, whose `old_path` differs from its path and that has no added
+or deleted line is a pure move. Three or more of them form a `moved` row; the snapshot alone verifies it.
+
+After return (`after_return`): a lexical hint, not proof. Per hunk and per side (old side for deleted lines,
+new side for added lines, each with its context lines), a changed line counts when the last code line before
+it (blank lines and comment lines skipped) starts with return, throw, raise, break or continue and has the
+same leading whitespace. Changed lines that start a new branch (closing bracket, end, else, elif, except,
+finally, catch, case, when, rescue, ensure, `default:`) never count. Only ts/tsx/js/jsx/mjs/cjs/py/go/java/rs/
+rb/kt/cs/php/swift files are scanned.
 """
 from __future__ import annotations
 
@@ -43,17 +59,23 @@ import json
 import math
 import re
 
-from paircli_skeleton import _line_kind, classify
+from paircli_skeleton import ROUTINE_CATEGORIES, _line_kind, classify
 
 SIGNATURE_CHARS = 16
-FAMILIES = ("same-change", "tests", "docs", "config", "remainder")
+FAMILIES = ("same-change", "tests", "docs", "config", "remainder", "moved", "routine")
 CATEGORY_FAMILIES = {"tests": "test", "docs": "docs", "config": "config"}  # family -> skeleton category
 MIN_MEMBERS = 3
+MIN_ROUTINE_MEMBERS = 1  # a routine row may stand for a single lockfile
+NO_SIGNATURE_FAMILIES = frozenset({"remainder", "moved", "routine"})  # a `signature` key is an error there
 MAX_MEMBERS = 500
 MAX_API_NAMES = 20
 MAX_VERIFY_ERRORS = 100
 MAX_LABEL_CHARS = 80
 MAX_BLOCK_LINES = 100
+MAX_SNIPPET_CHARS = 36
+MIN_SNIPPET_CHARS = 8
+IMPORT_VERBS = {"adds": "adds imports", "removes": "removes imports", "changes": "edits imports"}
+LABEL_VERBS = ("adds", "removes", "changes", "adds imports", "removes imports", "edits imports")
 
 DIGITS = re.compile(r"[0-9]+")
 STATUS_WORDS = {"deleted": "deleted", "added": "added", "renamed": "renamed and edited", "modified": "same edit"}
@@ -161,8 +183,8 @@ def _strip_comment(text: str, marker: str) -> str:
     return text
 
 
-def _net_lines(file) -> tuple[list[str], list[str]]:
-    """The sorted net added and net deleted lines of a file, without comment noise and digit-normalised.
+def _net_sets(file) -> tuple[set[str], set[str]]:
+    """The net added and net deleted lines of a file as sets, trimmed and without trailing line comments.
 
     The net sets are taken before digits become `#`, so a line changed only in a digit (a version bump)
     still counts as a change, while one changed only in its comment cancels out.
@@ -176,8 +198,14 @@ def _net_lines(file) -> tuple[list[str], list[str]]:
             text = _strip_comment(text, marker)
         if text:
             (added if kind == "add" else deleted).add(text)
-    return (sorted({DIGITS.sub("#", text) for text in added - deleted}),
-            sorted({DIGITS.sub("#", text) for text in deleted - added}))
+    return added - deleted, deleted - added
+
+
+def _net_lines(file) -> tuple[list[str], list[str]]:
+    """The sorted net added and net deleted lines of a file, without comment noise and digit-normalised."""
+    added, deleted = _net_sets(file)
+    return (sorted({DIGITS.sub("#", text) for text in added}),
+            sorted({DIGITS.sub("#", text) for text in deleted}))
 
 
 def change_signature(file) -> str | None:
@@ -286,6 +314,43 @@ def cluster_same_change(files, *, min_members: int = MIN_MEMBERS, max_members: i
         return []
 
 
+def is_pure_move(file) -> bool:
+    """A renamed file with a different old path and no added or deleted line: only the path changed."""
+    try:
+        if not isinstance(file, dict) or file.get("status") != "renamed":
+            return False
+        old, path = file.get("old_path"), _path(file)
+        if not (isinstance(old, str) and old and path and old != path):
+            return False
+        return not any(True for _ in _changed_lines(file))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def cluster_moved(files, *, min_members: int = MIN_MEMBERS, max_members: int = MAX_MEMBERS,
+                  skip=None) -> list[dict]:
+    """Pure moves (see `is_pure_move`) as `moved` clusters: one for the whole PR, split by directory above `max_members`.
+
+    Returns [{"signature": None, "status": "renamed", "members" (sorted paths), "additions": 0, "deletions": 0}],
+    largest first. Fewer than `min_members` pure moves form no cluster; a piece below it is dropped. Paths in
+    `skip` are ignored; a repeated path counts once.
+    """
+    try:
+        minimum = max(1, _int(min_members) or MIN_MEMBERS)
+        maximum = max(minimum, _int(max_members) or MAX_MEMBERS)
+        skipped = {item for item in skip if isinstance(item, str)} if skip else set()
+        paths = sorted({_path(file) for file in files if _path(file) not in skipped and is_pure_move(file)}
+                       if isinstance(files, (list, tuple)) else set())
+        if len(paths) < minimum:
+            return []
+        clusters = [{"signature": None, "status": "renamed", "members": members, "additions": 0, "deletions": 0}
+                    for members in _split_members(paths, maximum) if len(members) >= minimum]
+        clusters.sort(key=lambda cluster: (-len(cluster["members"]), cluster["members"][0]))
+        return clusters
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def category_members(files, category: str, *, min_members: int = MIN_MEMBERS, skip=None) -> list[str]:
     """Sorted paths of `files` in category "tests", "docs" or "config"; [] with fewer than `min_members`."""
     wanted = CATEGORY_FAMILIES.get(category) if isinstance(category, str) else None
@@ -323,16 +388,17 @@ def verify_pattern(pattern, files_by_path) -> list[dict]:
     if not isinstance(members, list):
         fail("pattern.members", "members must be a list of paths")
         return errors
-    if not MIN_MEMBERS <= len(members) <= MAX_MEMBERS:
-        fail("pattern.members", f"members must hold {MIN_MEMBERS} to {MAX_MEMBERS} paths, got {len(members)}")
+    minimum = MIN_ROUTINE_MEMBERS if family == "routine" else MIN_MEMBERS
+    if not minimum <= len(members) <= MAX_MEMBERS:
+        fail("pattern.members", f"members must hold {minimum} to {MAX_MEMBERS} paths, got {len(members)}")
     count = pattern.get("count")
     if type(count) is not int or count != len(members):
         fail("pattern.count", f"count must equal the number of members ({len(members)})")
     signature = pattern.get("signature")
     if family == "same-change" and (not isinstance(signature, str) or not signature):
         fail("pattern.signature", "same-change needs a signature")
-    if family == "remainder" and "signature" in pattern:
-        fail("pattern.signature", "a remainder pattern has no signature")
+    if family in NO_SIGNATURE_FAMILIES and "signature" in pattern:
+        fail("pattern.signature", f"a {family} pattern has no signature")
     seen: set[str] = set()
     for index, member in enumerate(members):
         where = f"pattern.members[{index}]"
@@ -355,16 +421,102 @@ def verify_pattern(pattern, files_by_path) -> list[dict]:
                 fail(where, f"{member} has change signature {actual}, not {signature}")
         elif family in CATEGORY_FAMILIES and classify(member)[1] != CATEGORY_FAMILIES[family]:
             fail(where, f"{member} is not a {family} file")
+        elif family == "moved" and not is_pure_move(file):
+            fail(where, f"{member} is not a pure move (status renamed, old_path set and different, no changed line)")
+        elif family == "routine" and classify(member)[1] not in ROUTINE_CATEGORIES:
+            fail(where, f"{member} is not a routine file (lockfile, generated, vendored or binary)")
     return errors
 
 
-def pattern_label(family, count, status=None) -> str:
-    """Short deterministic row label, at most 80 characters."""
+IMPORT_LINE = re.compile(
+    r"^(?:import\b|from\s+\S+\s+import\b|export\s+(?:\*|\{[^}]*\})\s+from\b|#include\b|using\s+\S+;|use\s+\S+;"
+    r"|(?:const|let|var)\s+.*=\s*require\()")
+IMPORT_QUOTED = re.compile(r"""['"]([^'"]+)['"]""")
+IMPORT_BARE = re.compile(r"^(?:from\s+(\S+)\s+import\b|import\s+(\S+))")
+
+
+def _is_import(text: str) -> bool:
+    return IMPORT_LINE.match(text) is not None
+
+
+def _import_module(text: str) -> str:
+    match = IMPORT_QUOTED.search(text) or IMPORT_BARE.match(text)
+    return next((group for group in match.groups() if group), "") if match else ""
+
+
+def net_line_set(file, raw: bool = False) -> set[str]:
+    """Every net added or net deleted line of a file, digit-normalised (as written with `raw`): what
+    `label_hint` may be told to avoid."""
+    try:
+        added, deleted = _net_sets(file)
+        return set(added | deleted) if raw else {DIGITS.sub("#", text) for text in added | deleted}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def label_hint(file, avoid=()) -> tuple[str, str] | None:
+    """`(verb, snippet)` naming the most distinctive net changed line of a file, or None when nothing fits.
+
+    `verb` is "adds" (net added lines only), "removes" (net deleted only) or "changes" (both). The snippet is
+    the longest net added line (else the longest net deleted one) that has a letter or digit in it and is not
+    an import, taken from this file as written (digits and all). Lines in `avoid` (digit-normalised, see
+    `net_line_set`) are skipped when anything else is left, so two repeated changes that share their longest
+    line can still be told apart. When every net changed line is an import the verb is "adds imports",
+    "removes imports" or "edits imports" (both sides) and the snippet is the module of the longest net added
+    (else deleted) import, possibly "". The snippet is
+    returned as written in this file; a caller that labels a whole group of files should replace digits with
+    `#` (`DIGITS`) when the other members do not carry the same text.
+    """
+    try:
+        added, deleted = _net_sets(file)
+        if not added and not deleted:
+            return None
+        verb = "adds" if added and not deleted else "removes" if deleted and not added else "changes"
+        avoided = set(avoid) if avoid else set()
+
+        def best(lines):
+            ranked = sorted(lines, key=lambda text: (-len(text), text))
+            return next((text for text in ranked if DIGITS.sub("#", text) not in avoided), ranked[0]) if ranked else ""
+
+        for side in (added, deleted):
+            code = {text for text in side if any(char.isalnum() for char in text) and not _is_import(text)}
+            if code:
+                return verb, best(code)
+        if all(_is_import(text) for text in added | deleted):
+            return IMPORT_VERBS[verb], _import_module(best(added or deleted))
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _clip(snippet, limit: int) -> str:
+    """`snippet` on one line, backtick-free, at most `limit` characters (ellipsis included); "" when it cannot fit."""
+    text = " ".join(snippet.replace("`", "'").split()) if isinstance(snippet, str) else ""
+    limit = min(limit, MAX_SNIPPET_CHARS)
+    if not text or limit < MIN_SNIPPET_CHARS:
+        return ""
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "\u2026"
+
+
+def pattern_label(family, count, status=None, snippet=None, verb=None) -> str:
+    """Short deterministic row label, at most 80 characters.
+
+    A same-change row with a `verb` (one of `LABEL_VERBS`) reads `16 files: adds
+    `logger.debug("renamed module", \u2026``; a renamed one `35 files: renamed, edits imports`. The snippet is
+    squeezed so the whole label fits; without a usable verb the label is the status word (`40 files: deleted`).
+    """
     number = _int(count) if _int(count) is not None else 0
     files = f"{number} file" + ("" if number == 1 else "s")
     if family == "same-change":
         word = STATUS_WORDS.get(status.lower(), "same change") if isinstance(status, str) else "same change"
         label = f"{files}: {word}"
+        if verb in LABEL_VERBS:
+            lead = "renamed, " if isinstance(status, str) and status.lower() == "renamed" else ""
+            label = f"{files}: {lead}{verb}"
+            joiner = " of " if verb.endswith(" imports") else " "
+            text = _clip(snippet, MAX_LABEL_CHARS - len(label) - len(joiner) - 2)
+            if text:
+                label += f"{joiner}`{text}`"
     elif family == "tests":
         label = f"{number} test file" + ("" if number == 1 else "s")
     elif family == "docs":
@@ -373,9 +525,55 @@ def pattern_label(family, count, status=None) -> str:
         label = f"{number} config file" + ("" if number == 1 else "s")
     elif family == "remainder":
         label = f"{number} other changed file" + ("" if number == 1 else "s")
+    elif family == "moved":
+        label = f"{files}: moved, not edited"
+    elif family == "routine":
+        label = f"{number} routine file" + ("" if number == 1 else "s")
     else:
         label = files
     return label[:MAX_LABEL_CHARS]
+
+
+# --- after return -------------------------------------------------------------------------------
+
+AFTER_RETURN_LANGUAGES = frozenset("ts tsx js jsx mjs cjs py go java rs rb kt cs php swift".split())
+TERMINATOR = re.compile(r"(?:return|throw|raise|break|continue)\b")
+NEW_BRANCH = re.compile(r"(?:[})\]]|(?:end|else|elif|except|finally|catch|case|when|rescue|ensure)\b|default\s*:)")
+
+
+def after_return(file) -> int:
+    """How many added or deleted lines directly follow a return/throw/raise/break/continue (a lexical hint).
+
+    Per hunk and per side: an added line is read in the new-side sequence (context and added lines), a deleted
+    line in the old-side sequence. It counts when the last code line before it, skipping blank and comment
+    lines, starts with a terminator and has the same leading whitespace, and the line itself does not open a
+    new branch (closing bracket, end, else, case, ...). Not proof that the line cannot run.
+    """
+    try:
+        path = _path(file)
+        name = path.rsplit("/", 1)[-1].lower()
+        if (name.rsplit(".", 1)[-1] if "." in name else "") not in AFTER_RETURN_LANGUAGES:
+            return 0
+        marker = _comment_marker(path)
+        total = 0
+        for hunk in _hunks(file):
+            lines = list(_hunk_lines(hunk))
+            for side in ("add", "del"):
+                previous = None  # (leading whitespace, starts with a terminator) of the last code line
+                for kind, text, _ in lines:
+                    if kind not in ("ctx", side):
+                        continue
+                    body = text.strip()
+                    if not body or (marker and not _strip_comment(body, marker)):
+                        continue
+                    prefix = text[:len(text) - len(text.lstrip())]
+                    if kind == side and previous and previous[1] and previous[0] == prefix \
+                            and not NEW_BRANCH.match(body):
+                        total += 1
+                    previous = (prefix, TERMINATOR.match(body) is not None)
+        return total
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 # --- API surface --------------------------------------------------------------------------------
@@ -498,9 +696,11 @@ def _surface(file, side: str) -> list[str]:
 
 
 def api_surface(file) -> dict:
-    """Exported names a file adds (from added lines) and removes (from deleted lines)."""
+    """Exported names a file adds and removes, netted by name: a name on both sides of the file is unchanged."""
     try:
         added, removed = _surface(file, "add"), _surface(file, "del")
+        both = set(added) & set(removed)  # the same name on both sides is unchanged
+        added, removed = [name for name in added if name not in both], [name for name in removed if name not in both]
     except Exception:  # noqa: BLE001
         added = removed = []
     return {"added": len(added), "removed": len(removed),

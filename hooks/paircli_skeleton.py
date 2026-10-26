@@ -38,10 +38,12 @@ appears only in that group's `patterns`. Members that live in other groups stay 
 `files` (so the v1 diagram, which reads `files`, is unchanged) but belong to the assigned group's
 pattern: a consumer that draws rows must skip every path that some group pattern claims. Then, from
 the files no cluster claimed, a group with at least 3 `test`, `docs` or `config` files of its own gets
-one folded pattern per category (`category_members`), still per group. A group's `patterns` list holds,
-in that order, `{family, signature (None unless same-change), members (sorted paths), count, additions,
-deletions, status}`; `status` is the shared file status of a same-change pattern, else added or deleted
-when every member is, else modified. A path belongs to at most one pattern.
+one folded pattern per category (`category_members`), still per group. Pure moves (renamed, old path set,
+no changed line; `paircli_patterns.cluster_moved`) have no hunks, so they are clustered separately (3 or
+more, PR-wide, split by directory above 500) into `moved` patterns, assigned to a group by the same rule
+and listed after the same-change ones. A group's `patterns` list holds, in that order, `{family, signature (None unless same-change), members (sorted paths), count, additions,
+deletions, status}`; `status` is the shared file status of a same-change pattern, `renamed` for a moved one, else added or
+deleted when every member is, else modified. A path belongs to at most one pattern.
 
 `deterministic_architecture(skeleton, head, snapshot)` turns that into an ADE v1 document, or
 returns None when nothing can be cited.
@@ -537,17 +539,24 @@ def _same_change_patterns(owner: dict[str, str], entries: dict[str, dict],
     the most of its members (ties: the smallest group id). Members that sit in other groups stay in
     those groups' `files` (the v1 diagram reads them) but are claimed by the pattern.
     """
-    from paircli_patterns import cluster_same_change
+    from paircli_patterns import cluster_moved, cluster_same_change
 
     candidates = [entries[path] for path in sorted(owner) if lines_available(entries[path])]
     assigned: dict[str, list[dict]] = {}
-    for cluster in cluster_same_change(candidates):
+
+    def assign(family: str, cluster: dict) -> None:
         held: dict[str, int] = {}
         for path in cluster["members"]:
             held[owner[path]] = held.get(owner[path], 0) + 1
         group = min(held, key=lambda name: (-held[name], name))
         assigned.setdefault(group, []).append(
-            _pattern_record("same-change", cluster["signature"], cluster["members"], cluster["status"], records))
+            _pattern_record(family, cluster["signature"], cluster["members"], cluster["status"], records))
+
+    for cluster in cluster_same_change(candidates):
+        assign("same-change", cluster)
+    # Pure moves (renamed, no changed line) have no hunks, so they are never in `candidates`.
+    for cluster in cluster_moved([entries[path] for path in sorted(owner)]):
+        assign("moved", cluster)
     return assigned
 
 

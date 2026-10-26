@@ -606,7 +606,7 @@ def test_prompts_fit_the_size_limit_for_a_253_file_digest_even_on_retry(tmp_path
 
 
 def test_the_prompt_version_changed_and_cache_keys_differ(monkeypatch):
-    assert llm.PROMPT_VERSION == "architecture-llm-4"
+    assert llm.PROMPT_VERSION == "architecture-llm-5"
     snapshot, draft = world()
     digest = llm.build_merge_digest(draft, {}, snapshot)
     group_key = llm.group_cache_key(draft, "api", snapshot, "codex", None)
@@ -1055,7 +1055,11 @@ NEW_RULE_PHRASES = (
     "Never write file, line, handler or percentage counts in prose",
     'Copy a number only from a digest field named count or stats, verbatim',
     "Samples are only some members",
-    'such as "the removed call sat after return, so behaviour does not change"',
+    "only when a row's stats carry after_return above 0",
+    "you may say that N changed lines sit after a return or throw and may never run",
+    "never state it otherwise",
+    'stands for files that were only moved to a new path: their content is unchanged',
+    "that they keep their old names and imports, but only after reading a sample file at its new path",
     'such as "the imports name something the target does not export"',
     "after reading the file around the cited lines",
     "If unsure, omit it",
@@ -1103,6 +1107,62 @@ def test_merge_digest_rows_carry_computed_stats():
     snapshot, draft, group = pattern_world()
     rows = {row["id"]: row for row in llm.build_merge_digest(draft, {}, snapshot)["groups"][0]["rows"]}
     assert rows["legacy-deleted"]["stats"]["files"] == 20 and rows["legacy-deleted"]["stats"]["deletions"] == 40
+
+
+# --- moved rows, routine rows and after_return in the digests ---------------------------------
+
+def real_draft_world():
+    """The real deterministic draft of: 6 pure moves, 3 files with a line after a return, 3 lockfiles."""
+    from paircli_architecture_v2_draft import deterministic_v2_draft
+    from paircli_skeleton import build_skeleton
+    after = [{"kind": "ctx", "text": "  return 1;", "old_no": 1, "new_no": 1}, {"kind": "add", "text": "  log();", "new_no": 2}]
+    files = [make_file(f"src/core/m{index}.ts", "renamed", old_path=f"src/old/m{index}.ts", no_hunks=True) for index in range(6)]
+    files += [{"path": f"src/app/r{index}.ts", "status": "modified", "hunks": [
+        {"old_start": 1, "old_lines": 1, "new_start": 1, "new_lines": 2, "section": "", "lines": after}]} for index in range(3)]
+    files += [make_file(f"pkg{index}/package-lock.json", added=["x"]) for index in range(3)]
+    snapshot = make_snapshot(files)
+    return snapshot, deterministic_v2_draft(build_skeleton(snapshot, HEAD), snapshot, HEAD)
+
+
+def test_group_digest_lists_a_moved_row_with_family_count_and_no_line_data():
+    snapshot, draft = real_draft_world()
+    moved = next(node for node in draft["nodes"] if node["kind"] == "pattern" and node["pattern"]["family"] == "moved")
+    digest = llm.build_group_digest(draft, moved["group"], snapshot)
+    row = next(item for item in digest["rows"] if item["id"] == moved["id"])
+    assert row["pattern"]["family"] == "moved" and row["pattern"]["count"] == 6 and "signature" in row["pattern"]
+    assert row["stats"] == {"files": 6, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0}
+    assert all(entry["no_line_data"] for entry in row["files"])
+    merged = llm.build_merge_digest(draft, {}, snapshot)
+    listed = next(item for group in merged["groups"] for item in group["rows"] if item["id"] == moved["id"])
+    assert listed["pattern"]["family"] == "moved" and listed["pattern"]["count"] == 6
+
+
+def test_digest_stats_carry_after_return_only_when_it_is_above_zero():
+    snapshot, draft = real_draft_world()
+    app = next(node for node in draft["nodes"] if node.get("pattern", {}).get("family") == "same-change"
+               or node["files"] == ["src/app/r0.ts"])
+    digest = llm.build_group_digest(draft, app["group"], snapshot)
+    stats = {row["id"]: row["stats"] for row in digest["rows"]}
+    assert stats[app["id"]]["after_return"] == 3
+    assert all("after_return" not in value for row_id, value in stats.items() if row_id != app["id"])
+    merged = llm.build_merge_digest(draft, {}, snapshot)
+    rows = {item["id"]: item for group in merged["groups"] for item in group["rows"]}
+    assert rows[app["id"]]["stats"]["after_return"] == 3
+    assert all("after_return" not in item["stats"] for name, item in rows.items() if name != app["id"])
+    assert llm.row_stats({"stats": {"files": 1, "after_return": 0}}) == {"files": 1}
+    assert llm.row_stats({"stats": {"files": 1, "after_return": 2}}) == {"files": 1, "after_return": 2}
+
+
+def test_a_routine_row_digest_counts_all_its_members_and_the_cache_key_follows_them():
+    snapshot, draft = real_draft_world()
+    routine = next(node for node in draft["nodes"] if node["kind"] == "routine")
+    digest = llm.build_group_digest(draft, routine["group"], snapshot)
+    row = next(item for item in digest["rows"] if item["id"] == routine["id"])
+    assert row["stats"]["files"] == 3 and "pattern" not in row, "pattern facts are for pattern rows"
+    before = llm.group_cache_key(draft, routine["group"], snapshot, "claude", None)
+    changed = copy.deepcopy(draft)
+    next(node for node in changed["nodes"] if node["kind"] == "routine")["pattern"]["members"].append("elsewhere/x.lock")
+    assert llm.group_cache_key(changed, routine["group"], snapshot, "claude", None) != before
 
 
 # --- orchestration -----------------------------------------------------------------------
