@@ -189,5 +189,78 @@ ignores the extra JSON. Pair BE must preserve the root generated-artifacts path
 when extracting the existing ZIP. No backend or AI-pipeline API change is made
 here; live S3 extraction is a rollout verification, not covered by unit tests.
 
+## Fallback diagram
+
+The diagram degrades in two steps, and `run_diagram_step` never fails the scan:
+
+1. **LLM** (`write_architecture`): the existing prompt, one retry, full validation.
+2. **Deterministic** (`write_fallback_architecture`): when step 1 produced nothing (invalid twice,
+   timeout, crash, harness missing, or an explicit `null`), the plugin builds a diagram from the
+   snapshot alone, runs `validate_architecture` on it and writes it to the same
+   `generated_artifacts/architecture.json` with the same symlink protections
+   (`save_architecture`, the one shared writer). If nothing is written, any older
+   `architecture.json` is removed. Docs-only changes get no diagram, even when the model errored.
+   Any exception in step 2 is logged, recorded as tier `none` and swallowed, so the summary
+   still uploads.
+
+The deterministic diagram is generated from file structure and imports, not from reading
+the code or understanding what changed. The model narrates and code computes: no model, no
+network, no repository read, and the same snapshot always gives byte-identical output. It comes from
+`hooks/paircli_skeleton.py`:
+
+- **Skeleton.** `build_skeleton(snapshot, head)` lists every changed file (new path for renames,
+  with `old_path`) with additions and deletions counted from hunk lines, a language, a category
+  (source, test, docs, config, lockfile, generated, vendor, binary), a `sensitive` flag
+  (path contains auth, secret, token, credential, password, migration, schema, permission, .env,
+  workflow, dockerfile or security), and whether it has hunks. Lockfiles, generated or vendored
+  code, build output (`dist`, `build`, `out`), minified files, snapshots and binaries are
+  *routine*: they are counted per group ("N routine files") and never get rows.
+- **Groups.** Files are clustered by directory. Clustering starts at top-level directories, splits
+  any group bigger than `max(5, files / max_groups)` by its next path component, then merges the
+  smallest groups into their parent (and, at the top level, into one "Other changes" group) until
+  the count fits the budget. Groups and the files in them are ranked by log-scaled changed lines,
+  plus a large boost for sensitive paths, minus a penalty for tests, docs and config relative to
+  source; ties break by path.
+- **Budget.** `size_budget(n_files, changed_lines)` (non-routine files; 2,000 or more changed lines moves
+  up one tier):
+
+  | non-routine files | max groups (nodes) | rows per group | max edges |
+  |---|---|---|---|
+  | 0-1 | 1 | 12 | 0 |
+  | 2-3 | 3 | 12 | 6 |
+  | 4-8 | 5 | 12 | 10 |
+  | 9-20 | 8 | 12 | 16 |
+  | 21-50 | 12 | 10 | 24 |
+  | 51-120 | 16 | 8 | 30 |
+  | 121+ | 20 | 8 | 30 |
+
+- **Import edges.** Candidate edges come only from import lines visible in hunks, so each has a
+  real citation: TypeScript and JavaScript (`import ... from`, `export ... from`, `require()`,
+  dynamic `import()`, multi-line imports, relative paths with extension and `index` probing, and
+  `@/` or `~/` aliases matched by path suffix), Python (`import a.b`, `from a.b import c`,
+  relative imports, matched to changed files by path suffix) and Go (single and block imports
+  with aliases, matched to changed directories by path suffix; standard-library roots are
+  skipped). Only targets that are other changed files count. A removed import line is kept as an
+  `old` side edge; the v1 diagram uses only `new` side edges.
+- **Diagram.** One node per group that has new-side hunk lines (extra groups merge into an "Other
+  changes" node). Node kind comes from path words (db, migrations, schema, sql: database; queue,
+  jobs, workers: worker; web, ui, components, pages, app, frontend, client: client; otherwise
+  service). Layers are the longest path over the group import graph, importers first, with
+  cycles broken in a fixed order and a cap of 8. Each node cites up to 12 of its biggest
+  new-side hunks and lists only files it cites. Each edge is a group-to-group `imports` edge
+  that cites the import lines. The description is a plain sentence ("Changes N files in M areas
+  (+A/-D)."), flows are empty, and `gaps` say what was left out (routine files, files without
+  hunk data, deleted-only areas, merged areas) and that the diagram was generated
+  deterministically from file structure and imports. A PR with no citable new-side line, only
+  deleted files, or only docs gets no diagram.
+
+`diagnostics/architecture-status.json` records which rung produced the result:
+`{"tier": "llm" | "deterministic" | "none", "reason": "<short>", "generated_by": "llm" |
+"deterministic" | null, "skeleton": {"files", "groups", "edges", "routine_files"}}`. The reason is why
+the model's diagram was not used ("llm output failed validation", "llm returned no diagram",
+"llm unavailable", "llm error: <class>"), or why there is none ("docs-only change", "no citable
+lines", "deterministic diagram failed: <class>"). Like the rest of `diagnostics/` it stays out of the
+ZIP.
+
 This does not change upload paths, capture offsets, publication versioning, or the
 separate `/pair` JSON review-brief agent contract.

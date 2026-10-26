@@ -323,11 +323,12 @@ def test_scan_uploads_fallback_when_model_returns_garbage_for_summary_and_diagra
     log = tmp_path / "scan.log"
     assert onboarding.scan(log, PR_URL, repo, "codex") == 0
     assert len(uploads) == 1 and "overview.md" in uploads[0]
-    assert not any(name.endswith("architecture.json") for name in uploads[0])
+    # The model's diagram failed twice, so the deterministic one is uploaded instead.
+    assert "generated_artifacts/architecture.json" in uploads[0]
     assert not any("diagnostics" in name for name in uploads[0])
     assert json.loads((artifacts / "diagnostics" / "summary-status.json").read_text())["mode"] == "fallback"
     assert "summary mode: fallback" in log.read_text()
-    assert "architecture diagram: not produced" in log.read_text()
+    assert "architecture diagram: produced" in log.read_text()
 
 
 @pytest.mark.parametrize("failure", [subprocess.TimeoutExpired("codex", 300), RuntimeError("boom"), OSError("gone")])
@@ -345,9 +346,10 @@ def test_scan_uploads_when_the_diagram_step_fails(monkeypatch, tmp_path, failure
     log = tmp_path / "scan.log"
     assert onboarding.scan(log, PR_URL, repo, "codex") == 0
     assert len(uploads) == 1 and "overview.md" in uploads[0]
-    assert not any(name.endswith("architecture.json") for name in uploads[0])
+    # A crashed or timed-out model run falls through to the deterministic diagram.
+    assert "generated_artifacts/architecture.json" in uploads[0]
     assert "summary mode: llm)" in log.read_text()
-    assert "architecture diagram: not produced" in log.read_text()
+    assert "architecture diagram: produced" in log.read_text()
 
 
 def test_scan_survives_the_diagram_step_raising_and_drops_a_stale_diagram(monkeypatch, tmp_path):
@@ -362,8 +364,156 @@ def test_scan_survives_the_diagram_step_raising_and_drops_a_stale_diagram(monkey
     monkeypatch.setattr(onboarding, "write_architecture", explode)
     log = tmp_path / "scan.log"
     assert onboarding.scan(log, PR_URL, repo, "codex") == 0
-    assert not any(name.endswith("architecture.json") for name in uploads[0])
     assert "architecture unavailable (KeyError" in log.read_text()
+    # The stale diagram is gone; the deterministic one replaced it.
+    document = json.loads((artifacts / "generated_artifacts" / "architecture.json").read_text())
+    assert document["schema_version"] == 1 and document["nodes"]
+    assert "generated_artifacts/architecture.json" in uploads[0]
+
+
+def architecture_status(artifacts):
+    return json.loads((artifacts / "diagnostics" / "architecture-status.json").read_text())
+
+
+def uploaded_architecture(artifacts):
+    """The ZIP's root generated_artifacts/architecture.json, as the backend reads it."""
+    with zipfile.ZipFile(artifacts.with_suffix(".zip")) as archive:
+        return json.loads(archive.read("generated_artifacts/architecture.json"))
+
+
+def llm_diagram():
+    evidence = [{"type": "diff", "path": "handler.py", "start": 10, "end": 12}]
+    return {"schema_version": 1, "head_sha": HEAD, "title": "Retry", "description": "Retries requests.",
+            "nodes": [{"id": "handler", "label": "Handler", "kind": "service", "layer": 0, "change": "modified",
+                       "description": "Retries.", "files": ["handler.py"], "episode_ids": [], "evidence": evidence}],
+            "edges": [], "flows": [], "gaps": []}
+
+
+def test_scan_uploads_a_deterministic_diagram_when_the_model_fails_validation_twice(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    answers = iter([VALID_SUMMARY, "garbage", '{"schema_version": 1}'])
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: next(answers))
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    document = uploaded_architecture(artifacts)
+    assert document["head_sha"] == HEAD and document["title"] == "Retry requests"
+    assert [node["files"] for node in document["nodes"]] == [["handler.py"]]
+    assert document["gaps"][-1].startswith("Generated deterministically")
+    assert "generated_artifacts/architecture.json" in uploads[0]
+    assert not any("diagnostics" in name for name in uploads[0])
+    assert architecture_status(artifacts) == {
+        "tier": "deterministic", "reason": "llm output failed validation", "generated_by": "deterministic",
+        "skeleton": {"files": 1, "groups": 1, "edges": 0, "routine_files": 0}}
+    assert "wrote deterministic generated_artifacts/architecture.json" in log.read_text()
+    assert "architecture diagram: produced" in log.read_text()
+
+
+@pytest.mark.parametrize("failure,reason", [
+    (subprocess.TimeoutExpired("codex", 300), "llm unavailable"), (RuntimeError("boom"), "llm unavailable"),
+])
+def test_scan_uses_the_deterministic_diagram_when_the_model_times_out_or_crashes(monkeypatch, tmp_path, failure, reason):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    answers = iter([VALID_SUMMARY])
+
+    def generate(prompt, _repo):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise failure
+
+    monkeypatch.setattr(summary_module(), "_run_codex", generate)
+    assert onboarding.scan(tmp_path / "scan.log", PR_URL, repo, "codex") == 0
+    assert uploaded_architecture(artifacts)["nodes"][0]["id"] == "root"
+    assert architecture_status(artifacts)["tier"] == "deterministic"
+    assert architecture_status(artifacts)["reason"] == reason
+
+
+def test_scan_uses_the_deterministic_diagram_when_the_model_returns_null(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    answers = iter([VALID_SUMMARY, "null"])
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: next(answers))
+    assert onboarding.scan(tmp_path / "scan.log", PR_URL, repo, "codex") == 0
+    assert uploaded_architecture(artifacts)["nodes"]
+    assert architecture_status(artifacts)["reason"] == "llm returned no diagram"
+
+
+def test_scan_keeps_the_model_diagram_and_records_the_llm_tier(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    answers = iter([VALID_SUMMARY, json.dumps(llm_diagram())])
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: next(answers))
+
+    def explode(*_args):
+        raise AssertionError("the deterministic builder must not run")
+
+    monkeypatch.setattr(sys.modules["paircli_architecture"], "deterministic_architecture", explode)
+    assert onboarding.scan(tmp_path / "scan.log", PR_URL, repo, "codex") == 0
+    assert uploaded_architecture(artifacts) == llm_diagram()
+    assert architecture_status(artifacts) == {
+        "tier": "llm", "reason": "llm diagram validated", "generated_by": "llm",
+        "skeleton": {"files": 1, "groups": 1, "edges": 0, "routine_files": 0}}
+
+
+def test_scan_gives_docs_only_changes_no_diagram_even_when_the_model_errors(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    (artifacts / "snapshot.json").write_text(json.dumps({"pr": {
+        "title": "Docs", "commits": [{"sha": HEAD}],
+        "files": [{"path": "README.md", "status": "modified", "hunks": [{"new_start": 1, "new_lines": 3}]}]}}))
+    (artifacts / "generated_artifacts").mkdir()
+    (artifacts / "generated_artifacts" / "architecture.json").write_text("{}")
+    answers = iter([VALID_SUMMARY])
+
+    def generate(prompt, _repo):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise subprocess.TimeoutExpired("codex", 300)
+
+    monkeypatch.setattr(summary_module(), "_run_codex", generate)
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert len(uploads) == 1 and "overview.md" in uploads[0]
+    assert not any(name.endswith("architecture.json") for name in uploads[0])
+    assert architecture_status(artifacts) == {
+        "tier": "none", "reason": "docs-only change", "generated_by": None,
+        "skeleton": {"files": 1, "groups": 1, "edges": 0, "routine_files": 0}}
+    assert "architecture diagram: not produced" in log.read_text()
+
+
+@pytest.mark.parametrize("target", ["deterministic_architecture", "build_skeleton"])
+def test_scan_still_uploads_when_the_deterministic_builder_raises(monkeypatch, tmp_path, target):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    (artifacts / "generated_artifacts").mkdir()
+    (artifacts / "generated_artifacts" / "architecture.json").write_text("{}")
+    answers = iter([VALID_SUMMARY, "garbage", "garbage"])
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: next(answers))
+
+    def explode(*_args):
+        raise KeyError("builder bug")
+
+    monkeypatch.setattr(sys.modules["paircli_architecture"], target, explode)
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert len(uploads) == 1 and "overview.md" in uploads[0]
+    assert not any(name.endswith("architecture.json") for name in uploads[0])
+    status = architecture_status(artifacts)
+    assert status["tier"] == "none" and "KeyError" in status["reason"] and status["generated_by"] is None
+    assert "deterministic architecture failed (KeyError" in log.read_text()
+    assert onboarding.scan_status_path(tmp_path).exists()
+    assert json.loads(onboarding.scan_status_path(tmp_path).read_text())["status"] == "complete"
+
+
+def test_scan_survives_the_fallback_step_itself_raising(monkeypatch, tmp_path):
+    repo, artifacts, uploads = fault_scan(monkeypatch, tmp_path)
+    monkeypatch.setattr(summary_module(), "_run_codex", lambda *_: "garbage")
+
+    def explode(*_args):
+        raise OSError("disk")
+
+    monkeypatch.setattr(onboarding, "write_fallback_architecture", explode)
+    log = tmp_path / "scan.log"
+    assert onboarding.scan(log, PR_URL, repo, "codex") == 0
+    assert not any(name.endswith("architecture.json") for name in uploads[0])
+    assert "architecture fallback failed (OSError" in log.read_text()
 
 
 def test_scan_uploads_when_both_summary_and_diagram_fail(monkeypatch, tmp_path):
@@ -383,7 +533,7 @@ def test_scan_uses_the_fallback_for_an_unsupported_harness(monkeypatch, tmp_path
     log = tmp_path / "scan.log"
     assert onboarding.scan(log, PR_URL, repo, "other") == 0
     assert len(uploads) == 1
-    assert "summary mode: fallback" in log.read_text() and "architecture diagram: not produced" in log.read_text()
+    assert "summary mode: fallback" in log.read_text() and "architecture diagram: produced" in log.read_text()
 
 
 def test_scan_reports_a_produced_diagram(monkeypatch, tmp_path):

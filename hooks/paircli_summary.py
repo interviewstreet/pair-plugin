@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from paircli_architecture import save_atomic
+from paircli_skeleton import LOCK_FILES
 from paircli_snapshot import captured_pr, no_line_data_note, snapshot_binds_head
 
 
@@ -39,10 +40,6 @@ SENSITIVE_WORDS = (
     "auth", "secret", "token", "migration", "schema", "config", ".env", "workflow",
     "dockerfile", "permission",
 )
-LOCK_FILES = {
-    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "cargo.lock", "go.sum",
-    "uv.lock", "gemfile.lock", "composer.lock", "pipfile.lock",
-}
 
 
 class SummaryValidationError(RuntimeError):

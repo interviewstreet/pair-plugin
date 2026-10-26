@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from paircli_skeleton import build_skeleton, deterministic_architecture, skeleton_stats
 from paircli_snapshot import no_line_data_note, snapshot_binds_head
 
 MAX_BYTES = 512 * 1024
@@ -26,6 +27,7 @@ EVIDENCE_KEYS = {"type", "path", "start", "end"}
 MAX_REPORTED_ERRORS = 50
 RAW_OUTPUT = "architecture-raw.txt"
 ERRORS_OUTPUT = "architecture-errors.json"
+STATUS_OUTPUT = "architecture-status.json"
 # After a retry, the first attempt's files keep what the model got wrong at first.
 FIRST_RAW_OUTPUT = "architecture-raw-1.txt"
 FIRST_ERRORS_OUTPUT = "architecture-errors-1.json"
@@ -243,6 +245,24 @@ def save_atomic(folder: Path, name: str, content: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def save_architecture(artifact_dir: Path, document: dict) -> Path:
+    """Atomically write generated_artifacts/architecture.json, refusing symlinked folders or files."""
+    folder = artifact_dir / "generated_artifacts"
+    require(not folder.is_symlink() and not (folder / "architecture.json").is_symlink())
+    save_atomic(folder, "architecture.json", json.dumps(document, ensure_ascii=False))
+    return folder / "architecture.json"
+
+
+def remove_stale_architecture(artifact_dir: Path) -> None:
+    """An older diagram must not be uploaded as if it described this run."""
+    folder = artifact_dir / "generated_artifacts"
+    try:
+        if not folder.is_symlink():
+            (folder / "architecture.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def parse_architecture(raw: str, head: str, snapshot: dict, log):
     """Return the validated diagram, None for an explicit null, or raise ArchitectureError."""
     if len(raw.encode("utf-8")) > MAX_BYTES:
@@ -326,7 +346,7 @@ Fix them and return the corrected full JSON object only, or null if no supported
         if document is None:
             log.write("architecture skipped: no supported runtime diagram\n")
             return None
-        save_atomic(folder, "architecture.json", json.dumps(document, ensure_ascii=False))
+        save_architecture(artifact_dir, document)
         log.write("wrote validated generated_artifacts/architecture.json\n")
         return target
     except ArchitectureError as error:
@@ -339,3 +359,77 @@ Fix them and return the corrected full JSON object only, or null if no supported
     except (ValueError, KeyError, TypeError, AttributeError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         log.write(f"architecture unavailable ({type(error).__name__}); keeping Markdown summary\n")
         return None
+
+
+def llm_failure_reason(artifact_dir: Path) -> str:
+    """A short reason for a missing LLM diagram, read from what write_architecture left in diagnostics."""
+    diagnostics = artifact_dir / "diagnostics"
+    try:
+        if (diagnostics / ERRORS_OUTPUT).is_file():
+            return "llm output failed validation"
+        if (diagnostics / RAW_OUTPUT).is_file():
+            return "llm returned no diagram"
+    except OSError:
+        pass
+    return "llm unavailable"
+
+
+def record_architecture_status(artifact_dir: Path, tier: str, reason: str, skeleton: dict | None, log) -> None:
+    """Record which tier produced the diagram, beside the other diagnostics (never in the ZIP)."""
+    status = {
+        "tier": tier, "reason": reason, "generated_by": tier if tier != "none" else None,
+        "skeleton": skeleton_stats(skeleton) if skeleton is not None else None,
+    }
+    try:
+        save_atomic(artifact_dir / "diagnostics", STATUS_OUTPUT, json.dumps(status, indent=2))
+    except (OSError, ValueError) as error:
+        log.write(f"architecture status not saved ({type(error).__name__})\n")
+
+
+def record_llm_diagram(artifact_dir: Path, log) -> None:
+    """Status for a diagram the model produced; the skeleton counts are best effort."""
+    skeleton = None
+    try:
+        snapshot = json.loads((artifact_dir / "snapshot.json").read_text(encoding="utf-8"))
+        skeleton = build_skeleton(snapshot, artifact_dir.name)
+    except Exception:
+        pass
+    record_architecture_status(artifact_dir, "llm", "llm diagram validated", skeleton, log)
+
+
+def write_fallback_architecture(artifact_dir: Path, reason: str, log) -> Path | None:
+    """Second rung: a validated diagram built from file structure and imports, or none at all.
+
+    Docs-only changes get no diagram. Any failure here is logged and recorded as tier "none"; it
+    never reaches the caller, and no older diagram is left behind when nothing is written.
+    """
+    remove_stale_architecture(artifact_dir)
+    skeleton = None
+    try:
+        head = artifact_dir.name
+        snapshot = json.loads((artifact_dir / "snapshot.json").read_text(encoding="utf-8"))
+        skeleton = build_skeleton(snapshot, head)
+        if skeleton["docs_only"]:
+            record_architecture_status(artifact_dir, "none", "docs-only change", skeleton, log)
+            log.write("architecture skipped: docs-only change\n")
+            return None
+        document = deterministic_architecture(skeleton, head, snapshot)
+        if document is None:
+            why = "no citable lines" if skeleton["no_citable_lines"] else "nothing to draw"
+            record_architecture_status(artifact_dir, "none", why, skeleton, log)
+            log.write(f"architecture skipped: {why}\n")
+            return None
+        validate_architecture(document, head, snapshot)
+        require(len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= MAX_BYTES)
+        path = save_architecture(artifact_dir, document)
+    except Exception as error:
+        detail = describe(error.errors) if isinstance(error, ArchitectureError) else str(error)[:200]
+        log.write(f"deterministic architecture failed ({type(error).__name__}: {detail}); no diagram\n")
+        record_architecture_status(artifact_dir, "none", f"deterministic diagram failed: {type(error).__name__}",
+                                   skeleton, log)
+        remove_stale_architecture(artifact_dir)
+        return None
+    record_architecture_status(artifact_dir, "deterministic", reason, skeleton, log)
+    log.write(f"wrote deterministic generated_artifacts/architecture.json ({reason}; "
+              f"{len(document['nodes'])} nodes, {len(document['edges'])} edges)\n")
+    return path

@@ -21,7 +21,10 @@ from urllib.request import Request, urlopen
 
 from pair_notification import notify_scan_result
 from paircli_archive import create_pr_archive
-from paircli_architecture import write_architecture
+from paircli_architecture import (
+    llm_failure_reason, record_llm_diagram, remove_stale_architecture, write_architecture,
+    write_fallback_architecture,
+)
 from paircli_summary import (
     EvidenceMissingError, STATUS_OUTPUT, agent_runner, write_fallback_summary, write_summary,
 )
@@ -851,19 +854,24 @@ def summary_mode(artifact_dir: Path) -> str:
 
 
 def run_diagram_step(harness: str, repo_dir: Path, artifact_dir: Path, log) -> Path | None:
-    """Try the architecture diagram after the summary; nothing here may fail the scan."""
+    """Try the model's diagram, then a deterministic one; nothing here may fail the scan."""
+    reason = ""
     try:
         generate = agent_runner(harness)
-        return write_architecture(artifact_dir, lambda prompt: generate(prompt, repo_dir), log)
+        diagram = write_architecture(artifact_dir, lambda prompt: generate(prompt, repo_dir), log)
+        if diagram:
+            record_llm_diagram(artifact_dir, log)
+            return diagram
+        reason = llm_failure_reason(artifact_dir)
     except Exception as error:
-        log.write(f"architecture unavailable ({type(error).__name__}: {error}); continuing without a diagram\n")
-        try:
-            # An older diagram must not be uploaded as if it described this run.
-            stale = artifact_dir / "generated_artifacts" / "architecture.json"
-            if not stale.parent.is_symlink():
-                stale.unlink(missing_ok=True)
-        except OSError:
-            pass
+        log.write(f"architecture unavailable ({type(error).__name__}: {error}); continuing without an LLM diagram\n")
+        reason = f"llm error: {type(error).__name__}"
+        remove_stale_architecture(artifact_dir)
+    try:
+        return write_fallback_architecture(artifact_dir, reason, log)
+    except Exception as error:
+        log.write(f"architecture fallback failed ({type(error).__name__}: {error}); continuing without a diagram\n")
+        remove_stale_architecture(artifact_dir)
         return None
 
 
