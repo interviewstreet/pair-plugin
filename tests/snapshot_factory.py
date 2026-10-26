@@ -76,3 +76,46 @@ def many_files(count: int, directories: list[str] | None = None, lines: int = 6,
                   added=source_lines(lines), removed=source_lines(1, "old"), start=1 + index % 3)
         for index in range(count)
     ]
+
+
+# --- repeated-change PRs (pattern rows) ---------------------------------------------------------
+
+def deleted_templates(count: int, directory: str = "src/legacy/templates") -> list[dict]:
+    """`count` deleted files that differ only in digits, so they share one change signature."""
+    return [
+        make_file(f"{directory}/t{index}.ts", "deleted", start=1,
+                  removed=[f"// template {index}", "export function render() {", f"  return '<div id=\"t{index}\"/>';", "}"])
+        for index in range(count)
+    ]
+
+
+def deletion_heavy_pr(templates: int = 40, features: int = 9) -> list[dict]:
+    """Template deletions, an index that stopped re-exporting them, and features that drop one shared import."""
+    index = make_file("src/legacy/index.ts", added=["export const ready = true;"],
+                      removed=[f"export * from './templates/t{number}';" for number in range(templates)])
+    users = [
+        make_file(f"src/features/f{number}.ts", start=1, added=["// no legacy"],
+                  removed=["import { render } from '../legacy/index';"])
+        for number in range(features)
+    ]
+    return deleted_templates(templates) + [index] + users
+
+
+def version_bumps(count: int, directory: str = "packages") -> list[dict]:
+    """`count` package.json files with the same version-line change (digits aside)."""
+    return [
+        make_file(f"{directory}/pkg{index}/package.json", start=3,
+                  removed=['  "version": "1.2.3",'], added=['  "version": "1.3.0",'])
+        for index in range(count)
+    ]
+
+
+def repeated_edits(count: int, variants: int = 3, directory: str = "src/modules") -> list[dict]:
+    """`count` modified files that each get one of `variants` distinct edits, whatever their number."""
+    names = ["Logger", "Tracer", "Meter", "Clock", "Cache"]
+    return [
+        make_file(f"{directory}/area{index % 8}/mod{index}.ts", start=2,
+                  removed=[f"import {{ log }} from '{names[index % variants]}';  // v1"],
+                  added=[f"import {{ log }} from '{names[index % variants]}2';  // v{index}"])
+        for index in range(count)
+    ]

@@ -1719,3 +1719,67 @@ def test_large_snapshot_prompts_stay_small_and_the_document_is_valid(tmp_path):
     assert result["stats"]["groups_selected"] == 8
     assert all(len(call["prompt"].encode()) < 12 * 1024 for call in stub.calls)
     assert all("const value" not in call["prompt"] for call in stub.calls)
+
+
+# --- patches on pattern rows (a real deterministic draft) -----------------------------------
+
+def real_pattern_world():
+    from paircli_architecture_v2_draft import deterministic_v2_draft
+    from paircli_skeleton import build_skeleton
+    from snapshot_factory import deletion_heavy_pr
+    snapshot = make_snapshot(deletion_heavy_pr(templates=12, features=5))
+    draft = deterministic_v2_draft(build_skeleton(snapshot, HEAD), snapshot, HEAD)
+    row = next(node for node in draft["nodes"] if node["kind"] == "pattern" and node["pattern"]["count"] == 12)
+    return snapshot, draft, row
+
+
+def test_a_patch_edits_the_text_of_a_pattern_row_but_never_its_structure():
+    snapshot, draft, row = real_pattern_world()
+    before = copy.deepcopy(row)
+    patch = {"rows": [{"id": row["id"], "label": "Legacy templates removed",
+                       "description": "The template engine no longer ships its built-in templates.",
+                       "kind": "service", "pattern": {"family": "docs", "count": 3, "members": []},
+                       "files": ["src/legacy/index.ts"], "evidence": [], "stats": {"files": 1}}]}
+    combined, warnings = llm.apply_group_patch(draft, row["group"], patch, HEAD, snapshot)
+    edited = next(node for node in combined["nodes"] if node["id"] == row["id"])
+    assert edited["label"] == "Legacy templates removed" and edited["description"].startswith("The template engine")
+    for key in ("kind", "pattern", "files", "evidence"):
+        assert edited[key] == before[key]
+    assert "stats" not in edited
+    assert any("kind: pattern rows keep kind pattern" in warning for warning in warnings)
+    for key in ("pattern", "files", "evidence", "stats"):
+        assert any(f".{key}: not editable; ignored" in warning for warning in warnings)
+    document, finalize_warnings = finalize_v2(combined, HEAD, snapshot, "llm")
+    assert finalize_warnings == [] and validate_v2(document, HEAD, snapshot) is None
+    shown = next(node for node in document["nodes"] if node["id"] == row["id"])
+    assert shown["stats"]["files"] == 12 and shown["label"] == "Legacy templates removed"
+
+
+def test_no_row_can_become_a_pattern_row_through_a_patch():
+    snapshot, draft, row = real_pattern_world()
+    file_row = next(node for node in draft["nodes"] if node["kind"] == "file")
+    combined, warnings = llm.apply_group_patch(
+        draft, file_row["group"], {"rows": [{"id": file_row["id"], "kind": "pattern", "label": "Renamed"}]},
+        HEAD, snapshot)
+    changed = next(node for node in combined["nodes"] if node["id"] == file_row["id"])
+    assert changed["kind"] == "file" and changed["label"] == "Renamed" and "pattern" not in changed
+    assert any("others cannot become pattern" in warning for warning in warnings)
+
+
+def test_group_cache_keys_change_when_pattern_membership_signature_or_family_changes():
+    snapshot, draft, row = real_pattern_world()
+    key = lambda doc: llm.group_cache_key(doc, row["group"], snapshot, "harness", "model")  # noqa: E731
+    assert key(draft) == key(copy.deepcopy(draft))
+    smaller = copy.deepcopy(draft)
+    target = next(node for node in smaller["nodes"] if node["id"] == row["id"])
+    target["pattern"]["members"].pop()
+    target["pattern"]["count"] -= 1
+    assert key(smaller) != key(draft), "a member left the pattern"
+    for field, value in (("signature", "f" * 16), ("family", "docs")):
+        other = copy.deepcopy(draft)
+        next(node for node in other["nodes"] if node["id"] == row["id"])["pattern"][field] = value
+        assert key(other) != key(draft), field
+    swapped = copy.deepcopy(draft)
+    members = next(node for node in swapped["nodes"] if node["id"] == row["id"])["pattern"]["members"]
+    members[-1] = "src/legacy/templates/elsewhere.ts"
+    assert key(swapped) != key(draft), "same count, different member"

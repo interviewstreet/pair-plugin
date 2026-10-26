@@ -134,13 +134,13 @@ def test_golden_computed_fields():
     document = valid()
     nodes = {item["id"]: item for item in document["nodes"]}
     assert {name: (item["change"], item["state"], item["stats"]) for name, item in nodes.items()} == {
-        "reviews-ts": ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1}),
-        "session-ts": ("added", "changed", {"files": 1, "additions": 5, "deletions": 0}),
-        "store-ts": ("modified", "changed", {"files": 1, "additions": 1, "deletions": 0}),
-        "legacy-sql": ("removed", "changed", {"files": 1, "additions": 0, "deletions": 4}),
-        "pg": ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0}),
-        "tooling": ("unchanged", "routine", {"files": 0, "additions": 0, "deletions": 0}),
-        "names-ts": ("modified", "changed", {"files": 1, "additions": 1, "deletions": 1}),
+        "reviews-ts": ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1, "api_added": 0, "api_removed": 0}),
+        "session-ts": ("added", "changed", {"files": 1, "additions": 5, "deletions": 0, "api_added": 0, "api_removed": 0}),
+        "store-ts": ("modified", "changed", {"files": 1, "additions": 1, "deletions": 0, "api_added": 0, "api_removed": 0}),
+        "legacy-sql": ("removed", "changed", {"files": 1, "additions": 0, "deletions": 4, "api_added": 0, "api_removed": 0}),
+        "pg": ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0}),
+        "tooling": ("unchanged", "routine", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0}),
+        "names-ts": ("modified", "changed", {"files": 1, "additions": 1, "deletions": 1, "api_added": 0, "api_removed": 0}),
     }
     assert {item["id"]: item["change"] for item in document["edges"]} == {
         "e1": "modified", "e2": "removed", "e3": "added", "e4": "modified", "e5": "unchanged"}
@@ -255,7 +255,7 @@ def test_model_supplied_computed_values_are_overwritten():
     source = draft()
     source.update({"schema_version": 9, "head_sha": OTHER_HEAD, "generated_by": "deterministic"})
     source["groups"][0].update({"path": "nope", "column": 5, "order": 9})
-    source["nodes"][0].update({"change": "removed", "state": "context", "stats": {"files": 9, "additions": 9, "deletions": 9}})
+    source["nodes"][0].update({"change": "removed", "state": "context", "stats": {"files": 9, "additions": 9, "deletions": 9, "api_added": 0, "api_removed": 0}})
     source["edges"][0]["change"] = "added"
     source["steps"][0]["flags"] = ["x"]
     expected = valid()
@@ -292,20 +292,20 @@ def test_enrich_does_not_crash_on_malformed_drafts(malformed):
 
 
 @pytest.mark.parametrize("name, files, kind, expected", [
-    ("added", [SESSION], "service", ("added", "changed", {"files": 1, "additions": 5, "deletions": 0})),
-    ("added file kind", [SESSION], "file", ("added", "changed", {"files": 1, "additions": 5, "deletions": 0})),
-    ("removed", [LEGACY], "database", ("removed", "changed", {"files": 1, "additions": 0, "deletions": 4})),
-    ("modified", [REVIEWS], "service", ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1})),
-    ("renamed", [NAMES], "file", ("modified", "changed", {"files": 1, "additions": 1, "deletions": 1})),
-    ("added and deleted", [SESSION, LEGACY], "file", ("modified", "changed", {"files": 2, "additions": 5, "deletions": 4})),
-    ("added and modified", [SESSION, STORE], "file", ("modified", "changed", {"files": 2, "additions": 6, "deletions": 0})),
-    ("hunk-less file", ["docs/notes.md"], "file", ("modified", "changed", {"files": 1, "additions": 0, "deletions": 0})),
-    ("unchanged context", [], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0})),
-    ("unchanged routine", [], "routine", ("unchanged", "routine", {"files": 0, "additions": 0, "deletions": 0})),
+    ("added", [SESSION], "service", ("added", "changed", {"files": 1, "additions": 5, "deletions": 0, "api_added": 0, "api_removed": 0})),
+    ("added file kind", [SESSION], "file", ("added", "changed", {"files": 1, "additions": 5, "deletions": 0, "api_added": 0, "api_removed": 0})),
+    ("removed", [LEGACY], "database", ("removed", "changed", {"files": 1, "additions": 0, "deletions": 4, "api_added": 0, "api_removed": 0})),
+    ("modified", [REVIEWS], "service", ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1, "api_added": 0, "api_removed": 0})),
+    ("renamed", [NAMES], "file", ("modified", "changed", {"files": 1, "additions": 1, "deletions": 1, "api_added": 0, "api_removed": 0})),
+    ("added and deleted", [SESSION, LEGACY], "file", ("modified", "changed", {"files": 2, "additions": 5, "deletions": 4, "api_added": 0, "api_removed": 0})),
+    ("added and modified", [SESSION, STORE], "file", ("modified", "changed", {"files": 2, "additions": 6, "deletions": 0, "api_added": 0, "api_removed": 0})),
+    ("hunk-less file", ["docs/notes.md"], "file", ("modified", "changed", {"files": 1, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0})),
+    ("unchanged context", [], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0})),
+    ("unchanged routine", [], "routine", ("unchanged", "routine", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0})),
     # A routine row is collapsed in the view even when its files changed.
-    ("changed routine", ["package-lock.json"], "routine", ("modified", "routine", {"files": 1, "additions": 1, "deletions": 0})),
-    ("file outside the PR is ignored", ["elsewhere.ts"], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0})),
-    ("repeated file counts once", [REVIEWS, REVIEWS], "service", ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1})),
+    ("changed routine", ["package-lock.json"], "routine", ("modified", "routine", {"files": 1, "additions": 1, "deletions": 0, "api_added": 0, "api_removed": 0})),
+    ("file outside the PR is ignored", ["elsewhere.ts"], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0})),
+    ("repeated file counts once", [REVIEWS, REVIEWS], "service", ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1, "api_added": 0, "api_removed": 0})),
 ])
 def test_node_change_state_and_stats(name, files, kind, expected):
     source = {"nodes": [node("n", "g", kind, files)]}
@@ -907,3 +907,160 @@ def test_drop_invalid_steps_drops_a_wrong_side_step_with_the_reason():
     assert [entry["id"] for entry in dropped] == ["s1", "s2"]
     assert any("must cite old-side lines" in error["reason"] for error in dropped[0]["errors"])
     assert kept["steps"] == []
+
+
+# --- pattern rows and API stats -------------------------------------------------------------
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paircli_architecture_v2_draft import deterministic_v2_draft  # noqa: E402
+from paircli_skeleton import build_skeleton  # noqa: E402
+from snapshot_factory import deleted_templates, make_file, make_snapshot, source_lines  # noqa: E402
+
+
+def pattern_world():
+    """A real draft with a same-change row (4 deleted files) and a tests row, finalized and valid."""
+    files = deleted_templates(4, "src/legacy/templates") + [
+        make_file("src/legacy/index.ts", added=["export const ready = true;", "export function boot() {}"],
+                  removed=[f"export * from './templates/t{number}';" for number in range(4)]),
+        make_file("src/app/service.ts", added=source_lines(3)),
+    ] + [make_file(f"src/app/__tests__/c{number}.test.ts", added=[f"it('{'xyz'[number]}', () => {{}});"]) for number in range(3)]
+    snap = make_snapshot(files, head=HEAD)
+    draft = deterministic_v2_draft(build_skeleton(snap, HEAD), snap, HEAD)
+    document, warnings = finalize_v2(draft, HEAD, snap, "deterministic")
+    assert warnings == []
+    return document, snap
+
+
+def pattern_index(document, family):
+    return next(position for position, node in enumerate(document["nodes"])
+                if node["kind"] == "pattern" and node["pattern"]["family"] == family)
+
+
+def pattern_errors(mutate):
+    document, snap = pattern_world()
+    mutate(document)
+    with pytest.raises(ArchitectureError) as caught:
+        validate_v2(document, HEAD, snap)
+    return [(error["path"], error["reason"]) for error in caught.value.errors]
+
+
+def test_a_pattern_document_is_valid_and_its_computed_fields_cover_all_members():
+    document, snap = pattern_world()
+    assert validate_v2(document, HEAD, snap) is None
+    node = document["nodes"][pattern_index(document, "same-change")]
+    assert list(node) == ["id", "label", "group", "kind", "description", "files", "evidence", "pattern",
+                          "change", "state", "stats"]
+    assert (node["change"], node["state"]) == ("removed", "changed")
+    assert node["stats"] == {"files": 4, "additions": 0, "deletions": 16, "api_added": 0, "api_removed": 4}
+    tests = document["nodes"][pattern_index(document, "tests")]
+    assert tests["change"] == "modified" and tests["stats"]["files"] == 3 and "signature" not in tests["pattern"]
+
+
+def test_api_stats_are_computed_for_every_node_and_summed_over_pattern_members():
+    document, _ = pattern_world()
+    index = next(node for node in document["nodes"] if node["files"] == ["src/legacy/index.ts"])
+    assert (index["stats"]["api_added"], index["stats"]["api_removed"]) == (2, 1)
+
+
+def test_older_documents_without_api_fields_are_recomputed_by_enrich():
+    document, snap = pattern_world()
+    for node in document["nodes"]:
+        node["stats"] = {key: node["stats"][key] for key in ("files", "additions", "deletions")}
+    with pytest.raises(ArchitectureError):
+        validate_v2(document, HEAD, snap)
+    again, warnings = finalize_v2(document, HEAD, snap, "deterministic")
+    assert warnings == [] and all("api_added" in node["stats"] for node in again["nodes"])
+
+
+PATTERN_FAULTS = [
+    ("signature mismatch", lambda d: d["nodes"][pattern_index(d, "same-change")]["pattern"].update(signature="0" * 16),
+     "pattern.members["),
+    ("signature missing", lambda d: d["nodes"][pattern_index(d, "same-change")]["pattern"].pop("signature"),
+     "pattern.signature"),
+    ("wrong category", lambda d: d["nodes"][pattern_index(d, "tests")]["pattern"]["members"].__setitem__(
+        0, "src/app/service.ts"), "pattern.members[0]"),
+    ("count mismatch", lambda d: d["nodes"][pattern_index(d, "same-change")]["pattern"].update(count=5),
+     "pattern.count"),
+    ("too few members", lambda d: d["nodes"][pattern_index(d, "tests")]["pattern"].update(
+        members=d["nodes"][pattern_index(d, "tests")]["pattern"]["members"][:2], count=2), "pattern.members"),
+    ("member is not a changed file", lambda d: d["nodes"][pattern_index(d, "tests")]["pattern"]["members"].__setitem__(
+        0, "src/app/ghost.test.ts"), "pattern.members[0]"),
+    ("duplicate member", lambda d: d["nodes"][pattern_index(d, "tests")]["pattern"]["members"].__setitem__(
+        1, d["nodes"][pattern_index(d, "tests")]["pattern"]["members"][0]), "pattern.members[1]"),
+    ("unknown family", lambda d: d["nodes"][pattern_index(d, "tests")]["pattern"].update(family="misc"), "pattern.family"),
+    ("signature on a category row", lambda d: d["nodes"][pattern_index(d, "tests")]["pattern"].update(signature="a" * 16),
+     "pattern.signature"),
+    ("unexpected pattern key", lambda d: d["nodes"][pattern_index(d, "tests")]["pattern"].update(extra=1),
+     "pattern.extra"),
+    ("pattern is not an object", lambda d: d["nodes"][pattern_index(d, "tests")].update(pattern="many"), "pattern"),
+    ("pattern key missing", lambda d: d["nodes"][pattern_index(d, "tests")].pop("pattern"), "pattern"),
+    ("sample is not a member", lambda d: d["nodes"][pattern_index(d, "same-change")]["files"].__setitem__(
+        0, "src/app/service.ts"), "files[0]"),
+    ("uncited sample", lambda d: d["nodes"][pattern_index(d, "same-change")]["evidence"].clear(), "files[0]"),
+    ("more than 12 samples", lambda d: d["nodes"][pattern_index(d, "same-change")]["files"].extend(
+        f"x{number}.ts" for number in range(10)), "files"),
+    ("stats files edited", lambda d: d["nodes"][pattern_index(d, "same-change")]["stats"].update(files=1), "stats"),
+    ("api_added edited", lambda d: d["nodes"][0]["stats"].update(api_added=99), "nodes[0].stats"),
+    ("api_removed missing", lambda d: d["nodes"][0]["stats"].pop("api_removed"), "nodes[0].stats"),
+    ("change edited", lambda d: d["nodes"][pattern_index(d, "tests")].update(change="added"), "change"),
+    ("member listed in a file row", lambda d: d["nodes"].append(
+        {**copy.deepcopy(next(n for n in d["nodes"] if n["files"] == ["src/app/service.ts"])), "id": "dup",
+         "files": [d["nodes"][pattern_index(d, "tests")]["pattern"]["members"][0]]}), "files[0]"),
+    ("pattern key on a file row", lambda d: next(n for n in d["nodes"] if n["kind"] == "file").update(
+        pattern={"family": "tests", "count": 3, "members": []}), "pattern"),
+]
+
+
+@pytest.mark.parametrize("name, mutate, expected", PATTERN_FAULTS, ids=[fault[0] for fault in PATTERN_FAULTS])
+def test_validate_rejects_a_bad_pattern_row(name, mutate, expected):
+    errors = pattern_errors(mutate)
+    assert any(expected in path for path, _ in errors), errors
+
+
+def test_a_member_in_two_pattern_rows_is_rejected():
+    def share(document):
+        first = document["nodes"][pattern_index(document, "same-change")]
+        second = copy.deepcopy(document["nodes"][pattern_index(document, "tests")])
+        second["id"] = "tests-two"
+        second["pattern"]["members"][0] = first["pattern"]["members"][0]
+        document["nodes"].append(second)
+    errors = pattern_errors(share)
+    assert any("already a member of" in reason for _, reason in errors), errors
+
+
+def test_a_pattern_citation_outside_every_hunk_is_rejected():
+    errors = pattern_errors(lambda d: d["nodes"][pattern_index(d, "tests")]["evidence"].append(
+        {"type": "diff", "path": "src/app/service.ts", "start": 99, "end": 99, "side": "new"}))
+    assert any("evidence" in path for path, _ in errors)
+
+
+def test_normalize_keeps_pattern_on_pattern_rows_and_strips_it_elsewhere_with_a_warning():
+    document, _ = pattern_world()
+    row = next(position for position, node in enumerate(document["nodes"]) if node["kind"] == "file")
+    document["nodes"][row]["pattern"] = {"family": "tests", "count": 3, "members": []}
+    document["nodes"][pattern_index(document, "tests")]["pattern"]["extra"] = 1
+    cleaned, warnings = normalize_v2(document)
+    assert "pattern" not in cleaned["nodes"][row]
+    kept = cleaned["nodes"][pattern_index(document, "tests")]["pattern"]
+    assert "extra" not in kept and kept["family"] == "tests"
+    assert f"nodes[{row}].pattern: removed from a row that is not a pattern row" in warnings
+    assert f"nodes[{pattern_index(document, 'tests')}].pattern.extra: removed unexpected key" in warnings
+    assert "pattern" in document["nodes"][row], "the input is left alone"
+
+
+def test_enrich_overwrites_model_written_pattern_stats():
+    document, snap = pattern_world()
+    position = pattern_index(document, "same-change")
+    document["nodes"][position]["stats"] = {"files": 1, "additions": 9, "deletions": 9}
+    document["nodes"][position]["change"] = "added"
+    again, _ = finalize_v2(document, HEAD, snap, "llm")
+    assert again["nodes"][position]["stats"]["files"] == 4 and again["nodes"][position]["change"] == "removed"
+
+
+def test_pattern_members_with_hunkless_files_still_count_in_stats_and_status():
+    snap = make_snapshot(deleted_templates(3) + [make_file("src/legacy/templates/gone.ts", "deleted", no_hunks=True)])
+    row = {"id": "p", "label": "3 files: deleted", "group": "g", "kind": "pattern", "description": "d",
+           "files": [], "evidence": [], "pattern": {"family": "tests", "count": 3, "members": [
+               "src/legacy/templates/t0.ts", "src/legacy/templates/t1.ts", "src/legacy/templates/gone.ts"]}}
+    computed = enrich_v2({"nodes": [row]}, HEAD, snap)["nodes"][0]
+    assert computed["stats"]["files"] == 3 and computed["change"] == "removed"

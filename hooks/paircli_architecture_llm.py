@@ -243,14 +243,14 @@ def count_of(value) -> int | None:
 
 
 def api_counts(node: dict) -> dict:
-    """The `api_added` / `api_removed` numbers of a row's computed stats; absent keys stay absent."""
+    """The `api_added` / `api_removed` numbers of a row's own stats; absent keys stay absent."""
     stats = node.get("stats") if isinstance(node.get("stats"), dict) else {}
     return {key: stats[key] for key in API_KEYS if count_of(stats.get(key)) is not None}
 
 
 def row_stats(node: dict, facts: dict) -> dict:
     """Stats for the digest: computed from the snapshot, plus the draft's own pattern totals and API counts."""
-    stats = dict(facts["stats"])
+    stats = {key: value for key, value in facts["stats"].items() if key not in API_KEYS}  # the draft's own, below
     own = node.get("stats") if isinstance(node.get("stats"), dict) else {}
     pattern = node.get("pattern") if node.get("kind") == "pattern" and isinstance(node.get("pattern"), dict) else None
     if pattern is not None:
@@ -1111,8 +1111,13 @@ def group_cache_key(draft, group_id: str, snapshot, harness: str, model: str | N
     for node in dicts(draft.get("nodes")):
         if node.get("group") == group_id:
             files = [name for name in node.get("files", []) if isinstance(name, str)]
-            rows.append({"id": node.get("id"), "kind": node.get("kind"),
-                         "files": [[name, hunk_hash(index.files.get(name))] for name in files]})
+            row = {"id": node.get("id"), "kind": node.get("kind"),
+                   "files": [[name, hunk_hash(index.files.get(name))] for name in files]}
+            pattern = node.get("pattern") if node.get("kind") == "pattern" else None
+            if isinstance(pattern, dict):
+                # A pattern row stands for all its members: a changed member list must not reuse a cached patch.
+                row["pattern"] = [pattern.get("family"), pattern.get("signature"), stable_hash(pattern.get("members"))]
+            rows.append(row)
     edges = [{key: edge.get(key) for key in ("id", "source", "target", "label", "evidence")}
              for edge in candidate_edges(draft, group_id)]
     pr_hash = snapshot.get("hash") if isinstance(snapshot, dict) else None

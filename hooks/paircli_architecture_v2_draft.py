@@ -7,13 +7,20 @@ is the input of `finalize_v2(draft, head, snapshot, "deterministic")`, which fil
 `path`/`column`/`order`, then validates. Everything cited is a real hunk range or import line.
 
   groups  [{id, label}]   the best skeleton groups (12 at most); smaller ones merge into "other"
-  nodes   [{id, label, group, kind, description, files, evidence}]
-                          one `file` row per top-ranked citable file, plus one `routine` row per
-                          group that has routine files (lockfiles, generated, vendored, binary)
+  nodes   [{id, label, group, kind, description, files, evidence[, pattern]}]
+                          one `file` row per top-ranked citable file, one `pattern` row per repeated
+                          change (identical change signature) or folded tests/docs/config set that
+                          the skeleton found (its members get no file rows; `files` is a sample of
+                          up to 12 with real citations), plus one `routine` row per group that has
+                          routine files (lockfiles, generated, vendored, binary). A pattern row
+                          counts as one row of the group's budget
   edges   [{id, source, target, label, claim, evidence}]
                           file-level imports between rows, new-side and removed (old-side) ones;
                           only unambiguous ones (a Go import is a package, so no file edge
-                          unless the package has exactly one changed file)
+                          unless the package has exactly one changed file). Imports between a row
+                          and many members of one pattern collapse into one edge, labelled
+                          "imports (N)", with a computed claim and up to 3 sample citations; no edge
+                          is drawn to or from a tests/docs/config pattern row
   steps   []              narration is the model's job
   gaps    [str]           what was collapsed, left out or not citable (5 at most)
 
@@ -28,14 +35,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import posixpath
 from pathlib import Path
 
 from paircli_architecture import MAX_BYTES, require, save_atomic
 from paircli_architecture_v2 import (
-    ID_PATTERN, MAX_EDGES, MAX_FILES_PER_NODE, MAX_GAPS, MAX_GROUPS, MAX_NODES, SnapshotIndex, dicts,
+    ID_PATTERN, MAX_EDGES, MAX_FILES_PER_NODE, MAX_GAPS, MAX_GROUPS, MAX_NODES, MAX_REFS, SnapshotIndex, dicts,
 )
-from paircli_skeleton import _clean, _int, _line_kind, _plural, _slug, size_budget
+from paircli_patterns import MIN_MEMBERS, pattern_label, verify_pattern
+from paircli_skeleton import CATEGORY_PENALTY, _clean, _int, _line_kind, _plural, _slug, size_budget
 
 ARCHITECTURE_V2 = "architecture.v2.json"
 STATUS_V2 = "architecture-v2-status.json"
@@ -43,6 +52,11 @@ TIERS = ("llm", "deterministic", "none")
 
 MAX_NODE_REFS = 3        # citations per file row
 MAX_EDGE_SIDE_REFS = 3   # citations per side of an import edge
+MAX_PATTERN_SAMPLES = 12  # sample members listed (and cited) on a pattern row
+MAX_PATTERN_EDGE_REFS = 3  # sample citations on an edge that stands for several imports
+MODIFIED_SOURCE_BONUS = 1.0  # row selection: a modified source file outranks added boilerplate
+PATTERN_BONUS = 2.0
+CATEGORY_OF_FAMILY = {"tests": "test", "docs": "docs", "config": "config"}
 MAX_PATH_CHARS = 300
 MAX_GAP_CHARS = 300
 OTHER_LABEL = "Other changes"
@@ -164,6 +178,96 @@ def _describe(record: dict) -> str:
     return f"{lead}, +{additions}/-{deletions} lines."
 
 
+def _verified_patterns(raw, cite: _Citations, records: dict) -> list[dict]:
+    """The skeleton patterns of a group whose members can be cited, as the validator will recompute them.
+
+    Members that cannot be cited (no hunk range) are dropped; a pattern left with fewer than 3 members,
+    or one the validator's own check (`verify_pattern`) would reject, is skipped, so its files stay file rows.
+    """
+    result = []
+    for item in dicts(raw):
+        family = item.get("family")
+        members = sorted({path for path in item.get("members") or [] if isinstance(path, str) and path in records
+                          and cite.usable(path)})
+        if len(members) < MIN_MEMBERS:
+            continue
+        signature = item.get("signature") if family == "same-change" else None
+        candidate = {"family": family, "count": len(members), "members": members}
+        if signature is not None:
+            candidate["signature"] = signature
+        if verify_pattern(candidate, cite.index.files):
+            continue
+        statuses = {records[path]["status"] for path in members}
+        status = (next(iter(statuses)) if family == "same-change" and len(statuses) == 1
+                  else "added" if statuses == {"added"} else "deleted" if statuses == {"deleted"} else "modified")
+        result.append({
+            "family": family, "signature": signature, "members": members, "status": status,
+            "additions": sum(records[path]["additions"] for path in members),
+            "deletions": sum(records[path]["deletions"] for path in members),
+        })
+    return result
+
+
+def _pattern_priority(pattern: dict) -> float:
+    """Row-selection and ordering score: big repeated changes first; folded tests/docs/config lowest."""
+    lines = math.log1p(pattern["additions"] + pattern["deletions"])
+    if pattern["family"] == "same-change":
+        return round(lines + PATTERN_BONUS + math.log1p(len(pattern["members"])), 4)
+    return round(lines - CATEGORY_PENALTY.get(CATEGORY_OF_FAMILY.get(pattern["family"], ""), 0.0), 4)
+
+
+def _file_priority(record: dict) -> float:
+    """Row-selection score of a file: its skeleton score, plus a bonus for edited (not added) source code."""
+    bonus = MODIFIED_SOURCE_BONUS if record.get("category") == "source" and record.get("status") in ("modified", "renamed") else 0.0
+    return record.get("score", 0) + bonus
+
+
+def _describe_pattern(pattern: dict) -> str:
+    count = len(pattern["members"])
+    if pattern["family"] == "same-change":
+        status = pattern["status"]
+        change = {"deleted": "removes", "added": "adds"}.get(status)
+        what = (f"Each {change} the same lines (digits aside)." if change
+                else "Each makes the same edit (digits aside).")
+        return (f"{count} files with the same change: {status}. {what} "
+                f"Together +{pattern['additions']}/-{pattern['deletions']} lines.")
+    noun = {"tests": "test", "docs": "doc", "config": "config"}[pattern["family"]]
+    return f"{count} {noun} files changed in this area. Together +{pattern['additions']}/-{pattern['deletions']} lines."
+
+
+def _pattern_node(group_id: str, pattern: dict, records: dict, cite: _Citations, taken: set[str]) -> dict | None:
+    """One `pattern` row: the biggest members as a cited sample, every member listed in `pattern.members`."""
+    members = pattern["members"]
+    ranked = sorted(members, key=lambda path: (-(records[path]["additions"] + records[path]["deletions"]), path))
+    samples, refs = [], []
+    for path in ranked:
+        if len(samples) >= MAX_PATTERN_SAMPLES:
+            break
+        evidence = cite.evidence(path)
+        if evidence:
+            samples.append((path, evidence))
+    if not samples:
+        return None
+    # One citation per sample first, then more from the same files while the row has room.
+    for depth in range(MAX_NODE_REFS):
+        for _path, evidence in samples:
+            if len(refs) < MAX_REFS and len(evidence) > depth:
+                refs.append(evidence[depth])
+    label = pattern_label(pattern["family"], len(members), pattern["status"])
+    name = f"same-{pattern['status']}" if pattern["family"] == "same-change" else pattern["family"]
+    stem = f"{group_id[:30].rstrip('-_') or 'g'}-{name}"
+    node = {
+        "id": _identifier(f"{stem}-{_hash(pattern['family'] + chr(0) + members[0], 6)}", taken, "pattern"),
+        "label": label, "group": group_id, "kind": "pattern", "description": _describe_pattern(pattern),
+        "files": [path for path, _ in samples], "evidence": refs,
+        "pattern": {"family": pattern["family"], "count": len(members)},
+    }
+    if pattern["signature"] is not None:
+        node["pattern"]["signature"] = pattern["signature"]
+    node["pattern"]["members"] = list(members)
+    return node
+
+
 def _cap(text: str) -> str:
     return _clean(text, MAX_GAP_CHARS)
 
@@ -196,7 +300,8 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
         if other_id in {group["id"] for group in keep}:
             other_id = _identifier("other", {group["id"] for group in keep}, "other")
         eligible = keep + [{"id": other_id, "label": OTHER_LABEL, "files": paths,
-                            "merged_ids": [group["id"] for group in rest]}]
+                            "merged_ids": [group["id"] for group in rest],
+                            "patterns": [item for group in rest for item in dicts(group.get("patterns"))]}]
     routine_by_group: dict[str, list[str]] = {}
     for record in records.values():
         if record.get("routine") and isinstance(record.get("group"), str):
@@ -206,17 +311,39 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
     per_group = min(rows_per_group, max(1, MAX_NODES // count))
     group_ids: set[str] = set()
     node_ids: set[str] = set()
-    groups, nodes, row_of = [], [], {}
-    unlisted = 0
+    groups, nodes, row_of, pattern_of = [], [], {}, {}
+    unlisted = folded = 0
+    pattern_rows = 0
     for group in eligible:
         group_id = _identifier(str(group.get("id")), group_ids, "group")
         routine = sorted(path for source in group.get("merged_ids") or [group["id"]]
                          for path in routine_by_group.get(source, []))
         shown = max(1, per_group - 1) if routine else per_group
         usable = citable(group)
-        unlisted += max(0, len(usable) - shown)
+        patterns = _verified_patterns(group.get("patterns"), cite, records)
+        members = {path for pattern in patterns for path in pattern["members"]}
+        singles = [path for path in usable if path not in members]
         groups.append({"id": group_id, "label": _clean(group.get("label"), 80) or "Changes"})
-        for path in usable[:shown]:
+
+        # Rows compete for the budget: a pattern row is one row however many files it stands for.
+        # `order` is the display rank (the skeleton score order for files); `priority` decides who is cut.
+        candidates = [(_file_priority(records[path]), records[path].get("score", 0), path, None) for path in singles]
+        candidates += [(_pattern_priority(pattern), _pattern_priority(pattern), pattern["members"][0], pattern)
+                       for pattern in patterns]
+        chosen = sorted(candidates, key=lambda item: (-item[0], item[2]))[:shown]
+        unlisted += len(usable) - sum(1 if item[3] is None else len(item[3]["members"]) for item in chosen)
+        for _priority, _order, path, pattern in sorted(chosen, key=lambda item: (-item[1], item[2])):
+            if pattern is not None:
+                node = _pattern_node(group_id, pattern, records, cite, node_ids)
+                if node is None:
+                    unlisted += len(pattern["members"])
+                    continue
+                for member in pattern["members"]:
+                    pattern_of[member] = node["id"]
+                folded += len(pattern["members"])
+                pattern_rows += 1
+                nodes.append(node)
+                continue
             record = records[path]
             evidence = cite.evidence(path)
             if not evidence:
@@ -239,14 +366,16 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
                 "evidence": [],
             })
     nodes = nodes[:MAX_NODES]
-    if not any(node["kind"] == "file" for node in nodes):
+    if not any(node["kind"] in ("file", "pattern") for node in nodes):
         return None
     node_ids = {node["id"] for node in nodes}
     row_of = {path: name for path, name in row_of.items() if name in node_ids}
+    pattern_of = {path: name for path, name in pattern_of.items() if name in node_ids}
+    pattern_nodes = {node["id"]: node for node in nodes if node["kind"] == "pattern"}
     shown_groups = {node["group"] for node in nodes}
     groups = [group for group in groups if group["id"] in shown_groups]
 
-    edges = _edges(skeleton, cite, records, row_of)
+    edges = _edges(skeleton, cite, row_of, pattern_of, pattern_nodes)
 
     totals = skeleton.get("totals") if isinstance(skeleton.get("totals"), dict) else {}
     routine_total = _int(totals.get("routine_files")) or 0
@@ -255,6 +384,9 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
     if routine_total:
         gaps.append(f"{_plural(routine_total, 'routine file')} (lockfiles, generated, vendored or binary) "
                     "collapsed, not shown individually.")
+    if folded:
+        gaps.append(f"{_plural(folded, 'changed file')} folded into {_plural(pattern_rows, 'pattern row')} "
+                    "(the same change repeated, or tests, docs and config of one area).")
     if no_hunks:
         gaps.append(f"{_plural(no_hunks, 'changed file')} with no usable hunk data cannot be cited and "
                     f"{'is' if no_hunks == 1 else 'are'} not shown.")
@@ -276,35 +408,95 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
     }
 
 
-def _edges(skeleton: dict, cite: _Citations, records: dict, row_of: dict[str, str]) -> list[dict]:
-    """File-level import edges between rows, with the import lines cited on whichever side they sit."""
+def _edges(skeleton: dict, cite: _Citations, row_of: dict[str, str], pattern_of: dict[str, str],
+           pattern_nodes: dict[str, dict]) -> list[dict]:
+    """Import edges between rows, with the import lines cited on whichever side they sit.
+
+    A file row's imports of other file rows stay one edge per pair. Imports that start or end at members
+    of a pattern row collapse into one edge per pair of rows ("imports (N)", a claim counting the members
+    it covers, up to 3 sample citations). Nothing is drawn to or from a tests/docs/config pattern row.
+    """
     found: dict[tuple[str, str], dict[str, set[int]]] = {}
+    grouped: dict[tuple[str, str], dict] = {}
     for edge in dicts(skeleton.get("edges")):
         where = edge.get("cite") if isinstance(edge.get("cite"), dict) else {}
         source, target = edge.get("source_file"), edge.get("target_file")
         side, line = where.get("side"), _int(where.get("line"))
         # A package-level edge has no target file: it never becomes a file-level edge.
-        if (not isinstance(target, str) or source not in row_of or target not in row_of or source == target
+        if (not isinstance(source, str) or not isinstance(target, str) or source == target
                 or side not in ("new", "old")
                 or line is None or where.get("path") != source
                 or not any(low <= line <= high for low, high in cite.ranges(source, side))):
             continue
-        found.setdefault((source, target), {"new": set(), "old": set()})[side].add(line)
-    chosen = sorted(found, key=lambda pair: (-sum(len(lines) for lines in found[pair].values()), pair))[:MAX_EDGES]
-    taken: set[str] = set()
-    edges = []
-    for source, target in sorted(chosen):
-        sides = found[(source, target)]
+        source_row, target_row = row_of.get(source) or pattern_of.get(source), row_of.get(target) or pattern_of.get(target)
+        if source_row is None or target_row is None or source_row == target_row:
+            continue
+        if source in row_of and target in row_of:
+            found.setdefault((source, target), {"new": set(), "old": set()})[side].add(line)
+            continue
+        if any(pattern_nodes[row]["pattern"]["family"] != "same-change" for row in (source_row, target_row)
+               if row in pattern_nodes):
+            continue
+        item = grouped.setdefault((source_row, target_row), {"sources": set(), "targets": set(), "pairs": set(), "cites": set()})
+        item["sources"].add(source)
+        item["targets"].add(target)
+        item["pairs"].add((source, target))
+        item["cites"].add((source, line, side))
+
+    # (weight, sort key, edge) for every candidate; the heaviest MAX_EDGES stay, in a stable order.
+    candidates = []
+    for (source, target), sides in found.items():
         refs = [{"type": "diff", "path": cite.ref_path(source, side), "start": line, "end": line, "side": side}
                 for side in ("new", "old") for line in sorted(sides[side])[:MAX_EDGE_SIDE_REFS]]
         verb = "imports" if sides["new"] else "imported"
         names = [_clean(posixpath.basename(path), 80) or "file" for path in (source, target)]
-        edges.append({
-            "id": _identifier("e-" + _hash(source + "\0" + target, 10), taken, "e"),
+        candidates.append((sum(len(lines) for lines in sides.values()), (source, target), {
+            "id": ("e-" + _hash(source + "\0" + target, 10)),
             "source": row_of[source], "target": row_of[target], "label": "imports",
             "claim": f"{names[0]} {verb} {names[1]}.", "evidence": refs,
-        })
+        }))
+    for (source_row, target_row), item in grouped.items():
+        candidates.append((len(item["cites"]), (source_row, target_row),
+                           _collapsed_edge(source_row, target_row, item, cite, row_of, pattern_nodes)))
+    chosen = sorted(candidates, key=lambda entry: (-entry[0], entry[1]))[:MAX_EDGES]
+    taken: set[str] = set()
+    edges = []
+    for _weight, _key, edge in sorted(chosen, key=lambda entry: entry[1]):
+        edge["id"] = _identifier(edge["id"], taken, "e")
+        edges.append(edge)
     return edges
+
+
+def _collapsed_edge(source_row: str, target_row: str, item: dict, cite: _Citations, row_of: dict[str, str],
+                    pattern_nodes: dict[str, dict]) -> dict:
+    """One edge for all imports between a file row and a pattern row, or between two pattern rows."""
+    cites = sorted(item["cites"], key=lambda ref: (ref[2] != "new", ref[0], ref[1]))
+    new = [ref for ref in cites if ref[2] == "new"]
+    old = [ref for ref in cites if ref[2] == "old"]
+    # Up to 3 citations; when both sides exist, keep one removed import so the edge reads as modified.
+    picked = (new[:MAX_PATTERN_EDGE_REFS - 1] + old[:1]) if new and old else (new or old)[:MAX_PATTERN_EDGE_REFS]
+    refs = [{"type": "diff", "path": cite.ref_path(path, side), "start": line, "end": line, "side": side}
+            for path, line, side in sorted(picked, key=lambda ref: (ref[2] != "new", ref[0], ref[1]))]
+    imports = "imports" if new else "imported"
+    plural = "import" if new else "imported"
+
+    def covers(row: str, members: set) -> str:
+        pattern = pattern_nodes[row]["pattern"]
+        return f'{len(members)} of the {pattern["count"]} files in "{pattern_nodes[row]["label"]}"'
+
+    if source_row in pattern_nodes and target_row in pattern_nodes:
+        claim = f"{covers(source_row, item['sources'])} {plural} {covers(target_row, item['targets'])}."
+        count = len(item["pairs"])
+    elif target_row in pattern_nodes:
+        source = next(iter(item["sources"]))
+        claim = f"{_clean(posixpath.basename(source), 80)} {imports} {covers(target_row, item['targets'])}."
+        count = len(item["targets"])
+    else:
+        target = next(iter(item["targets"]))
+        claim = f"{covers(source_row, item['sources'])} {plural} {_clean(posixpath.basename(target), 80)}."
+        count = len(item["sources"])
+    return {"id": "e-" + _hash(source_row + "\0" + target_row, 10), "source": source_row, "target": target_row,
+            "label": f"imports ({count})", "claim": _clean(claim, 400), "evidence": refs}
 
 
 def deterministic_v2_draft(skeleton, snapshot, head) -> dict | None:

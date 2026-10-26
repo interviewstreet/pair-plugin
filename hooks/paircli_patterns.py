@@ -11,8 +11,8 @@ odd shapes; unreadable input counts as "no changed lines".
   pattern_label(family, count, ...) the short row label
   api_surface(file), api_total(fs)  lexical counts of exported names added and removed
 
-Change signature: sha256 over the file status and the sorted multiset of its added and deleted lines,
-each trimmed, with every run of ASCII digits replaced by `#`. Context lines and lines that are empty
+Change signature: sha256 over the file status and the sorted set of its distinct added and deleted lines (how often a
+line repeats is ignored), each trimmed, with every run of ASCII digits replaced by `#`. Context lines and lines that are empty
 after trimming are ignored; an add and a delete of the same text stay distinct. A file with no such
 line (binary, no hunks, whitespace-only edits) has no signature.
 
@@ -117,7 +117,7 @@ def change_signature(file) -> str | None:
                 lines.append(("+" if kind == "add" else "-") + DIGITS.sub("#", text))
         if not lines:
             return None
-        lines.sort()
+        lines = sorted(set(lines))
         payload = json.dumps([_text(file.get("status")), lines], ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:SIGNATURE_CHARS]
     except Exception:  # noqa: BLE001 - odd input must never break a diagram

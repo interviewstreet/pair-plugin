@@ -16,7 +16,7 @@ from paircli_architecture_llm import generate_v2
 from paircli_architecture_v2 import finalize_v2, validate_v2
 from paircli_architecture_v2_draft import deterministic_v2_draft
 from paircli_skeleton import build_skeleton
-from snapshot_factory import HEAD, make_file, make_snapshot, source_lines
+from snapshot_factory import HEAD, deletion_heavy_pr, make_file, make_snapshot, source_lines
 
 PR_URL = "https://github.com/acme/repo/pull/42"
 V2 = "generated_artifacts/architecture.v2.json"
@@ -423,3 +423,44 @@ def test_end_to_end_with_the_real_draft_and_generate_v2_and_a_stubbed_model(tmp_
     assert result["stats"]["merge"] == "ok" and result["stats"]["groups_llm_ok"] >= 1
     assert {node["id"] for node in document["nodes"]} == {node["id"] for node in deterministic["nodes"]}
     assert document["title"] == "A story about the change"
+
+
+def test_a_deletion_heavy_scan_uploads_a_short_valid_v2_with_pattern_rows(monkeypatch, tmp_path):
+    snapshot = make_snapshot(deletion_heavy_pr(templates=40, features=9))
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path, snapshot=snapshot)
+    run_scan(tmp_path, repo)
+    document = uploaded_v2(uploads)
+    assert_valid(document, snapshot)
+    kinds = sorted(node["kind"] for node in document["nodes"])
+    assert kinds == ["file", "pattern", "pattern"] and len(document["edges"]) == 2
+    assert sorted(node["pattern"]["count"] for node in document["nodes"] if node["kind"] == "pattern") == [9, 40]
+    labels = {node["label"] for node in document["nodes"] if node["kind"] == "pattern"}
+    assert all(label.startswith("LLM ") or label in {"40 files: deleted", "9 files: same edit"} for label in labels)
+    assert status_of(artifacts)["counts"]["nodes"] == 3
+
+
+def test_the_llm_narrates_pattern_rows_without_changing_their_members(tmp_path):
+    snapshot = make_snapshot(deletion_heavy_pr(templates=12, features=5))
+    artifacts = tmp_path / ".paircli" / "pr-42" / HEAD
+    artifacts.mkdir(parents=True)
+    skeleton = build_skeleton(snapshot, HEAD)
+    draft = deterministic_v2_draft(skeleton, snapshot, HEAD)
+    before = {node["id"]: node["pattern"] for node in draft["nodes"] if node["kind"] == "pattern"}
+    assert len(before) == 2
+
+    def generate(prompt, *, timeout, model):
+        kind = "group" if GROUP_PROMPT in prompt else "merge"
+        if kind == "group":
+            digest = digest_of(prompt)
+            row = next((row for row in digest["rows"] if row["kind"] == "pattern"), digest["rows"][0])
+            return json.dumps({"rows": [{"id": row["id"], "label": "LLM " + row["label"][:60],
+                                         "description": "Rewritten by the model.", "kind": "service"}]})
+        return Agent.answer(kind, prompt)
+
+    result = generate_v2(artifacts, snapshot, HEAD, draft, generate, io.StringIO(), harness="codex",
+                         skeleton=skeleton, min_call_seconds=0)
+    document = result["document"]
+    validate_v2(document, HEAD, snapshot)
+    after = {node["id"]: node["pattern"] for node in document["nodes"] if node["kind"] == "pattern"}
+    assert after == before
+    assert any(node["label"].startswith("LLM ") and node["kind"] == "pattern" for node in document["nodes"])

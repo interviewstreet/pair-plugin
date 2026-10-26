@@ -13,7 +13,9 @@ is no model, no network and no repository read, and the same input always gives 
                         exists), score, group (group id; None for routine files with no group)
   groups                directory clusters, best first (score desc, path asc): id, label, path,
                         files (non-routine paths, ranked), routine_count, additions, deletions
-                        (non-routine files only), sensitive, change, score, citable_files
+                        (non-routine files only), sensitive, change, score, citable_files,
+                        patterns (repeated changes folded into one row each, see below)
+                        Each file record also has `in_pattern` (it is a member of a group pattern).
   routine_unassigned    routine files that belong to no group
   edges                 candidate import edges between changed files, every one read from an
                         import line in a hunk: source_file, target_file, source_group,
@@ -27,6 +29,14 @@ is no model, no network and no repository read, and the same input always gives 
   budget                size_budget() for this PR (non-routine files and changed lines)
   docs_only             no files, or every non-routine file is documentation (and one exists)
   no_citable_lines      no file has a new-side hunk line to cite
+
+Patterns: within each group (never across groups) the non-routine files with line data are clustered
+by `paircli_patterns.cluster_same_change` (identical change signature, 3 or more files). Then, from the
+files not already in a cluster, a group with at least 3 `test`, `docs` or `config` files gets one folded
+pattern per category (`category_members`). A group's `patterns` list holds, in that order,
+`{family, signature (None unless same-change), members (sorted paths), count, additions, deletions,
+status}`; `status` is the shared file status of a same-change pattern, else added or deleted when every
+member is, else modified. A path belongs to at most one pattern.
 
 `deterministic_architecture(skeleton, head, snapshot)` turns that into an ADE v1 document, or
 returns None when nothing can be cited.
@@ -495,13 +505,56 @@ def _dominant_penalty(records: list[dict]) -> float:
     return CATEGORY_PENALTY.get(category, 0.0)
 
 
+PATTERN_FAMILIES = ("tests", "docs", "config")  # folded by category, in this order
+
+
+def _pattern_status(statuses: set[str]) -> str:
+    if statuses == {"added"}:
+        return "added"
+    if statuses == {"deleted"}:
+        return "deleted"
+    return "modified"
+
+
+def _group_patterns(paths: list[str], entries: dict[str, dict], records: dict[str, dict]) -> list[dict]:
+    """Same-change clusters, then tests/docs/config folds, among one group's files; marks members `in_pattern`."""
+    from paircli_patterns import MAX_MEMBERS, MIN_MEMBERS, _split_members, category_members, cluster_same_change
+
+    candidates = [entries[path] for path in paths if lines_available(entries[path])]
+    patterns = []
+    taken: set[str] = set()
+
+    def add(family: str, signature, members: list[str], status: str) -> None:
+        taken.update(members)
+        patterns.append({
+            "family": family, "signature": signature, "members": members, "count": len(members),
+            "additions": sum(records[path]["additions"] for path in members),
+            "deletions": sum(records[path]["deletions"] for path in members), "status": status,
+        })
+
+    for cluster in cluster_same_change(candidates):
+        add("same-change", cluster["signature"], cluster["members"], cluster["status"])
+    for family in PATTERN_FAMILIES:
+        members = category_members(candidates, family, skip=taken)
+        if not members:
+            continue
+        for piece in _split_members(members, MAX_MEMBERS):
+            if len(piece) >= MIN_MEMBERS:
+                add(family, None, piece, _pattern_status({records[path]["status"] for path in piece}))
+    for path in taken:
+        records[path]["in_pattern"] = True
+    return patterns
+
+
 def build_skeleton(snapshot: dict, head: str) -> dict:
     """Build the deterministic skeleton described in the module docstring; never raises on odd shapes."""
     pr = snapshot.get("pr") if isinstance(snapshot, dict) and isinstance(snapshot.get("pr"), dict) else {}
     records: dict[str, dict] = {}
     refs: dict[str, list] = {}
+    entries_by_path: dict[str, dict] = {}
     for entry in _unique_entries(snapshot):
         path = entry["path"]
+        entries_by_path[path] = entry
         language, category = classify(path)
         routine = category in ROUTINE_CATEGORIES
         scanned = _scan_entry(entry, language, imports=not routine and language in JS_LANGUAGES | {"py", "go"})
@@ -515,7 +568,7 @@ def build_skeleton(snapshot: dict, head: str) -> dict:
             "lines_available": lines_available(entry), "has_new_lines": bool(_hunk_ranges(entry)),
             "score": _score(scanned["additions"] + scanned["deletions"], sensitive,
                             CATEGORY_PENALTY.get(category, 0.0)),
-            "group": None,
+            "group": None, "in_pattern": False,
         }
         refs[path] = scanned["refs"]
     kept = [record for record in records.values() if not record["routine"]]
@@ -571,6 +624,7 @@ def build_skeleton(snapshot: dict, head: str) -> dict:
             "change": _group_change(group_records),
             "score": _score(additions + deletions, sensitive, _dominant_penalty(group_records)),
             "citable_files": sum(record["has_new_lines"] for record in group_records),
+            "patterns": _group_patterns(group_paths, entries_by_path, records),
         })
     groups.sort(key=lambda group: (-group["score"], group["path"], group["id"]))
 
@@ -729,6 +783,7 @@ def _merge_groups(groups: list[dict], records: dict[str, dict], taken: set[str])
         "additions": additions, "deletions": deletions,
         "sensitive": any(group["sensitive"] for group in groups), "change": _group_change(members),
         "score": 0.0, "citable_files": sum(group["citable_files"] for group in groups),
+        "patterns": [pattern for group in groups for pattern in group.get("patterns", [])],
     }
 
 

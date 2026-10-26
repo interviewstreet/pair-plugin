@@ -298,6 +298,14 @@ failure never touches it. The ZIP carries v2 under its normal path and as a root
   stats) and `diagnostics/architecture-llm/` (per-call inputs, raw answers, errors and `stats.json`).
   `scan()` logs one line such as `architecture v2: tier=llm groups_llm_ok=5/8 merge=ok
   steps_dropped=1 cache_hits=2`.
+- **Pattern rows.** When many files in one area get the same change (a deleted template set, a version
+  bump, a logging line) or a group has several test, docs or config files, the deterministic draft shows
+  them as one `pattern` row instead of one row per file. The skeleton finds them from the hunks (identical
+  change signature, digits ignored, at least 3 files, never across groups), the row lists up to 12 cited
+  sample files plus every member, imports of its members collapse into one `imports (N)` edge, and
+  `validate_v2` recomputes the signature of every member. Node `stats` also carry `api_added` and
+  `api_removed`, lexical counts of exported names. The model may reword a pattern row but never change its
+  members.
 
 This does not change upload paths, capture offsets, publication versioning, or the
 separate `/pair` JSON review-brief agent contract.

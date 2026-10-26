@@ -18,9 +18,13 @@ from paircli_architecture_v2_draft import (
 )
 from paircli_archive import create_pr_archive
 from paircli_skeleton import build_skeleton
-from snapshot_factory import HEAD, make_file, make_hunk, make_snapshot, many_files, source_lines
+from snapshot_factory import (
+    HEAD, deleted_templates, deletion_heavy_pr, make_file, make_hunk, make_snapshot, many_files, repeated_edits,
+    source_lines, version_bumps,
+)
 
 ID = re.compile(IDENTIFIER)
+LETTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"  # distinct, digit-free text per file
 
 
 def build(files, title="Synthetic change"):
@@ -52,7 +56,7 @@ def test_a_single_file_pr_gives_a_valid_one_row_draft():
     _, draft, document = finalize([make_file("src/app.ts", added=source_lines(4), removed=["old"])])
     assert [group["id"] for group in draft["groups"]] == [group["id"] for group in document["groups"]]
     assert len(draft["nodes"]) == 1 and draft["edges"] == [] and draft["steps"] == []
-    assert document["nodes"][0]["stats"] == {"additions": 4, "deletions": 1, "files": 1}
+    assert document["nodes"][0]["stats"] == {"additions": 4, "deletions": 1, "files": 1, "api_added": 0, "api_removed": 0}
     assert draft["gaps"][-1].startswith("Generated deterministically")
 
 
@@ -207,7 +211,7 @@ def test_routine_files_become_one_row_per_group_without_evidence():
 
 
 def test_a_routine_row_lists_at_most_fifteen_files_and_costs_one_slot():
-    files = [make_file(f"web/src/f{index}.ts", added=source_lines(5 + index)) for index in range(12)]
+    files = [make_file(f"web/src/f{index}.ts", added=[f"const {chr(97 + index)}{line} = 1;" for line in range(5 + index)]) for index in range(12)]
     files += [make_file(f"web/src/vendor/lib{index}.js", added=["x"]) for index in range(20)]
     _, _, draft = build(files)
     routine = next(node for node in draft["nodes"] if node["kind"] == "routine")
@@ -353,8 +357,9 @@ def test_a_thousand_files_respect_the_v2_caps_and_stay_fast():
 
 def test_the_edge_cap_keeps_the_best_connected_pairs():
     files = [make_file(f"src/f{index}.ts", added=[f"import a from './f{(index + 1) % 30}';",
-                                                  f"import b from './f{(index + 2) % 30}';"] + source_lines(3))
-             for index in range(30)]
+                                                  f"import b from './f{(index + 2) % 30}';",
+                                                  f"const own = '{LETTERS[index]}';"] + source_lines(3))
+             for index in range(30)]  # a line of its own each, so the files are not one repeated change
     _, _, draft = build(files)
     assert 0 < len(draft["edges"]) <= 60
     _, _, document = finalize(files)
@@ -364,10 +369,10 @@ def test_the_edge_cap_keeps_the_best_connected_pairs():
 # --- ids, determinism, odd input -------------------------------------------------------------
 
 def test_ids_match_the_pattern_and_are_unique_even_for_odd_names():
-    files = [make_file(path, added=["x"]) for path in (
+    files = [make_file(path, added=[f"const own = '{LETTERS[number]}';"]) for number, path in enumerate((
         "src/same.ts", "lib/same.ts", "a/b/c/d/same.ts", "src/1leading.ts", "src/__init__.py", "src/ünï cödé.ts",
-        "src/" + "x" * 120 + ".ts", "src/a b.ts", "src/a-b.ts", "src/a_b.ts", "-weird/-.ts", "9/9.ts")]
-    files.append(make_file("a" * 80 + "/" + "b" * 80 + "/file.ts", added=["x"]))
+        "src/" + "x" * 120 + ".ts", "src/a b.ts", "src/a-b.ts", "src/a_b.ts", "-weird/-.ts", "9/9.ts"))]
+    files.append(make_file("a" * 80 + "/" + "b" * 80 + "/file.ts", added=["const own = 'z';"]))
     _, draft, _ = finalize(files)
     for items in (draft["groups"], draft["nodes"], draft["edges"]):
         ids = [item["id"] for item in items]
@@ -593,3 +598,218 @@ def test_the_v2_document_ships_in_the_zip_and_its_status_does_not(tmp_path):
         assert not any("architecture-v2-status" in name or "diagnostics" in name for name in names)
         shipped = json.loads(archive.read(f"{prefix}/generated_artifacts/architecture.v2.json"))
     assert shipped["schema_version"] == 2 and shipped["generated_by"] == "deterministic"
+
+
+# --- pattern rows ----------------------------------------------------------------------------
+
+def patterns_of(document):
+    return [node for node in document["nodes"] if node["kind"] == "pattern"]
+
+
+def covered(document):
+    return sum(node["pattern"]["count"] for node in patterns_of(document))
+
+
+def test_a_deletion_heavy_pr_collapses_into_pattern_rows_and_collapsed_edges():
+    files = deletion_heavy_pr(templates=40, features=9)
+    _, draft, document = finalize(files)
+    rows = {node["id"]: node for node in document["nodes"]}
+    assert len(rows) == 3 and len(rows) < len(files) / 10
+    deleted = next(node for node in patterns_of(document) if node["pattern"]["family"] == "same-change"
+                   and node["change"] == "removed")
+    assert deleted["pattern"]["count"] == 40 and len(deleted["pattern"]["members"]) == 40
+    assert deleted["label"] == "40 files: deleted"
+    assert deleted["description"].startswith("40 files with the same change: deleted. Each removes the same lines")
+    assert len(deleted["files"]) == 12 and set(deleted["files"]) <= set(deleted["pattern"]["members"])
+    assert {ref["side"] for ref in deleted["evidence"]} == {"old"} and len(deleted["evidence"]) == 12
+    assert deleted["stats"]["files"] == 40 and deleted["stats"]["deletions"] == 160 and deleted["stats"]["additions"] == 0
+    assert (deleted["change"], deleted["state"]) == ("removed", "changed")
+    assert not any(node["files"] == [path] for node in document["nodes"] for path in deleted["pattern"]["members"])
+    index = next(node for node in document["nodes"] if node["files"] == ["src/legacy/index.ts"])
+    assert len(document["edges"]) == 2
+    collapsed = next(edge for edge in document["edges"] if edge["source"] == index["id"])
+    assert collapsed["target"] == deleted["id"] and collapsed["label"] == "imports (40)"
+    assert collapsed["claim"] == 'index.ts imported 40 of the 40 files in "40 files: deleted".'
+    assert len(collapsed["evidence"]) == 3 and {ref["side"] for ref in collapsed["evidence"]} == {"old"}
+    assert collapsed["change"] == "removed"
+    features = next(node for node in patterns_of(document) if node is not deleted)
+    assert features["pattern"]["count"] == 9
+    second = next(edge for edge in document["edges"] if edge["source"] == features["id"])
+    assert second["target"] == index["id"] and second["label"] == "imports (9)"
+    assert second["claim"] == '9 of the 9 files in "9 files: same edit" imported index.ts.'
+    assert any("49 changed files folded into 2 pattern rows" in gap for gap in document["gaps"])
+    assert len(draft["nodes"]) == 3
+
+
+def test_a_mechanical_bump_in_one_directory_is_one_pattern_row():
+    files = [make_file(f"packages/bump/pkg{index}.json", start=3, removed=['  "version": "1.2.3",'],
+                       added=['  "version": "1.3.0",']) for index in range(40)]
+    _, _, document = finalize(files)
+    assert len(document["nodes"]) == 1
+    node = document["nodes"][0]
+    assert node["kind"] == "pattern" and node["pattern"]["count"] == 40
+    assert node["label"] == "40 files: same edit" and node["stats"]["additions"] == 40 == node["stats"]["deletions"]
+    assert node["description"].startswith("40 files with the same change: modified. Each makes the same edit")
+
+
+def test_a_bump_across_package_directories_keeps_one_pattern_per_group_and_far_fewer_rows():
+    # The v1 grouping puts 29 of the 40 package.json files in one group and the rest in single-file
+    # groups; clusters never cross groups, so the bump is one pattern plus the files outside it.
+    files = version_bumps(40)
+    _, _, document = finalize(files)
+    assert len(document["nodes"]) <= 12 < len(files)
+    assert covered(document) >= 29
+
+
+def test_many_modified_files_with_three_repeated_edits_give_three_pattern_rows():
+    files = repeated_edits(480, variants=3, directory="src/modules")
+    for index, file in enumerate(files):  # one flat directory: one group
+        file["path"] = f"src/modules/mod{index}.ts"
+    _, _, document = finalize(files)
+    patterns = patterns_of(document)
+    assert len(document["nodes"]) == 3 == len(patterns)
+    assert sorted(node["pattern"]["count"] for node in patterns) == [160, 160, 160]
+    assert len({node["pattern"]["signature"] for node in patterns}) == 3
+    assert len({member for node in patterns for member in node["pattern"]["members"]}) == 480
+    assert all(len(node["files"]) == 12 and len(node["evidence"]) == 12 for node in patterns)
+
+
+def test_repeated_edits_spread_over_directories_stay_inside_their_groups():
+    files = repeated_edits(480, variants=3)
+    _, skeleton, draft = build(files)
+    _, _, document = finalize(files)
+    assert len(document["nodes"]) == 24 < len(files) / 10
+    for node in patterns_of(document):
+        assert len({path.rsplit("/", 1)[0] for path in node["pattern"]["members"]}) == 1, "one group each"
+        assert node["group"] in {group["id"] for group in document["groups"]}
+
+
+def test_a_pattern_larger_than_500_files_is_split_into_several_rows():
+    files = [make_file(f"src/bulk/m{index}.ts", start=2, removed=["export const old = 1;"],
+                       added=["export const old = 2;"]) for index in range(1100)]
+    _, _, document = finalize(files)
+    sizes = sorted(node["pattern"]["count"] for node in patterns_of(document))
+    assert all(3 <= size <= 500 for size in sizes) and sum(sizes) == 1100
+    assert len(document["nodes"]) <= 4 and len({node["pattern"]["signature"] for node in patterns_of(document)}) == 1
+
+
+def test_tests_docs_and_config_fold_by_group_and_get_no_edges():
+    source = [make_file("src/app/service.ts", added=["export function run() {}"] + source_lines(3)),
+              make_file("src/app/store.ts", added=["export const store = {};"] + source_lines(4, "const other"))]
+    tests = [make_file(f"src/app/__tests__/case{index}.test.ts", added=[f"import {{ run }} from '../service';",
+                                                                      f"it('case {LETTERS[index]}', () => {{}});"])
+             for index in range(5)]
+    docs = [make_file(f"src/app/docs/page{index}.md", added=[f"# page {LETTERS[index]}"]) for index in range(4)]
+    config = [make_file(f"src/app/conf{index}.json", added=[f'{{"k{LETTERS[index]}": true}}']) for index in range(3)]
+    _, _, document = finalize(source + tests + docs + config)
+    kinds = {node["label"]: node for node in patterns_of(document)}
+    assert set(kinds) == {"5 test files", "4 doc files", "3 config files"}
+    assert kinds["5 test files"]["description"] == "5 test files changed in this area. Together +10/-0 lines."
+    assert {node["pattern"]["family"] for node in patterns_of(document)} == {"tests", "docs", "config"}
+    assert all("signature" not in node["pattern"] for node in patterns_of(document))
+    assert len(document["nodes"]) == 5  # two source files and three folded rows
+    pattern_ids = {node["id"] for node in patterns_of(document)}
+    assert not [edge for edge in document["edges"] if {edge["source"], edge["target"]} & pattern_ids]
+    assert any("12 changed files folded into 3 pattern rows" in gap for gap in document["gaps"])
+
+
+def test_only_the_files_that_share_a_signature_are_folded():
+    shared = [make_file(f"src/mix/a{index}.ts", start=2, removed=["const mode = 'old';"],
+                        added=[f"const mode = 'new{index}';"]) for index in range(6)]
+    others = [make_file(f"src/mix/b{index}.ts", start=2, removed=[f"const x{LETTERS[index]} = 1;"],
+                        added=[f"const y{LETTERS[index]} = 2;"]) for index in range(4)]
+    _, _, document = finalize(shared + others)
+    assert [node["pattern"]["count"] for node in patterns_of(document)] == [6]
+    assert sorted(node["files"][0] for node in document["nodes"] if node["kind"] == "file") == sorted(
+        f"src/mix/b{index}.ts" for index in range(4))
+    assert len(document["nodes"]) == 5
+
+
+def test_clusters_in_different_groups_stay_separate():
+    one = [make_file(f"src/alpha/f{index}.ts", status="deleted", removed=[f"// gone {index}", "export const A = 1;"])
+           for index in range(4)]
+    two = [make_file(f"src/beta/f{index}.ts", status="deleted", removed=[f"// gone {index}", "export const A = 1;"])
+           for index in range(4)]
+    _, skeleton, _ = build(one + two + [make_file("src/gamma/app.ts", added=source_lines(5))])
+    assert {group["path"]: [pattern["count"] for pattern in group["patterns"]] for group in skeleton["groups"]
+            if group["patterns"]} == {"src/alpha": [4], "src/beta": [4]}
+    _, _, document = finalize(one + two + [make_file("src/gamma/app.ts", added=source_lines(5))])
+    patterns = patterns_of(document)
+    assert len(patterns) == 2 and patterns[0]["group"] != patterns[1]["group"]
+    assert patterns[0]["pattern"]["signature"] == patterns[1]["pattern"]["signature"]
+    assert not set(patterns[0]["pattern"]["members"]) & set(patterns[1]["pattern"]["members"])
+
+
+def test_a_pattern_row_wins_budget_over_a_small_file_and_modified_source_over_added_boilerplate():
+    files = ([make_file(f"src/big/gen{index}.ts", "added", added=[f"export const g{LETTERS[index]} = 1;"] * 1)
+              for index in range(12)]
+             + [make_file("src/big/core.ts", added=["export function core() {}"], removed=["function core() {}"])]
+             + deleted_templates(5, "src/big"))
+    _, _, document = finalize(files)
+    labels = [node["label"] for node in document["nodes"]]
+    assert "5 files: deleted" in labels, "the repeated deletion keeps its row"
+    assert "core.ts" in labels, "an edited source file outranks added boilerplate when rows run out"
+    assert len([node for node in document["nodes"] if node["group"] == document["nodes"][0]["group"]]) <= 12
+
+
+def test_pattern_members_may_be_renamed_and_hunkless_files_are_left_out():
+    renamed = [make_file(f"src/new/r{index}.ts", "renamed", old_path=f"src/old/r{index}.ts", start=2,
+                         removed=["import a from './a';"], added=["import a from './b';"]) for index in range(4)]
+    hunkless = [make_file(f"src/new/h{index}.ts", "renamed", old_path=f"src/old/h{index}.ts", no_hunks=True)
+                for index in range(2)]
+    _, _, document = finalize(renamed + hunkless)
+    (node,) = patterns_of(document)
+    assert node["pattern"]["count"] == 4 and node["change"] == "modified" and node["label"] == "4 files: renamed and edited"
+    assert not any(path.startswith("src/new/h") for path in node["pattern"]["members"])
+    assert any("no usable hunk data" in gap for gap in document["gaps"])
+
+
+def test_a_pattern_row_is_one_row_of_the_group_budget():
+    files = [make_file(f"src/one/m{index}.ts", "deleted", removed=[f"// {index}", "export {};"]) for index in range(30)]
+    files += [make_file(f"src/one/own{LETTERS[index]}.ts", added=[f"const {LETTERS[index]}own = 'x';"] * 2)
+              for index in range(30)]
+    _, skeleton, draft = build(files)
+    rows = [node for node in draft["nodes"] if node["group"] == draft["nodes"][0]["group"]]
+    assert len(rows) <= skeleton["budget"]["max_rows_per_group"]
+    assert sum(node["kind"] == "pattern" for node in draft["nodes"]) == 1
+
+
+def test_pattern_drafts_are_deterministic_and_fast_for_a_thousand_files():
+    files = (version_bumps(150, "pkgs") + repeated_edits(300, variants=4) + deleted_templates(200)
+             + many_files(350, lines=4))
+    for index, file in enumerate(files[650:]):
+        file["hunks"][0]["lines"][1]["text"] = f"const unique_{LETTERS[index % 52]}{LETTERS[index // 52]} = 1;"
+    snapshot = make_snapshot(files)
+    started = time.perf_counter()
+    skeleton = build_skeleton(snapshot, HEAD)
+    draft = deterministic_v2_draft(skeleton, snapshot, HEAD)
+    document, warnings = finalize_v2(draft, HEAD, snapshot, "deterministic")
+    elapsed = time.perf_counter() - started
+    assert elapsed < 2.0, elapsed
+    assert warnings == [] and len(document["nodes"]) <= 60 and len(document["edges"]) <= 60
+    assert covered(document) > 400
+    again = deterministic_v2_draft(build_skeleton(snapshot, HEAD), snapshot, HEAD)
+    assert json.dumps(draft) == json.dumps(again)
+    assert len(json.dumps(document).encode()) <= MAX_BYTES
+
+
+def test_pattern_edges_between_two_pattern_rows_collapse_into_one():
+    callers = [make_file(f"src/callers/c{index}.ts", start=2, added=[f"import {{ x }} from '../callees/e{index}';"],
+                         removed=["// before"]) for index in range(5)]
+    callees = [make_file(f"src/callees/e{index}.ts", "added", added=["export const x = 1;", f"// callee {index}"])
+               for index in range(5)]
+    _, _, document = finalize(callers + callees)
+    assert len(patterns_of(document)) == 2 and len(document["edges"]) == 1
+    edge = document["edges"][0]
+    assert edge["label"] == "imports (5)" and len(edge["evidence"]) == 3 and edge["change"] == "added"
+    assert edge["claim"] == '5 of the 5 files in "5 files: same edit" import 5 of the 5 files in "5 files: added".'
+    assert {document["nodes"][0]["id"], document["nodes"][1]["id"]} == {edge["source"], edge["target"]}
+
+
+def test_an_import_of_part_of_a_pattern_counts_the_files_it_covers():
+    templates = deleted_templates(10)
+    index = make_file("src/legacy/index.ts", added=["// done"],
+                      removed=[f"export * from './templates/t{number}';" for number in range(4)])
+    _, _, document = finalize(templates + [index])
+    (edge,) = document["edges"]
+    assert edge["label"] == "imports (4)" and edge["claim"] == 'index.ts imported 4 of the 10 files in "10 files: deleted".'

@@ -45,10 +45,10 @@ def test_signature_status_matters_including_renamed():
     assert signatures["renamed"] == change_signature(changed("z.ts", added=lines, status="renamed", old_path="q.ts"))
 
 
-def test_signature_is_a_multiset_and_order_independent():
+def test_signature_ignores_order_and_repetition_but_not_distinct_lines():
     first = changed("a.ts", added=["x();", "y();", "x();"])
-    second = changed("b.ts", added=["y();", "x();", "x();"])
-    third = changed("c.ts", added=["x();", "y();"])
+    second = changed("b.ts", added=["y();", "x();", "x();", "x();"])
+    third = changed("c.ts", added=["x();", "z();"])
     assert change_signature(first) == change_signature(second)
     assert change_signature(first) != change_signature(third)
 

@@ -15,7 +15,9 @@ from paircli_architecture import MAX_BYTES, validate_architecture, write_fallbac
 from paircli_skeleton import (
     BUDGET_TIERS, MAX_NODES, build_skeleton, classify, deterministic_architecture, size_budget, skeleton_stats,
 )
-from snapshot_factory import HEAD, make_file, make_hunk, make_snapshot, many_files, source_lines
+from snapshot_factory import (
+    HEAD, deleted_templates, make_file, make_hunk, make_snapshot, many_files, repeated_edits, source_lines,
+)
 
 
 def build(files, **kwargs):
@@ -713,3 +715,85 @@ def test_write_fallback_architecture_refuses_symlinked_output(tmp_path):
     (folder / "generated_artifacts" / "architecture.json").symlink_to(target)
     write_fallback_architecture(folder, "llm unavailable", io.StringIO())
     assert not target.exists()
+
+
+# --- patterns --------------------------------------------------------------------------------
+
+def group_patterns(skeleton):
+    return [(group["path"], pattern) for group in skeleton["groups"] for pattern in group["patterns"]]
+
+
+def test_same_change_files_form_a_pattern_and_are_marked_in_pattern():
+    files = deleted_templates(6) + [make_file("src/legacy/keep.ts", added=source_lines(3))]
+    _, skeleton = build(files)
+    ((path, pattern),) = group_patterns(skeleton)
+    assert path == "src/legacy" or path.startswith("src/legacy")
+    assert pattern["family"] == "same-change" and pattern["count"] == 6 == len(pattern["members"])
+    assert pattern["status"] == "deleted" and pattern["additions"] == 0 and pattern["deletions"] == 24
+    assert isinstance(pattern["signature"], str) and len(pattern["signature"]) == 16
+    assert pattern["members"] == sorted(pattern["members"])
+    flags = {item["path"]: item["in_pattern"] for item in skeleton["files"]}
+    assert [name for name, flag in flags.items() if flag] == pattern["members"]
+    assert flags["src/legacy/keep.ts"] is False
+
+
+def test_fewer_than_three_files_make_no_pattern():
+    _, skeleton = build(deleted_templates(2))
+    assert group_patterns(skeleton) == []
+    assert not any(item["in_pattern"] for item in skeleton["files"])
+
+
+def test_patterns_never_cross_groups_and_keep_one_signature_each():
+    files = repeated_edits(48, variants=2, directory="src/modules")
+    _, skeleton = build(files)
+    assert len(skeleton["groups"]) > 1
+    seen = set()
+    for group in skeleton["groups"]:
+        for pattern in group["patterns"]:
+            assert set(pattern["members"]) <= set(group["files"]), "members belong to their own group"
+            assert not set(pattern["members"]) & seen
+            seen |= set(pattern["members"])
+    assert seen == {item["path"] for item in skeleton["files"] if item["in_pattern"]}
+
+
+def test_tests_docs_and_config_fold_when_a_group_has_three_and_skip_same_change_members():
+    files = ([make_file(f"src/app/t{index}.test.ts", added=[f"it('case {chr(97 + index)}', () => {{}});"]) for index in range(3)]
+             + [make_file(f"src/app/c{index}.json", added=[f'{{"k{chr(97 + index)}": 1}}']) for index in range(2)]
+             + [make_file(f"src/app/d{index}.md", added=[f"# {chr(97 + index)}"]) for index in range(3)]
+             + [make_file(f"src/app/same{index}.test.ts", added=[f"// same {index}"]) for index in range(3)])
+    _, skeleton = build(files)
+    found = {pattern["family"]: pattern for _, pattern in group_patterns(skeleton)}
+    assert set(found) == {"same-change", "tests", "docs"}, "two config files are not enough"
+    assert found["same-change"]["count"] == 3 and found["tests"]["count"] == 3 and found["docs"]["count"] == 3
+    assert found["tests"]["signature"] is None and not set(found["tests"]["members"]) & set(found["same-change"]["members"])
+    assert found["docs"]["status"] == "modified"
+
+
+def test_hunkless_and_routine_files_are_never_pattern_members():
+    files = ([make_file(f"src/x/n{index}.ts", no_hunks=True) for index in range(4)]
+             + [make_file(f"src/x/dist/g{index}.js", added=["// same"]) for index in range(4)]
+             + [make_file(f"src/x/k{index}.ts", added=[f"const q = {index};"]) for index in range(3)])
+    _, skeleton = build(files)
+    ((_, pattern),) = group_patterns(skeleton)
+    assert pattern["members"] == [f"src/x/k{index}.ts" for index in range(3)]
+
+
+def test_v1_diagram_is_unchanged_by_patterns():
+    files = deleted_templates(6) + [make_file("src/legacy/keep.ts", added=source_lines(3))]
+    snapshot, skeleton = build(files)
+    document = deterministic_architecture(skeleton, HEAD, snapshot)
+    assert document is None or all(node["kind"] != "pattern" for node in document["nodes"])
+    stripped = copy.deepcopy(skeleton)
+    for group in stripped["groups"]:
+        group.pop("patterns")
+    for item in stripped["files"]:
+        item.pop("in_pattern")
+    assert deterministic_architecture(stripped, HEAD, snapshot) == document
+
+
+def test_patterns_are_deterministic_and_fast_for_a_thousand_files():
+    files = repeated_edits(1000, variants=3)
+    started = time.perf_counter()
+    first = build(files)[1]
+    assert time.perf_counter() - started < 1.0
+    assert json.dumps(first, sort_keys=True) == json.dumps(build(files)[1], sort_keys=True)

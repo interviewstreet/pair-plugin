@@ -11,16 +11,18 @@ import json
 import re
 
 from paircli_architecture import IDENTIFIER, KINDS, MAX_BYTES, ArchitectureError
+from paircli_patterns import api_surface, verify_pattern
 from paircli_snapshot import snapshot_binds_head
 
 SCHEMA_VERSION = 2
 GENERATED_BY = ("llm", "deterministic")
-NODE_KINDS = KINDS | {"file", "routine"}
+NODE_KINDS = KINDS | {"file", "routine", "pattern"}
 WHENS = {"before", "after"}
 SIDES = {"new", "old"}
 
 MAX_GROUPS, MAX_NODES, MAX_EDGES, MAX_STEPS, MAX_GAPS = 12, 60, 60, 24, 5
 MAX_FILES_PER_NODE, MAX_REFS = 15, 12
+MAX_PATTERN_SAMPLES = 12
 MAX_STEP_NODES = 16
 MAX_COLUMN = 8
 MAX_WARNINGS = 100
@@ -30,12 +32,15 @@ MAX_WARNINGS = 100
 TOP_KEYS = ("schema_version", "generated_by", "head_sha", "title", "description",
             "groups", "nodes", "edges", "steps", "gaps")
 GROUP_KEYS = ("id", "label", "path", "column", "order")
-NODE_KEYS = ("id", "label", "group", "kind", "description", "files", "evidence",
+NODE_KEYS = ("id", "label", "group", "kind", "description", "files", "evidence", "pattern",
              "change", "state", "stats")
+# `pattern` is required on a pattern row and not allowed on any other.
+OPTIONAL_NODE_KEYS = frozenset({"pattern"})
+PATTERN_KEYS = ("family", "count", "signature", "members")
 EDGE_KEYS = ("id", "source", "target", "label", "claim", "change", "evidence")
 STEP_KEYS = ("id", "when", "edge", "nodes", "text", "flags", "evidence")
 EVIDENCE_KEYS = ("type", "path", "start", "end", "side")
-STATS_KEYS = ("additions", "deletions", "files")
+STATS_KEYS = ("additions", "deletions", "files", "api_added", "api_removed")
 # `edge` is the only optional key; everything else must be present.
 STEP_REQUIRED = frozenset(STEP_KEYS) - {"edge"}
 
@@ -130,6 +135,13 @@ def normalize_v2(document):
                     strip_evidence(item, path)
                 if isinstance(item.get("stats"), dict):
                     item["stats"] = strip(item["stats"], STATS_KEYS, f"{path}.stats")
+            if isinstance(item, dict) and name == "nodes" and "pattern" in item:
+                if item.get("kind") == "pattern":
+                    item["pattern"] = strip(item["pattern"], PATTERN_KEYS, f"{path}.pattern")
+                else:
+                    del item["pattern"]
+                    if len(warnings) < MAX_WARNINGS:
+                        warnings.append(f"{path}.pattern: removed from a row that is not a pattern row")
             cleaned.append(item)
         return cleaned
 
@@ -158,6 +170,14 @@ class SnapshotIndex:
                 if isinstance(file.get("old_path"), str) and file["old_path"]:
                     self.old_paths.setdefault(file["old_path"], file)
         self._lines: dict[str, dict] = {}
+        self._api: dict[str, dict] = {}
+
+    def api(self, file: dict) -> dict:
+        """`api_surface` of one changed file, computed once."""
+        cached = self._api.get(file["path"])
+        if cached is None:
+            cached = self._api[file["path"]] = api_surface(file)
+        return cached
 
     def hunks(self, file: dict) -> list[dict]:
         keys = ("old_start", "old_lines", "new_start", "new_lines")
@@ -198,9 +218,20 @@ class SnapshotIndex:
 
 # --- computed fields ---------------------------------------------------------------------
 
+def pattern_members(node: dict) -> list | None:
+    """The member list of a pattern row (any entries, unchecked), or None for any other row."""
+    pattern = node.get("pattern") if node.get("kind") == "pattern" else None
+    members = pattern.get("members") if isinstance(pattern, dict) else None
+    return members if isinstance(members, list) else None
+
+
 def node_facts(node: dict, index: SnapshotIndex) -> dict:
-    """`change`, `state` and `stats` of one node from the snapshot status and hunk lines of its files."""
-    names = node.get("files") if isinstance(node.get("files"), list) else []
+    """`change`, `state` and `stats` of one node from the snapshot status and hunk lines of its files.
+
+    A pattern row covers all its `pattern.members`; `files` is only a sample of them.
+    """
+    members = pattern_members(node)
+    names = members if members is not None else node.get("files") if isinstance(node.get("files"), list) else []
     resolved = list({name: index.files[name] for name in names if isinstance(name, str) and name in index.files}.values())
     statuses = [file.get("status") for file in resolved]
     if not statuses:
@@ -213,10 +244,13 @@ def node_facts(node: dict, index: SnapshotIndex) -> dict:
         change = "modified"
     state = "routine" if node.get("kind") == "routine" else "changed" if change != "unchanged" else "context"
     counts = [index.lines(file) for file in resolved]
+    api = [index.api(file) for file in resolved]
     return {"change": change, "state": state,
             "stats": {"files": len(resolved),
                       "additions": sum(count["additions"] for count in counts),
-                      "deletions": sum(count["deletions"] for count in counts)}}
+                      "deletions": sum(count["deletions"] for count in counts),
+                      "api_added": sum(item["added"] for item in api),
+                      "api_removed": sum(item["removed"] for item in api)}}
 
 
 def edge_change(edge: dict, index: SnapshotIndex) -> str:
@@ -285,7 +319,8 @@ def compute_layout(groups, nodes, edges) -> dict[str, dict]:
         name, group = node.get("id"), node.get("group")
         if isinstance(name, str) and name not in node_group and isinstance(group, str) and group in members:
             node_group[name] = group
-            files = node.get("files") if isinstance(node.get("files"), list) else []
+            files = pattern_members(node)
+            files = files if files is not None else node.get("files") if isinstance(node.get("files"), list) else []
             members[group] += [file for file in files if isinstance(file, str)]
     paths = {name: common_directory(files) for name, files in members.items()}
     rank = {name: (paths[name], name) for name in group_ids}
@@ -487,6 +522,47 @@ def check_evidence(refs, path: str, index: SnapshotIndex, check) -> list[tuple]:
     return [ref for ref in valid if ref is not None]
 
 
+def check_pattern(node: dict, path: str, index: SnapshotIndex, check) -> None:
+    """Validate a pattern row's `pattern` object, recomputing every claim from the snapshot."""
+    for error in verify_pattern(node.get("pattern"), index.files):
+        check(False, join(path, error["path"]), error["reason"])
+    pattern = node.get("pattern")
+    if not isinstance(pattern, dict):
+        return
+    for key in sorted(set(pattern) - set(PATTERN_KEYS), key=str):
+        check(False, join(path, f"pattern.{str(key)[:64]}"), "unexpected key")
+    if pattern.get("family") != "same-change":
+        check(pattern.get("signature") is None, join(path, "pattern.signature"),
+              "only a same-change pattern has a signature")
+    members = pattern.get("members")
+    members = set(item for item in members if isinstance(item, str)) if isinstance(members, list) else set()
+    files = node.get("files")
+    for offset, name in enumerate(files if isinstance(files, list) else []):
+        if isinstance(name, str):
+            check(name in members, f"{path}.files[{offset}]", "a pattern row's files must be members of its pattern")
+
+
+def check_pattern_ownership(nodes: list, check) -> None:
+    """A file belongs to one row: pattern members are unique across pattern rows and not listed elsewhere."""
+    owner: dict[str, int] = {}
+    for position, node in enumerate(nodes):
+        members = pattern_members(node) if isinstance(node, dict) else None
+        for offset, name in enumerate(members or []):
+            if not isinstance(name, str):
+                continue
+            first = owner.setdefault(name, position)
+            if first != position:
+                check(False, f"nodes[{position}].pattern.members[{offset}]",
+                      f"{name} is already a member of nodes[{first}]")
+    for position, node in enumerate(nodes):
+        if not isinstance(node, dict) or node.get("kind") == "pattern" or not isinstance(node.get("files"), list):
+            continue
+        for offset, name in enumerate(node["files"]):
+            if isinstance(name, str) and name in owner:
+                check(False, f"nodes[{position}].files[{offset}]",
+                      f"{name} is a member of the pattern row nodes[{owner[name]}]")
+
+
 class Graph:
     """What step validation needs to know about an otherwise checked graph."""
 
@@ -550,7 +626,8 @@ def check_graph(document: dict, index: SnapshotIndex, check) -> Graph:
         path = f"nodes[{position}]"
         if not check(isinstance(node, dict), path, "must be an object"):
             continue
-        keys_ok(node, NODE_KEYS, path)
+        keys_ok(node, tuple(key for key in NODE_KEYS if key not in OPTIONAL_NODE_KEYS or node.get("kind") == "pattern"),
+                path)
         name = identifier(node, path, node_ids)
         if name is not None and name not in graph.nodes:
             graph.nodes[name] = node
@@ -560,12 +637,16 @@ def check_graph(document: dict, index: SnapshotIndex, check) -> Graph:
         check(one_of(node.get("kind"), NODE_KINDS), join(path, "kind"), f"must be one of {sorted(NODE_KINDS)}")
         check(is_text(node.get("description"), 1200), join(path, "description"), "must be 1-1200 characters")
         files = node.get("files")
-        if check(isinstance(files, list) and len(files) <= MAX_FILES_PER_NODE, join(path, "files"),
-                 f"must be a list of at most {MAX_FILES_PER_NODE}"):
+        is_pattern = node.get("kind") == "pattern"
+        limit = MAX_PATTERN_SAMPLES if is_pattern else MAX_FILES_PER_NODE
+        if check(isinstance(files, list) and len(files) <= limit, join(path, "files"),
+                 f"must be a list of at most {limit}" + (" sample members" if is_pattern else "")):
             for offset, name_of_file in enumerate(files):
                 where = f"{path}.files[{offset}]"
                 if check(is_text(name_of_file, 300), where, "must be 1-300 characters"):
                     check(files.index(name_of_file) == offset, where, "duplicate file")
+        if is_pattern and "pattern" in node:
+            check_pattern(node, path, index, check)
         refs_by_node[position] = check_evidence(node.get("evidence"), join(path, "evidence"), index, check)
         facts = facts_by_node[position] = node_facts(node, index)
         if name is not None and name not in graph.node_change:
@@ -597,6 +678,8 @@ def check_graph(document: dict, index: SnapshotIndex, check) -> Graph:
             graph.edge_change[name] = change
         computed(edge, "change", change, path)
 
+    check_pattern_ownership(nodes, check)
+
     for position, node in enumerate(nodes):
         if not isinstance(node, dict):
             continue
@@ -610,7 +693,8 @@ def check_graph(document: dict, index: SnapshotIndex, check) -> Graph:
         check(bool(refs) or exempt, join(path, "evidence"), "needs at least one valid diff citation")
         cited_files = {file["path"] for file, _side, _start, _end in refs}
         files = node.get("files")
-        for offset, name_of_file in enumerate(files if isinstance(files, list) and len(files) <= MAX_FILES_PER_NODE else []):
+        limit = MAX_PATTERN_SAMPLES if node.get("kind") == "pattern" else MAX_FILES_PER_NODE
+        for offset, name_of_file in enumerate(files if isinstance(files, list) and len(files) <= limit else []):
             if not isinstance(name_of_file, str):
                 continue
             where = f"{path}.files[{offset}]"

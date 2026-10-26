@@ -19,7 +19,7 @@ computes. Every claim is cited and validated against the PR snapshot.
     "files": ["src/api/reviews.ts"],
     "evidence": [{"type": "diff", "path": "src/api/reviews.ts", "start": 12, "end": 25, "side": "new"}],
     "change": "modified", "state": "changed",
-    "stats": {"files": 1, "additions": 14, "deletions": 3}
+    "stats": {"files": 1, "additions": 14, "deletions": 3, "api_added": 1, "api_removed": 0}
   }],
   "edges": [{
     "id": "e1", "source": "reviews-ts", "target": "db-ts", "label": "insert",
@@ -35,8 +35,9 @@ computes. Every claim is cited and validated against the PR snapshot.
 }
 ```
 
-Only the keys above are allowed. Unknown keys are stripped with a warning before
-validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
+Only the keys above are allowed, plus `pattern` on a `pattern` row (see Pattern rows; it is
+required there and stripped with a warning from any other row). Unknown keys are stripped with a
+warning before validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
 `episode_ids` are gone, and groups, `claim`, `stats`, `state`, `side` and
 `generated_by` are new.
 
@@ -46,6 +47,7 @@ validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
 | --- | --- |
 | `title`, `description`, node `label`/`description`/`kind`/`group`/`files`/`evidence`, edge `label`/`claim`/`source`/`target`/`evidence`, step `text`/`when`/`edge`/`nodes`/`evidence`, `gaps` | model, or the deterministic skeleton |
 | `generated_by`, `head_sha`, `schema_version` | code |
+| node `pattern` | the deterministic draft; the model cannot change it (patches never touch `kind`, `pattern`, `files` or `evidence` of a pattern row) |
 | node `change`, `state`, `stats`; edge `change`; group `path`, `column`, `order` | **code only**. Model values are ignored and overwritten |
 | step `flags` | reserved. Must be `[]`. Flags are built in a separate change |
 
@@ -56,8 +58,9 @@ validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
   (context or external node): `unchanged`.
 - **Node `state`**: `routine` when `kind` is `routine` (even if its files
   changed), else `changed` when `change` is not `unchanged`, else `context`.
-- **Node `stats`**: `files` count, and `additions`/`deletions` summed from the
-  `+`/`-` hunk lines of its files.
+- **Node `stats`**: `files` count, `additions`/`deletions` summed from the
+  `+`/`-` hunk lines of its files, and `api_added`/`api_removed` (see API surface stats).
+  For a pattern row every figure covers all `pattern.members`, not just the sample in `files`.
 - **Edge `change`**: from the kinds of the hunk lines its valid citations point at.
 
   | Cited lines | `change` |
@@ -68,7 +71,8 @@ validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
   | Anything else with an added or deleted line (a mix, or changed lines next to context citations) | `modified` |
 
   So an import line that exists before and after the PR is `unchanged`, not `modified`.
-- **Group `path`**: longest common directory prefix of its nodes' files (empty if none).
+- **Group `path`**: longest common directory prefix of its nodes' files (all members for a
+  pattern row; empty if none).
 - **Group `column` / `order`**: layered layout. Build the group graph from node
   edges (source group to target group, ignoring self edges). Break cycles
   deterministically. `column` is the longest path from a source group, capped
@@ -111,15 +115,15 @@ validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
 
 ## Limits
 
-12 groups, 60 nodes, 60 edges, 24 steps, 5 gaps; 15 files and 12 evidence refs
-per node; whole document at most 512 KiB. Ids match `[A-Za-z][A-Za-z0-9_-]{0,63}`.
+12 groups, 60 nodes, 60 edges, 24 steps, 5 gaps; 15 files (12 sample files on a pattern
+row) and 12 evidence refs per node; whole document at most 512 KiB. Ids match `[A-Za-z][A-Za-z0-9_-]{0,63}`.
 Node `kind` is one of the v1 kinds (`client`, `service`, `database`, `cache`,
-`queue`, `worker`, `storage`, `external`) plus `file` and `routine`.
+`queue`, `worker`, `storage`, `external`) plus `file`, `routine` and `pattern`.
 
 ## Tiers
 
 `generated_by` is `llm` for model-written structure and `deterministic` for the
-skeleton-only fallback (groups, file rows and import edges, with real hunk
+skeleton-only fallback (groups, file rows, pattern rows and import edges, with real hunk
 citations). A docs-only PR produces no diagram.
 
 Import edges are file-level only when the import resolves to exactly one
@@ -154,20 +158,26 @@ A node with `kind: "pattern"` stands for several files:
   `config` (files of that category in the group; used when a group has at least 3).
 - `pattern.members` lists every member path (at most 500; larger sets are split by
   directory into several pattern rows). `count` equals `len(members)`, at least 3, and
-  every member is a changed file. Members are unique across all rows.
+  every member is a changed file. Members are unique across all pattern rows, and a member
+  is never listed in the `files` of any other row. `pattern.signature` exists only for
+  `same-change` rows.
+- A pattern forms inside one group; the same change in two groups gives two rows.
 - `files` is a sample of at most 12 members; each needs a citation, as for any node.
-  `evidence` has at most 12 refs and should cover the sample.
+  `evidence` has at most 12 refs and must cover the sample (the validator requires a valid
+  citation of every sample file).
 - **Same-change signature** (computed by `change_signature` in `hooks/paircli_patterns.py`):
-  the sorted multiset of the file's added and deleted lines, trimmed, with every run of
-  digits replaced by `#`, plus the file status. Context lines are ignored. The validator
+  the sorted set of the file's distinct added and deleted lines (how often a line repeats
+  is ignored), trimmed, with every run of digits replaced by `#`, plus the file status. Context lines are ignored. The validator
   recomputes the signature of every member and rejects the row if any differs. So "these N
   files have the same change" is checked by code, not asserted by the model.
 - `tests`/`docs`/`config` members must classify into that category.
 - Computed fields cover all members: `stats.files` = `count`, additions/deletions summed
   over members, `change` from member statuses, `state` `changed`.
 - Edges may end at a pattern row. A set of import edges from one row to many members of
-  the same pattern collapses into one edge, labelled with the count, whose claim states
-  how many members it covers (computed) and whose evidence samples up to 3 of them.
+  the same pattern collapses into one edge, labelled `imports (N)`, whose claim states
+  how many members it covers (computed) and whose evidence samples up to 3 of the import
+  lines. Edges between two pattern rows collapse likewise. No edge is drawn to or from a
+  `tests`, `docs` or `config` pattern row.
 
 ## API surface stats (additive)
 
@@ -178,7 +188,9 @@ members). Exported means: TypeScript/JavaScript `export` declarations (`export f
 `export * from` counts as one); Python top-level `def`/`class` without a leading underscore;
 Go top-level `func`, `type`, `var` and `const` whose name starts with an uppercase letter
 (methods included). Counts are lexical, they do not prove a name is used elsewhere. The
-validator recomputes them.
+validator recomputes them. Every node carries both numbers (0 when nothing is exported);
+documents written before they existed are recomputed by `enrich_v2`, but a document without
+them fails `validate_v2`.
 
 ## Row quality rules for generators
 
