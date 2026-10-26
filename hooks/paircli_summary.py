@@ -344,16 +344,38 @@ def _agent_environment() -> dict[str, str]:
     return environment
 
 
-def _run_codex(prompt: str, repo_dir: Path) -> str:
+MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,99}")
+
+
+def stage_model(stage: str) -> str | None:
+    """The model configured for one pipeline stage in `PAIRCLI_MODEL_<STAGE>`, or None for the CLI default.
+
+    Unset, empty or oddly shaped values (anything that could be read as a flag) mean no override.
+    """
+    if not isinstance(stage, str) or re.fullmatch(r"[A-Za-z0-9_]+", stage) is None:
+        return None
+    value = os.environ.get(f"PAIRCLI_MODEL_{stage.upper()}", "").strip()
+    return value if MODEL_NAME.fullmatch(value) else None
+
+
+def _model_args(flag: str, model: str | None) -> list[str]:
+    if model is None:
+        return []
+    if not isinstance(model, str) or MODEL_NAME.fullmatch(model) is None:
+        raise ValueError("model name has an unsupported shape")
+    return [flag, model]
+
+
+def _run_codex(prompt: str, repo_dir: Path, timeout: int | None = None, model: str | None = None) -> str:
     descriptor, temporary_name = tempfile.mkstemp(prefix="pair-summary-", suffix=".md")
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
         completed = subprocess.run(
-            [_executable("codex"), "exec", "-C", str(repo_dir), "-s", "read-only",
+            [_executable("codex"), "exec", "-C", str(repo_dir), "-s", "read-only", *_model_args("-m", model),
              "--ephemeral", "--ignore-user-config", "--output-last-message", str(temporary), "-"],
             input=prompt, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=_agent_environment(), timeout=SUMMARY_TIMEOUT_SECONDS, check=False,
+            env=_agent_environment(), timeout=SUMMARY_TIMEOUT_SECONDS if timeout is None else timeout, check=False,
         )
         if completed.returncode != 0:
             raise RuntimeError(f"Codex summary run exited {completed.returncode}")
@@ -362,13 +384,13 @@ def _run_codex(prompt: str, repo_dir: Path) -> str:
         temporary.unlink(missing_ok=True)
 
 
-def _run_claude(prompt: str, repo_dir: Path) -> str:
+def _run_claude(prompt: str, repo_dir: Path, timeout: int | None = None, model: str | None = None) -> str:
     completed = subprocess.run(
         [_executable("claude"), "-p", "--no-session-persistence", "--restricted",
          "--strict-mcp-config", "--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
-         "--output-format", "text", prompt],
+         *_model_args("--model", model), "--output-format", "text", prompt],
         cwd=repo_dir, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        env=_agent_environment(), timeout=SUMMARY_TIMEOUT_SECONDS, check=False,
+        env=_agent_environment(), timeout=SUMMARY_TIMEOUT_SECONDS if timeout is None else timeout, check=False,
     )
     if completed.returncode != 0:
         raise RuntimeError(f"Claude summary run exited {completed.returncode}")
@@ -410,7 +432,7 @@ def validate_reading_guide(content: str, links: dict[str, str]) -> None:
 
 
 def agent_runner(harness: str):
-    """Return the callable(prompt, repo_dir) -> text that runs the triggering harness."""
+    """Return the callable(prompt, repo_dir, timeout=None, model=None) -> text that runs the triggering harness."""
     if harness == "codex":
         return _run_codex
     if harness == "claude-code":

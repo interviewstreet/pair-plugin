@@ -54,8 +54,8 @@ validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
 - **Node `change`**: from the snapshot status of its `files`. All added: `added`.
   All deleted: `removed`. Any modified or renamed: `modified`. No files
   (context or external node): `unchanged`.
-- **Node `state`**: `changed` when `change` is not `unchanged`, `routine` when
-  `kind` is `routine`, else `context`.
+- **Node `state`**: `routine` when `kind` is `routine` (even if its files
+  changed), else `changed` when `change` is not `unchanged`, else `context`.
 - **Node `stats`**: `files` count, and `additions`/`deletions` summed from the
   `+`/`-` hunk lines of its files.
 - **Edge `change`**: from the hunk lines its evidence cites. Only old-side

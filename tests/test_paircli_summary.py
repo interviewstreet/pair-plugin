@@ -696,3 +696,93 @@ def test_agent_runner_picks_the_triggering_harness():
     assert summary.agent_runner("claude-code") is summary._run_claude
     with pytest.raises(RuntimeError, match="not supported for other"):
         summary.agent_runner("other")
+
+
+# --- agent runner argv: timeout and model ---------------------------------------------------
+
+def capture_run(monkeypatch, output="done"):
+    """Replace subprocess.run; return the list of (argv, kwargs) and write codex's output file."""
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if "--output-last-message" in argv:
+            Path(argv[argv.index("--output-last-message") + 1]).write_text(output, encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    monkeypatch.setattr(summary.subprocess, "run", fake_run)
+    monkeypatch.setattr(summary, "_executable", lambda name: f"/bin/{name}")
+    return calls
+
+
+def test_runners_keep_default_argv_and_timeout_without_options(monkeypatch, tmp_path):
+    calls = capture_run(monkeypatch)
+    assert summary._run_claude("prompt", tmp_path) == "done"
+    assert summary._run_codex("prompt", tmp_path) == "done"
+    claude_argv, claude_kwargs = calls[0]
+    codex_argv, codex_kwargs = calls[1]
+    assert "--model" not in claude_argv and "-m" not in codex_argv
+    assert claude_argv[-3:] == ["--output-format", "text", "prompt"]
+    assert claude_kwargs["timeout"] == codex_kwargs["timeout"] == summary.SUMMARY_TIMEOUT_SECONDS
+
+
+def test_runners_pass_model_and_timeout_when_given(monkeypatch, tmp_path):
+    calls = capture_run(monkeypatch)
+    summary._run_claude("prompt", tmp_path, timeout=17, model="some-model")
+    summary._run_codex("prompt", tmp_path, timeout=23, model="other-model")
+    claude_argv, claude_kwargs = calls[0]
+    codex_argv, codex_kwargs = calls[1]
+    assert claude_argv[claude_argv.index("--model") + 1] == "some-model"
+    assert claude_argv[-1] == "prompt" and claude_kwargs["timeout"] == 17
+    assert codex_argv[codex_argv.index("-m") + 1] == "other-model" and codex_kwargs["timeout"] == 23
+    assert codex_argv[-1] == "-"
+
+
+def test_runners_accept_a_timeout_or_a_model_alone(monkeypatch, tmp_path):
+    calls = capture_run(monkeypatch)
+    summary._run_claude("prompt", tmp_path, model="m1")
+    summary._run_claude("prompt", tmp_path, timeout=9)
+    assert calls[0][1]["timeout"] == summary.SUMMARY_TIMEOUT_SECONDS and "--model" in calls[0][0]
+    assert calls[1][1]["timeout"] == 9 and "--model" not in calls[1][0]
+
+
+@pytest.mark.parametrize("bad", ["--dangerous", "-m x", "a b", "", "x;y"])
+def test_runners_refuse_a_model_that_looks_like_a_flag(monkeypatch, tmp_path, bad):
+    capture_run(monkeypatch)
+    with pytest.raises(ValueError):
+        summary._run_claude("prompt", tmp_path, model=bad)
+    with pytest.raises(ValueError):
+        summary._run_codex("prompt", tmp_path, model=bad)
+
+
+def test_runner_timeout_expiry_propagates(monkeypatch, tmp_path):
+    def expire(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(summary.subprocess, "run", expire)
+    monkeypatch.setattr(summary, "_executable", lambda name: f"/bin/{name}")
+    with pytest.raises(subprocess.TimeoutExpired):
+        summary._run_claude("prompt", tmp_path, timeout=3)
+
+
+def test_stage_model_reads_the_environment_and_never_defaults(monkeypatch):
+    for name in ("SUMMARY", "GROUP", "MERGE"):
+        monkeypatch.delenv(f"PAIRCLI_MODEL_{name}", raising=False)
+    assert summary.stage_model("summary") is None
+    monkeypatch.setenv("PAIRCLI_MODEL_GROUP", "  fast-model[1m]  ")
+    monkeypatch.setenv("PAIRCLI_MODEL_MERGE", "")
+    assert summary.stage_model("group") == "fast-model[1m]"
+    assert summary.stage_model("GROUP") == "fast-model[1m]"
+    assert summary.stage_model("merge") is None
+    assert summary.stage_model("summary") is None
+
+
+@pytest.mark.parametrize("value", ["--flag", "two words", "-m", "a;b"])
+def test_stage_model_ignores_values_that_could_be_flags(monkeypatch, value):
+    monkeypatch.setenv("PAIRCLI_MODEL_SUMMARY", value)
+    assert summary.stage_model("summary") is None
+
+
+@pytest.mark.parametrize("stage", ["", "a-b", "x y", None])
+def test_stage_model_rejects_odd_stage_names(stage):
+    assert summary.stage_model(stage) is None

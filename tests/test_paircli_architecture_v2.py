@@ -302,8 +302,8 @@ def test_enrich_does_not_crash_on_malformed_drafts(malformed):
     ("hunk-less file", ["docs/notes.md"], "file", ("modified", "changed", {"files": 1, "additions": 0, "deletions": 0})),
     ("unchanged context", [], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0})),
     ("unchanged routine", [], "routine", ("unchanged", "routine", {"files": 0, "additions": 0, "deletions": 0})),
-    # The contract lists `changed` before `routine`, so a routine node that has diff files is `changed`.
-    ("changed routine", ["package-lock.json"], "routine", ("modified", "changed", {"files": 1, "additions": 1, "deletions": 0})),
+    # A routine row is collapsed in the view even when its files changed.
+    ("changed routine", ["package-lock.json"], "routine", ("modified", "routine", {"files": 1, "additions": 1, "deletions": 0})),
     ("file outside the PR is ignored", ["elsewhere.ts"], "service", ("unchanged", "context", {"files": 0, "additions": 0, "deletions": 0})),
     ("repeated file counts once", [REVIEWS, REVIEWS], "service", ("modified", "changed", {"files": 1, "additions": 2, "deletions": 1})),
 ])

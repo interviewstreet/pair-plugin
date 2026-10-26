@@ -207,7 +207,7 @@ def node_facts(node: dict, index: SnapshotIndex) -> dict:
         change = "removed"
     else:
         change = "modified"
-    state = "changed" if change != "unchanged" else "routine" if node.get("kind") == "routine" else "context"
+    state = "routine" if node.get("kind") == "routine" else "changed" if change != "unchanged" else "context"
     counts = [index.lines(file) for file in resolved]
     return {"change": change, "state": state,
             "stats": {"files": len(resolved),
