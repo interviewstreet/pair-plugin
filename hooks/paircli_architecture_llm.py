@@ -242,29 +242,15 @@ def count_of(value) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
-def api_counts(node: dict) -> dict:
-    """The `api_added` / `api_removed` numbers of a row's own stats; absent keys stay absent."""
-    stats = node.get("stats") if isinstance(node.get("stats"), dict) else {}
-    return {key: stats[key] for key in API_KEYS if count_of(stats.get(key)) is not None}
+def row_stats(facts: dict) -> dict:
+    """A row's stats for the digest: the computed `stats` of `node_facts` (files, additions, deletions,
+    api_added, api_removed), never whatever the unenriched draft carries. A pattern row covers all members."""
+    return dict(facts["stats"])
 
 
-def row_stats(node: dict, facts: dict) -> dict:
-    """Stats for the digest: computed from the snapshot, plus the draft's own pattern totals and API counts."""
-    stats = {key: value for key, value in facts["stats"].items() if key not in API_KEYS}  # the draft's own, below
-    own = node.get("stats") if isinstance(node.get("stats"), dict) else {}
-    pattern = node.get("pattern") if node.get("kind") == "pattern" and isinstance(node.get("pattern"), dict) else None
-    if pattern is not None:
-        # `files` of a pattern row is only a sample: its totals cover every member.
-        total = count_of(own.get("files")) if own else None
-        total = total if total is not None else count_of(pattern.get("count"))
-        if own and all(count_of(own.get(key)) is not None for key in ("additions", "deletions")):
-            stats.update(additions=own["additions"], deletions=own["deletions"])
-        elif total is not None:
-            stats = {"files": total}
-        if total is not None:
-            stats["files"] = total
-    stats.update(api_counts(node))
-    return stats
+def api_counts(facts: dict) -> dict:
+    """The computed `api_added` / `api_removed` of a row's `node_facts`."""
+    return {key: facts["stats"][key] for key in API_KEYS if count_of(facts["stats"].get(key)) is not None}
 
 
 def pattern_facts(node: dict) -> dict | None:
@@ -315,7 +301,7 @@ def build_group_digest(draft, group_id: str, snapshot) -> dict:
                              old_hunks=[list(item) for item in index.ranges(file, "old")[:MAX_DIGEST_HUNKS]])
             files.append(entry)
         row = {"id": node["id"], "label": node.get("label"), "kind": node.get("kind"),
-               "description": node.get("description"), "change": facts["change"], "stats": row_stats(node, facts),
+               "description": node.get("description"), "change": facts["change"], "stats": row_stats(facts),
                "sensitive": any(entry["sensitive"] for entry in files), "files": files}
         pattern = pattern_facts(node)
         if pattern is not None:
@@ -373,11 +359,12 @@ def build_merge_digest(draft, summaries: dict, snapshot) -> dict:
         group_removed = group_added = 0
         for node in dicts(draft.get("nodes")):
             if node.get("group") == group_id and isinstance(node.get("id"), str):
+                facts = node_facts(node, index)  # computed once per row: the draft itself has no stats yet
                 row = {"id": node["id"], "label": node.get("label"), "kind": node.get("kind"),
-                       "change": node_facts(node, index)["change"],
+                       "change": facts["change"],
                        "description": str(node.get("description") or "")[:MERGE_DESCRIPTION_CHARS],
                        "evidence": dicts(node.get("evidence"))[:2]}
-                api = api_counts(node)
+                api = api_counts(facts)
                 row.update({key: value for key, value in api.items() if value})
                 pattern = pattern_facts(node)
                 if pattern is not None:

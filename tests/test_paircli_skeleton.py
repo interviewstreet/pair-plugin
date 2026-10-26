@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import io
 import json
 import re
@@ -17,6 +18,7 @@ from paircli_skeleton import (
 )
 from snapshot_factory import (
     HEAD, deleted_templates, make_file, make_hunk, make_snapshot, many_files, repeated_edits, source_lines,
+    version_bumps,
 )
 
 
@@ -743,17 +745,44 @@ def test_fewer_than_three_files_make_no_pattern():
     assert not any(item["in_pattern"] for item in skeleton["files"])
 
 
-def test_patterns_never_cross_groups_and_keep_one_signature_each():
+def test_each_pattern_lives_in_one_group_and_members_are_unique():
     files = repeated_edits(48, variants=2, directory="src/modules")
     _, skeleton = build(files)
     assert len(skeleton["groups"]) > 1
     seen = set()
     for group in skeleton["groups"]:
         for pattern in group["patterns"]:
-            assert set(pattern["members"]) <= set(group["files"]), "members belong to their own group"
             assert not set(pattern["members"]) & seen
             seen |= set(pattern["members"])
     assert seen == {item["path"] for item in skeleton["files"] if item["in_pattern"]}
+    assert sorted(pattern["count"] for _, pattern in group_patterns(skeleton)) == [24, 24], "PR-wide, one per kind"
+
+
+def test_same_change_clusters_are_pr_wide_and_assigned_to_the_majority_group():
+    files = ([make_file(f"src/a/m{index}.ts", start=2, removed=["const mode = 'old';"],
+                        added=[f"const mode = 'new{index}';"]) for index in range(4)]
+             + [make_file(f"src/b/m{index}.ts", start=2, removed=["const mode = 'old';"],
+                          added=[f"const mode = 'new{index}';"]) for index in range(2)]
+             + [make_file("src/b/other.ts", added=["const lonely = 1;"])])
+    _, skeleton = build(files)
+    ((path, pattern),) = group_patterns(skeleton)
+    assert path == "src/a" and pattern["count"] == 6
+    group_b = next(group for group in skeleton["groups"] if group["path"] == "src/b")
+    assert group_b["patterns"] == [] and "src/b/m0.ts" in group_b["files"]
+    assert all(item["in_pattern"] for item in skeleton["files"] if item["path"] != "src/b/other.ts")
+
+
+def test_the_v1_diagram_is_byte_identical_with_cross_group_patterns():
+    files = (version_bumps(40) + repeated_edits(120, variants=3) + deleted_templates(6)
+             + [make_file("src/app/main.ts", added=["import { log } from '../modules/area0/mod0';", "const main = 1;"]),
+                make_file("src/app/util.ts", added=source_lines(4))])
+    snapshot, skeleton = build(files)
+    document = deterministic_architecture(skeleton, HEAD, snapshot)
+    # Golden value computed with the skeleton before cross-group patterns existed (same-change
+    # clusters inside one directory group only): v1 reads group files, never patterns.
+    digest = hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
+    assert digest == "ad0129a9a1825557d6c7974b7245d21288a2a99a0be85a8b93f15eae6718f61f"
+    assert any(group["patterns"] for group in skeleton["groups"])
 
 
 def test_tests_docs_and_config_fold_when_a_group_has_three_and_skip_same_change_members():

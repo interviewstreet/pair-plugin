@@ -128,19 +128,22 @@ def golden_draft(snapshot):
     }
 
 
-@pytest.fixture(scope="module")
+BUILT = build_world()
+
+
+@pytest.fixture
 def world():
-    return build_world()
+    return copy.deepcopy(BUILT)
 
 
 @pytest.fixture
-def snapshot(world):
-    return copy.deepcopy(world[0])
+def snapshot():
+    return copy.deepcopy(BUILT[0])
 
 
 @pytest.fixture
-def document(world):
-    return copy.deepcopy(world[1])
+def document():
+    return copy.deepcopy(BUILT[1])
 
 
 @pytest.fixture
@@ -224,8 +227,7 @@ def test_enrich_computes_component_facts(world):
     overview = enrich_overview(normalize_overview(golden_draft(snapshot))[0], document, snapshot, "llm")
     store, legacy, db = (component(overview, name) for name in ("store", "legacy", "db"))
     assert (store["change"], store["state"]) == ("added", "changed")
-    assert store["stats"] == {"files": 1, "additions": 13, "deletions": 0, "api_added": 0, "api_removed": 0} \
-        or store["stats"]["additions"] == 13
+    assert store["stats"] == {"files": 1, "additions": 13, "deletions": 0, "api_added": 0, "api_removed": 0}
     assert (component(overview, "view")["change"], legacy["change"]) == ("modified", "removed")
     assert legacy["stats"]["deletions"] == 6
     assert (db["change"], db["state"], db["members"]) == ("unchanged", "context", [])
@@ -247,7 +249,7 @@ def test_enrich_computes_other_for_unclaimed_rows(world):
     assert {ref["path"] for ref in other["evidence"]} == {TEST, GUIDE}
     assert other["group"] == "other" and {"id": "other", "label": "Other changes"}.items() <= \
         next(group for group in overview["groups"] if group["id"] == "other").items()
-    assert overview["components"][-1] is other or overview["components"][-1] == other
+    assert overview["components"][-1] == other
 
 
 def test_enrich_has_no_other_when_everything_is_claimed(world):
@@ -308,7 +310,6 @@ def test_enrich_uses_the_own_stats_of_pattern_members(world):
     assert stats == {"files": 4, "additions": 43, "deletions": 9, "api_added": 4, "api_removed": 2}
     assert component(overview, "pat")["change"] == "modified"
     assert "tests-pattern" not in component(overview, "other")["members"]
-    validate_overview(overview, document, HEAD, snapshot) if False else None
 
 
 def test_enrich_other_stats_sum_api_fields(world):
@@ -347,18 +348,18 @@ def test_enrich_drops_unused_groups_and_lays_groups_out(world):
 
 def test_enrich_puts_other_in_the_heaviest_group_when_groups_are_full(world):
     snapshot, document = world
-    groups = [{"id": f"g{n}", "label": f"G{n}"} for n in range(8)]
-    names = [item["id"] for item in document["nodes"][:5]]
-    draft = {"groups": groups, "edges": [], "steps": [], "components": [
-        {"id": f"c{n}", "label": f"C{n}", "group": f"g{n}", "kind": "component", "description": "x",
-         "members": [names[n]]} for n in range(5)]}
-    draft["components"].append({"id": "c5", "label": "C5", "group": "g5", "kind": "component", "description": "x",
-                                "members": [names[0]]})
-    draft["groups"] = groups[:6] + [{"id": "u1", "label": "U"}, {"id": "u2", "label": "U"}]
+    claims = [ids(STORE), ids(VIEW, ROUTE), ids(SERVICE), ids(LEGACY), ids(TEST), ids(GUIDE), [], []]
+    draft = {"groups": [{"id": f"g{n}", "label": f"G{n}"} for n in range(8)], "edges": [], "steps": [], "components": [
+        {"id": f"c{n}", "label": f"C{n}", "group": f"g{n}", "kind": "context" if not members else "component",
+         "description": "x", "members": members, "evidence": [cite(snapshot, SERVICE)] if not members else []}
+        for n, members in enumerate(claims)]}
     overview = enrich_overview(draft, document, snapshot, "llm")
-    assert len(overview["groups"]) <= 8
-    assert component(overview, "other")["group"] in {group["id"] for group in overview["groups"]}
-    assert "other" not in {group["id"] for group in overview["groups"]} or len(overview["groups"]) <= 8
+    assert len(overview["groups"]) == 8 and "other" not in {group["id"] for group in overview["groups"]}
+    assert component(overview, "other")["group"] == "g1"        # the group with two files
+    # with a group to spare, `other` gets its own
+    draft["components"].pop()
+    draft["groups"].pop()
+    assert "other" in {group["id"] for group in enrich_overview(draft, document, snapshot, "llm")["groups"]}
 
 
 def test_enrich_keeps_valid_citations_and_leaves_all_invalid_lists_for_validation(world):
@@ -415,6 +416,40 @@ def test_enrich_and_finalize_never_crash_on_malformed_drafts(draft, world):
         finalize_overview(draft, document, HEAD, snapshot, "llm")
 
 
+def test_finalize_survives_random_damage_to_a_valid_draft(world):
+    import random
+    snapshot, document = world
+    rng = random.Random(7)
+    junk = [None, 0, -1, True, "", "x" * 500, [], {}, [None], {"a": 1}, 1.5, "other", float("inf")]
+
+    def damage(value):
+        if isinstance(value, dict) and value:
+            key = rng.choice(sorted(value))
+            if rng.random() < 0.3:
+                del value[key]
+            else:
+                value[key] = rng.choice(junk) if rng.random() < 0.5 else damage(value[key])
+        elif isinstance(value, list) and value:
+            position = rng.randrange(len(value))
+            if rng.random() < 0.3:
+                del value[position]
+            else:
+                value[position] = rng.choice(junk) if rng.random() < 0.5 else damage(value[position])
+        else:
+            return rng.choice(junk)
+        return value
+
+    for _ in range(400):
+        draft = golden_draft(snapshot)
+        for _round in range(rng.randrange(1, 4)):
+            damage(draft)
+        try:
+            overview, _ = finalize_overview(draft, document, HEAD, snapshot, "llm")
+        except ArchitectureError:
+            continue
+        validate_overview(overview, document, HEAD, snapshot)        # whatever survives is valid
+
+
 @pytest.mark.parametrize("draft", [None, [], "x", 3])
 def test_enrich_returns_non_dict_drafts_and_finalize_reports_them(draft, world):
     snapshot, document = world
@@ -449,9 +484,7 @@ def test_golden_overview_is_valid_and_complete(golden, document, snapshot):
     assert len(json.dumps(golden)) < MAX_BYTES
 
 
-def mutate(path):
-    """Decorator-free helper: a mutation is a (name, function(overview, document), error path, reason fragment)."""
-
+# Each mutation breaks one rule of the golden overview; MUTATIONS lists (mutation, error path, reason fragment).
 
 def m_label_long(o, d):
     o["components"][0]["label"] = "x" * 41
@@ -866,11 +899,19 @@ def test_deterministic_overview_of_the_world(world):
     assert by_id["other"]["members"] == ids(LOCK)           # the routine row
     (edge,) = overview["edges"]
     assert (edge["source"], edge["target"], edge["label"]) == ("c-server", "c-web", "imports")
-    assert edge["claim"] == "3 imports between these areas" and len(edge["evidence"]) == 3
+    assert edge["claim"] == "2 imports between these areas" and len(edge["evidence"]) == 2
     assert {ref["path"] for ref in edge["evidence"]} <= {ROUTE, SERVICE}
     assert edge["id"].startswith("o-")
     groups = {group["id"] for group in overview["groups"]}
     assert all(item["group"] in groups for item in overview["components"])
+
+
+def test_deterministic_overview_does_not_reuse_the_name_of_the_computed_component(world):
+    snapshot, document = world
+    document["groups"][2]["label"] = "Other changes"
+    overview = deterministic(document, snapshot)
+    labels = [item["label"] for item in overview["components"]]
+    assert labels.count("Other changes") == 1 and "Smaller areas" in labels
 
 
 def test_deterministic_overview_is_deterministic(world):
@@ -886,7 +927,7 @@ def test_deterministic_overview_labels_unrelated_edges_as_uses(world):
     for edge in document["edges"]:
         edge["label"] = "calls"
     (edge,) = deterministic(document, snapshot)["edges"]
-    assert (edge["label"], edge["claim"]) == ("uses", "3 links between these areas")
+    assert (edge["label"], edge["claim"]) == ("uses", "2 links between these areas")
 
 
 def test_deterministic_overview_skips_edges_it_cannot_cite(world):
@@ -1074,7 +1115,7 @@ def test_generate_retries_once_with_the_structured_errors(artifact, world):
 
 def test_generate_retry_lines_are_capped(artifact, world):
     bad = golden_draft(world[0])
-    bad["components"] = [dict(bad["components"][0], id=f"c{n}", members=[f"ghost-{'x' * 300}-{n}"]) for n in range(20)]
+    bad["components"] = [dict(bad["components"][0], id=f"c{n}", members=[f"ghost-{'x' * 300}-{n}", "ghost2"]) for n in range(15)]
     stub = Stub([json.dumps(bad), json.dumps(golden_draft(world[0]))])
     run(artifact, world, stub)
     lines = [line for line in stub.calls[1]["prompt"].splitlines() if line.startswith("overview.")]
@@ -1210,7 +1251,7 @@ def test_digest_is_capped_for_huge_documents(artifact, world):
     document = copy.deepcopy(document)
     template = document["nodes"][0]
     document["nodes"] = [dict(template, id=f"node-{n}", label="L" * 80, description="d" * 1200, evidence=[template["evidence"][0]] * 12)
-                         for n in range(60)]
+                         for n in range(400)]
     document["steps"] = [{"id": f"s{n}", "when": "after", "text": "t" * 400} for n in range(24)]
     document["edges"] = []
     digest = build_overview_digest(document, snapshot, {"components": [{"id": f"c{n}", "label": "x" * 40, "members": [f"node-{n}"] * 40}

@@ -837,6 +837,8 @@ def deterministic_overview(document, snapshot) -> dict:
     candidates = []  # (weight, position, group id, label, nodes)
     for name in order:
         label = str(detailed_groups.get(name, {}).get("label") or name or "Changes")
+        if label.strip().lower() == OTHER_LABEL.lower():  # the detailed draft's catch-all group; `other` is code's
+            label = "Smaller areas"
         chunks = chunk_by_directory([(directory_parts(node), node) for node in by_group[name]])
         for number, chunk in enumerate(chunks, 1):
             tail = common_directory([file for node in chunk for file in member_files(node)]).rsplit("/", 1)[-1]
@@ -1072,7 +1074,12 @@ def build_overview_digest(document, snapshot, baseline=None) -> dict:
         for group in value["groups"]:
             group.pop("summary", None)
 
-    for shrink in (drop_evidence, short_descriptions, drop_baseline, drop_summaries):
+    def fewer_rows(value):
+        for key in ("nodes", "edges", "groups"):
+            while size_of(value) > MAX_DIGEST_BYTES and len(value[key]) > 1:
+                del value[key][len(value[key]) // 2 + 1:]
+
+    for shrink in (drop_evidence, short_descriptions, drop_baseline, drop_summaries, fewer_rows):
         if size_of(digest) <= MAX_DIGEST_BYTES:
             break
         shrink(digest)

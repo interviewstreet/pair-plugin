@@ -30,13 +30,18 @@ is no model, no network and no repository read, and the same input always gives 
   docs_only             no files, or every non-routine file is documentation (and one exists)
   no_citable_lines      no file has a new-side hunk line to cite
 
-Patterns: within each group (never across groups) the non-routine files with line data are clustered
-by `paircli_patterns.cluster_same_change` (identical change signature, 3 or more files). Then, from the
-files not already in a cluster, a group with at least 3 `test`, `docs` or `config` files gets one folded
-pattern per category (`category_members`). A group's `patterns` list holds, in that order,
-`{family, signature (None unless same-change), members (sorted paths), count, additions, deletions,
-status}`; `status` is the shared file status of a same-change pattern, else added or deleted when every
-member is, else modified. A path belongs to at most one pattern.
+Patterns: same-change clustering runs once over ALL non-routine files with line data
+(`paircli_patterns.cluster_same_change`: identical change signature, 3 or more files), whatever their
+directory, so a repeated change in a flat monorepo layout is one pattern, not one per directory. Each
+cluster is assigned to ONE group, the one holding most of its members (ties: smallest group id), and
+appears only in that group's `patterns`. Members that live in other groups stay in those groups'
+`files` (so the v1 diagram, which reads `files`, is unchanged) but belong to the assigned group's
+pattern: a consumer that draws rows must skip every path that some group pattern claims. Then, from
+the files no cluster claimed, a group with at least 3 `test`, `docs` or `config` files of its own gets
+one folded pattern per category (`category_members`), still per group. A group's `patterns` list holds,
+in that order, `{family, signature (None unless same-change), members (sorted paths), count, additions,
+deletions, status}`; `status` is the shared file status of a same-change pattern, else added or deleted
+when every member is, else modified. A path belongs to at most one pattern.
 
 `deterministic_architecture(skeleton, head, snapshot)` turns that into an ADE v1 document, or
 returns None when nothing can be cited.
@@ -516,31 +521,56 @@ def _pattern_status(statuses: set[str]) -> str:
     return "modified"
 
 
-def _group_patterns(paths: list[str], entries: dict[str, dict], records: dict[str, dict]) -> list[dict]:
-    """Same-change clusters, then tests/docs/config folds, among one group's files; marks members `in_pattern`."""
-    from paircli_patterns import MAX_MEMBERS, MIN_MEMBERS, _split_members, category_members, cluster_same_change
+def _pattern_record(family: str, signature, members: list[str], status: str, records: dict[str, dict]) -> dict:
+    return {
+        "family": family, "signature": signature, "members": members, "count": len(members),
+        "additions": sum(records[path]["additions"] for path in members),
+        "deletions": sum(records[path]["deletions"] for path in members), "status": status,
+    }
+
+
+def _same_change_patterns(owner: dict[str, str], entries: dict[str, dict],
+                          records: dict[str, dict]) -> dict[str, list[dict]]:
+    """PR-wide same-change clusters, each assigned to ONE group: the group id -> its patterns.
+
+    `owner` maps every non-routine path to its directory group id. A cluster goes to the group holding
+    the most of its members (ties: the smallest group id). Members that sit in other groups stay in
+    those groups' `files` (the v1 diagram reads them) but are claimed by the pattern.
+    """
+    from paircli_patterns import cluster_same_change
+
+    candidates = [entries[path] for path in sorted(owner) if lines_available(entries[path])]
+    assigned: dict[str, list[dict]] = {}
+    for cluster in cluster_same_change(candidates):
+        held: dict[str, int] = {}
+        for path in cluster["members"]:
+            held[owner[path]] = held.get(owner[path], 0) + 1
+        group = min(held, key=lambda name: (-held[name], name))
+        assigned.setdefault(group, []).append(
+            _pattern_record("same-change", cluster["signature"], cluster["members"], cluster["status"], records))
+    return assigned
+
+
+def _group_patterns(paths: list[str], entries: dict[str, dict], records: dict[str, dict],
+                    same_change: list[dict], claimed: set[str]) -> list[dict]:
+    """The group's patterns: its assigned same-change clusters, then tests/docs/config folds of its own
+    files that no cluster (of any group) claimed. Marks every member `in_pattern`."""
+    from paircli_patterns import MAX_MEMBERS, MIN_MEMBERS, _split_members, category_members
 
     candidates = [entries[path] for path in paths if lines_available(entries[path])]
-    patterns = []
+    patterns = list(same_change)
     taken: set[str] = set()
-
-    def add(family: str, signature, members: list[str], status: str) -> None:
-        taken.update(members)
-        patterns.append({
-            "family": family, "signature": signature, "members": members, "count": len(members),
-            "additions": sum(records[path]["additions"] for path in members),
-            "deletions": sum(records[path]["deletions"] for path in members), "status": status,
-        })
-
-    for cluster in cluster_same_change(candidates):
-        add("same-change", cluster["signature"], cluster["members"], cluster["status"])
+    for pattern in patterns:
+        taken.update(pattern["members"])
     for family in PATTERN_FAMILIES:
-        members = category_members(candidates, family, skip=taken)
+        members = category_members(candidates, family, skip=claimed | taken)
         if not members:
             continue
         for piece in _split_members(members, MAX_MEMBERS):
             if len(piece) >= MIN_MEMBERS:
-                add(family, None, piece, _pattern_status({records[path]["status"] for path in piece}))
+                patterns.append(_pattern_record(
+                    family, None, piece, _pattern_status({records[path]["status"] for path in piece}), records))
+                taken.update(piece)
     for path in taken:
         records[path]["in_pattern"] = True
     return patterns
@@ -608,6 +638,9 @@ def build_skeleton(snapshot: dict, head: str) -> dict:
         routine_counts[key] = routine_counts.get(key, 0) + 1
         record["group"] = ids[key]
 
+    owner = {path: ids[key] for key, group_paths in members.items() for path in group_paths}
+    same_change = _same_change_patterns(owner, entries_by_path, records)
+    claimed = {path for patterns in same_change.values() for pattern in patterns for path in pattern["members"]}
     groups = []
     for key, group_paths in members.items():
         group_records = sorted((records[path] for path in group_paths), key=lambda record: (-record["score"], record["path"]))
@@ -624,7 +657,7 @@ def build_skeleton(snapshot: dict, head: str) -> dict:
             "change": _group_change(group_records),
             "score": _score(additions + deletions, sensitive, _dominant_penalty(group_records)),
             "citable_files": sum(record["has_new_lines"] for record in group_records),
-            "patterns": _group_patterns(group_paths, entries_by_path, records),
+            "patterns": _group_patterns(group_paths, entries_by_path, records, same_change.get(ids[key], []), claimed),
         })
     groups.sort(key=lambda group: (-group["score"], group["path"], group["id"]))
 

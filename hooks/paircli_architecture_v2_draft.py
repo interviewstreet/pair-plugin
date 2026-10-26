@@ -41,7 +41,8 @@ from pathlib import Path
 
 from paircli_architecture import MAX_BYTES, require, save_atomic
 from paircli_architecture_v2 import (
-    ID_PATTERN, MAX_EDGES, MAX_FILES_PER_NODE, MAX_GAPS, MAX_GROUPS, MAX_NODES, MAX_REFS, SnapshotIndex, dicts,
+    ID_PATTERN, MAX_EDGES, MAX_FILES_PER_NODE, MAX_GAPS, MAX_GROUPS, MAX_NODES, MAX_REFS, SnapshotIndex, common_directory,
+    dicts,
 )
 from paircli_patterns import MIN_MEMBERS, pattern_label, verify_pattern
 from paircli_skeleton import CATEGORY_PENALTY, _clean, _int, _line_kind, _plural, _slug, size_budget
@@ -224,15 +225,18 @@ def _file_priority(record: dict) -> float:
 
 def _describe_pattern(pattern: dict) -> str:
     count = len(pattern["members"])
+    directories = len({posixpath.dirname(path) for path in pattern["members"]})
+    spans = f" Spans {directories} directories." if directories > 1 else ""
     if pattern["family"] == "same-change":
         status = pattern["status"]
         change = {"deleted": "removes", "added": "adds"}.get(status)
         what = (f"Each {change} the same lines (digits aside)." if change
                 else "Each makes the same edit (digits aside).")
         return (f"{count} files with the same change: {status}. {what} "
-                f"Together +{pattern['additions']}/-{pattern['deletions']} lines.")
+                f"Together +{pattern['additions']}/-{pattern['deletions']} lines.{spans}")
     noun = {"tests": "test", "docs": "doc", "config": "config"}[pattern["family"]]
-    return f"{count} {noun} files changed in this area. Together +{pattern['additions']}/-{pattern['deletions']} lines."
+    return (f"{count} {noun} files changed in this area. "
+            f"Together +{pattern['additions']}/-{pattern['deletions']} lines.{spans}")
 
 
 def _pattern_node(group_id: str, pattern: dict, records: dict, cite: _Citations, taken: set[str]) -> dict | None:
@@ -285,7 +289,16 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
     def citable(group: dict) -> list[str]:
         return [path for path in group["files"] if path in records and cite.usable(path)]
 
-    eligible = [group for group in skeleton_groups if citable(group)]
+    # Patterns are assigned to one group each but may claim files that sit in other groups: those files
+    # are not rows of their own group. A pattern the validator would reject releases its members.
+    verified = {str(group.get("id")): _verified_patterns(group.get("patterns"), cite, records) for group in skeleton_groups}
+    claimed = {path for patterns in verified.values() for pattern in patterns for path in pattern["members"]}
+
+    def rows_of(group: dict) -> tuple[list[str], list[dict]]:
+        """The group's own file rows' candidates and its patterns; (`[]`, `[]`) when nothing is left."""
+        return [path for path in citable(group) if path not in claimed], verified.get(str(group.get("id")), [])
+
+    eligible = [group for group in skeleton_groups if any(rows_of(group))]
     if not eligible:
         return None
 
@@ -299,9 +312,9 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
         other_id = "other"
         if other_id in {group["id"] for group in keep}:
             other_id = _identifier("other", {group["id"] for group in keep}, "other")
+        verified[other_id] = [item for group in rest for item in verified.get(str(group.get("id")), [])]
         eligible = keep + [{"id": other_id, "label": OTHER_LABEL, "files": paths,
-                            "merged_ids": [group["id"] for group in rest],
-                            "patterns": [item for group in rest for item in dicts(group.get("patterns"))]}]
+                            "merged_ids": [group["id"] for group in rest], "merged": True}]
     routine_by_group: dict[str, list[str]] = {}
     for record in records.values():
         if record.get("routine") and isinstance(record.get("group"), str):
@@ -312,6 +325,7 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
     group_ids: set[str] = set()
     node_ids: set[str] = set()
     groups, nodes, row_of, pattern_of = [], [], {}, {}
+    spread: set[str] = set()
     unlisted = folded = 0
     pattern_rows = 0
     for group in eligible:
@@ -319,10 +333,10 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
         routine = sorted(path for source in group.get("merged_ids") or [group["id"]]
                          for path in routine_by_group.get(source, []))
         shown = max(1, per_group - 1) if routine else per_group
-        usable = citable(group)
-        patterns = _verified_patterns(group.get("patterns"), cite, records)
-        members = {path for pattern in patterns for path in pattern["members"]}
-        singles = [path for path in usable if path not in members]
+        singles, patterns = rows_of(group)
+        own = set(group["files"])
+        if not group.get("merged") and any(path not in own for pattern in patterns for path in pattern["members"]):
+            spread.add(group_id)  # its label names a directory, but a pattern here reaches beyond it
         groups.append({"id": group_id, "label": _clean(group.get("label"), 80) or "Changes"})
 
         # Rows compete for the budget: a pattern row is one row however many files it stands for.
@@ -331,7 +345,8 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
         candidates += [(_pattern_priority(pattern), _pattern_priority(pattern), pattern["members"][0], pattern)
                        for pattern in patterns]
         chosen = sorted(candidates, key=lambda item: (-item[0], item[2]))[:shown]
-        unlisted += len(usable) - sum(1 if item[3] is None else len(item[3]["members"]) for item in chosen)
+        unlisted += (len(singles) + sum(len(pattern["members"]) for pattern in patterns)
+                     - sum(1 if item[3] is None else len(item[3]["members"]) for item in chosen))
         for _priority, _order, path, pattern in sorted(chosen, key=lambda item: (-item[1], item[2])):
             if pattern is not None:
                 node = _pattern_node(group_id, pattern, records, cite, node_ids)
@@ -374,6 +389,12 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
     pattern_nodes = {node["id"]: node for node in nodes if node["kind"] == "pattern"}
     shown_groups = {node["group"] for node in nodes}
     groups = [group for group in groups if group["id"] in shown_groups]
+    for group in groups:
+        if group["id"] in spread:
+            reach = [path for node in nodes if node["group"] == group["id"]
+                     for path in (node["pattern"]["members"] if node["kind"] == "pattern" else node["files"])]
+            where = common_directory(reach).split("/")[-2:]
+            group["label"] = _clean("/".join(part for part in where if part), 80) or "Repeated changes"
 
     edges = _edges(skeleton, cite, row_of, pattern_of, pattern_nodes)
 

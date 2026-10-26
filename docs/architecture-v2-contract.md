@@ -161,7 +161,14 @@ A node with `kind: "pattern"` stands for several files:
   every member is a changed file. Members are unique across all pattern rows, and a member
   is never listed in the `files` of any other row. `pattern.signature` exists only for
   `same-change` rows.
-- A pattern forms inside one group; the same change in two groups gives two rows.
+- **Cluster scope.** `same-change` clustering runs over the whole PR (every non-routine file with
+  line data), not per directory, so one change repeated across a flat layout (`packages/pkg00/package.json`
+  ... `packages/pkg39/package.json`) is one row. Each cluster is assigned to ONE group, the group that
+  holds the most of its members (ties: the smallest group id), and the row appears only there; the
+  members' own groups show no row for them, and a group left with no rows is dropped. A row whose
+  members span several directories says so in its `description` ("Spans N directories."), and the
+  group's computed `path` is the common directory of all members of the rows in it (empty when there
+  is none). `tests`, `docs` and `config` folding stays per group.
 - `files` is a sample of at most 12 members; each needs a citation, as for any node.
   `evidence` has at most 12 refs and must cover the sample (the validator requires a valid
   citation of every sample file).

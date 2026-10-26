@@ -68,7 +68,7 @@ def test_synthetic_prs_of_every_size_finalize_with_nothing_dropped(count):
 
 
 def test_draft_shape_keeps_to_the_model_writable_fields():
-    _, _, draft = build(many_files(12))
+    _, _, draft = build(many_files(12, unique=True))
     assert set(draft) == {"title", "description", "groups", "nodes", "edges", "steps", "gaps"}
     assert all(set(group) == {"id", "label"} for group in draft["groups"])
     node_keys = {"id", "label", "group", "kind", "description", "files", "evidence"}
@@ -325,7 +325,7 @@ def test_edge_evidence_is_capped_per_side():
 # --- caps ------------------------------------------------------------------------------------
 
 def thousand_files():
-    files = many_files(1000, lines=8)
+    files = many_files(1000, lines=8, unique=True)
     for index in range(0, 1000, 2):
         files[index]["hunks"][0]["lines"].insert(1, {"kind": "add", "text": f"import x from './file{index + 1}';", "new_no": 2})
         files[index]["hunks"][0]["new_lines"] += 1
@@ -652,13 +652,27 @@ def test_a_mechanical_bump_in_one_directory_is_one_pattern_row():
     assert node["description"].startswith("40 files with the same change: modified. Each makes the same edit")
 
 
-def test_a_bump_across_package_directories_keeps_one_pattern_per_group_and_far_fewer_rows():
-    # The v1 grouping puts 29 of the 40 package.json files in one group and the rest in single-file
-    # groups; clusters never cross groups, so the bump is one pattern plus the files outside it.
+def test_a_bump_across_package_directories_is_one_pattern_row():
+    # The directory grouping spreads 40 package.json files over many groups; the same change is
+    # clustered PR-wide and the pattern row sits in the group that holds most of its members.
     files = version_bumps(40)
+    snapshot, _, document = finalize(files)
+    skeleton = build_skeleton(snapshot, HEAD)
+    assert len(skeleton["groups"]) > 3, "the layout is flat: many directory groups"
+    (row,) = document["nodes"]
+    assert row["kind"] == "pattern" and row["pattern"]["count"] == 40 == covered(document)
+    assert len(document["groups"]) == 1 and document["groups"][0]["id"] == row["group"]
+    assert "Spans 40 directories." in row["description"]
+    assert document["groups"][0]["path"] == "packages", "common directory of the members"
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_flat_monorepo_bumps_never_make_one_row_per_directory():
+    files = [make_file(f"packages/pkg{index:02d}/package.json", start=3, removed=['  "version": "1.2.3",'],
+                       added=['  "version": "1.3.0",']) for index in range(40)]
     _, _, document = finalize(files)
-    assert len(document["nodes"]) <= 12 < len(files)
-    assert covered(document) >= 29
+    assert [node["kind"] for node in document["nodes"]] == ["pattern"]
+    assert document["nodes"][0]["stats"]["files"] == 40
 
 
 def test_many_modified_files_with_three_repeated_edits_give_three_pattern_rows():
@@ -674,14 +688,82 @@ def test_many_modified_files_with_three_repeated_edits_give_three_pattern_rows()
     assert all(len(node["files"]) == 12 and len(node["evidence"]) == 12 for node in patterns)
 
 
-def test_repeated_edits_spread_over_directories_stay_inside_their_groups():
-    files = repeated_edits(480, variants=3)
+def flat_package_edits(variants: int = 3, packages: int = 40, per_package: int = 12) -> list[dict]:
+    """`per_package` src/modK.ts files in each of `packages` packages; K picks one of `variants` edits."""
+    names = ["Logger", "Tracer", "Meter", "Clock", "Cache"]
+    return [make_file(f"packages/pkg{package:02d}/src/mod{number}.ts", start=2,
+                      removed=[f"import {{ log }} from '{names[number % variants]}';  // v1"],
+                      added=[f"import {{ log }} from '{names[number % variants]}2';  // v{package}"])
+            for package in range(packages) for number in range(per_package)]
+
+
+def test_repeated_edits_spread_over_packages_give_one_row_per_edit_kind():
+    files = flat_package_edits()
+    assert len(files) == 480
+    snapshot, _, document = finalize(files)
+    assert len(build_skeleton(snapshot, HEAD)["groups"]) > 3
+    patterns = patterns_of(document)
+    assert len(document["nodes"]) == 3 == len(patterns)
+    assert sorted(node["pattern"]["count"] for node in patterns) == [160, 160, 160]
+    assert len({member for node in patterns for member in node["pattern"]["members"]}) == 480
+    assert all("Spans 40 directories." in node["description"] for node in patterns)
+    assert all(node["group"] in {group["id"] for group in document["groups"]} for node in patterns)
+    assert len({group["id"] for group in document["groups"]}) == len(document["groups"]) <= 3
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_pattern_goes_to_the_group_with_most_members_and_leaves_no_empty_groups():
+    # 5 members in src/a, 3 in src/b, 1 in src/c: the pattern is src/a's; b and c keep nothing else.
+    members = ([f"src/a/m{index}.ts" for index in range(5)] + [f"src/b/m{index}.ts" for index in range(3)]
+               + ["src/c/m0.ts"])
+    files = [make_file(path, start=2, removed=["const mode = 'old';"], added=[f"const mode = 'new{number}';"])
+             for number, path in enumerate(members)]
+    files += [make_file("src/d/x.ts", added=["const solo = 'd';"])]
+    snapshot, skeleton, draft = build(files)
+    holders = [group for group in skeleton["groups"] if group["patterns"]]
+    assert [group["path"] for group in holders] == ["src/a"] and holders[0]["patterns"][0]["count"] == 9
+    assert all(not group["patterns"] for group in skeleton["groups"] if group is not holders[0])
+    # The other directories' files stay in their `files` (the v1 diagram reads them) and claim `in_pattern`.
+    assert any(path in group["files"] for group in skeleton["groups"] if group["path"] == "src/b" for path in members)
+    document, warnings = finalize_v2(draft, HEAD, snapshot, "deterministic")
+    assert warnings == []
+    assert sorted(node["kind"] for node in document["nodes"]) == ["file", "pattern"]
+    pattern = patterns_of(document)[0]
+    assert pattern["group"] == "src-a" and "Spans 3 directories." in pattern["description"]
+    assert {group["id"] for group in document["groups"]} == {"src-a", "src-d"}
+
+
+def test_a_tie_between_groups_goes_to_the_smallest_group_id():
+    members = [f"src/{name}/m{index}.ts" for name in ("zeta", "alpha", "mid") for index in range(2)]
+    files = [make_file(path, start=2, removed=["const mode = 'old';"], added=[f"const mode = 'new{number}';"])
+             for number, path in enumerate(members)]
     _, skeleton, draft = build(files)
-    _, _, document = finalize(files)
-    assert len(document["nodes"]) == 24 < len(files) / 10
-    for node in patterns_of(document):
-        assert len({path.rsplit("/", 1)[0] for path in node["pattern"]["members"]}) == 1, "one group each"
-        assert node["group"] in {group["id"] for group in document["groups"]}
+    holders = [group for group in skeleton["groups"] if group["patterns"]]
+    assert len(holders) == 1 and holders[0]["id"] == "src-alpha"
+    assert [node["group"] for node in draft["nodes"]] == ["src-alpha"]
+
+
+def test_two_directories_with_different_repeated_changes_keep_two_patterns():
+    one = [make_file(f"src/alpha/f{index}.ts", status="deleted", removed=[f"// gone {index}", "export const A = 1;"])
+           for index in range(3)]
+    two = [make_file(f"src/beta/f{index}.ts", start=2, removed=["const mode = 'old';"],
+                     added=[f"const mode = 'new{index}';"]) for index in range(3)]
+    _, _, document = finalize(one + two)
+    patterns = patterns_of(document)
+    assert len(patterns) == 2 == len(document["nodes"]) and patterns[0]["group"] != patterns[1]["group"]
+    assert all("Spans" not in node["description"] for node in patterns)
+
+
+def test_pattern_clusters_are_deterministic_and_fast_across_a_thousand_flat_files():
+    files = flat_package_edits(variants=4, packages=40, per_package=25)
+    snapshot = make_snapshot(files)
+    started = time.perf_counter()
+    skeleton = build_skeleton(snapshot, HEAD)
+    draft = deterministic_v2_draft(skeleton, snapshot, HEAD)
+    document, warnings = finalize_v2(draft, HEAD, snapshot, "deterministic")
+    assert time.perf_counter() - started < 2.0
+    assert warnings == [] and len(patterns_of(document)) == 4 and covered(document) == 1000
+    assert json.dumps(draft) == json.dumps(deterministic_v2_draft(build_skeleton(snapshot, HEAD), snapshot, HEAD))
 
 
 def test_a_pattern_larger_than_500_files_is_split_into_several_rows():
@@ -725,19 +807,18 @@ def test_only_the_files_that_share_a_signature_are_folded():
     assert len(document["nodes"]) == 5
 
 
-def test_clusters_in_different_groups_stay_separate():
+def test_the_same_change_in_two_groups_is_one_pattern_in_the_larger_group():
     one = [make_file(f"src/alpha/f{index}.ts", status="deleted", removed=[f"// gone {index}", "export const A = 1;"])
-           for index in range(4)]
+           for index in range(5)]
     two = [make_file(f"src/beta/f{index}.ts", status="deleted", removed=[f"// gone {index}", "export const A = 1;"])
            for index in range(4)]
-    _, skeleton, _ = build(one + two + [make_file("src/gamma/app.ts", added=source_lines(5))])
+    files = one + two + [make_file("src/gamma/app.ts", added=source_lines(5))]
+    _, skeleton, _ = build(files)
     assert {group["path"]: [pattern["count"] for pattern in group["patterns"]] for group in skeleton["groups"]
-            if group["patterns"]} == {"src/alpha": [4], "src/beta": [4]}
-    _, _, document = finalize(one + two + [make_file("src/gamma/app.ts", added=source_lines(5))])
-    patterns = patterns_of(document)
-    assert len(patterns) == 2 and patterns[0]["group"] != patterns[1]["group"]
-    assert patterns[0]["pattern"]["signature"] == patterns[1]["pattern"]["signature"]
-    assert not set(patterns[0]["pattern"]["members"]) & set(patterns[1]["pattern"]["members"])
+            if group["patterns"]} == {"src/alpha": [9]}
+    _, _, document = finalize(files)
+    (pattern,) = patterns_of(document)
+    assert pattern["pattern"]["count"] == 9 and "Spans 2 directories." in pattern["description"]
 
 
 def test_a_pattern_row_wins_budget_over_a_small_file_and_modified_source_over_added_boilerplate():

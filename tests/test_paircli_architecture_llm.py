@@ -266,7 +266,7 @@ def test_group_digest_lists_rows_stats_edges_and_sensitive_flags():
     assert set(rows) == {"src-svc-token-ts", "src-svc-plain-ts"}
     token = rows["src-svc-token-ts"]
     assert token["sensitive"] is True and rows["src-svc-plain-ts"]["sensitive"] is False
-    assert token["stats"] == {"files": 1, "additions": 3, "deletions": 1}
+    assert token["stats"] == {"files": 1, "additions": 3, "deletions": 1, "api_added": 0, "api_removed": 0}
     assert token["files"][0]["new_hunks"] == [[10, 14]] and token["files"][0]["old_hunks"] == [[10, 12]]
     edge = digest["candidate_edges"][0]
     assert edge["id"] == "e-svc-db" and edge["cross_group"] is True
@@ -394,9 +394,15 @@ def test_merge_digest_lists_groups_rows_and_edges():
 PATTERN_MEMBERS = [f"src/legacy/area{index}/module{index}.ts" for index in range(20)]
 
 
-def pattern_world(stats=None, count=20, description="Removes the legacy module."):
-    """A draft with one file row and one pattern row of 20 members (the shape of the v2 contract)."""
-    snapshot = make_snapshot([make_file(path, "deleted", removed=source_lines(2), start=1) for path in PATTERN_MEMBERS]
+def pattern_world(stats=None, count=20, description="Removes the legacy module.", exports=0):
+    """A draft with one file row and one pattern row of 20 members (the shape of the v2 contract).
+
+    Each member deletes two plain lines and `exports` exported functions. `stats`, when given, is put on the
+    row as the draft's own (the digests must ignore it: they read the computed values).
+    """
+    snapshot = make_snapshot([make_file(path, "deleted", start=1, removed=source_lines(2) + [
+                                  f"export function gone{index}x{number}() {{}}" for number in range(exports)])
+                              for index, path in enumerate(PATTERN_MEMBERS)]
                              + [make_file("src/legacy/index.ts", "modified", added=source_lines(2),
                                           removed=["export const old = 1;"], start=3)])
     draft = stub_draft(snapshot, depth=2, per_group=30)
@@ -414,7 +420,7 @@ def pattern_world(stats=None, count=20, description="Removes the legacy module."
 
 
 def test_group_digest_carries_the_pattern_family_count_signature_samples_and_stats():
-    stats = {"files": 20, "additions": 0, "deletions": 40, "api_added": 0, "api_removed": 7}
+    stats = {"files": 20, "additions": 0, "deletions": 40, "api_added": 0, "api_removed": 0}
     snapshot, draft, group = pattern_world(stats)
     digest = llm.build_group_digest(draft, group, snapshot)
     rows = {row["id"]: row for row in digest["rows"]}
@@ -429,10 +435,47 @@ def test_group_digest_carries_the_pattern_family_count_signature_samples_and_sta
     assert "pattern" not in rows["src-legacy-index-ts"]
 
 
-def test_pattern_row_without_computed_stats_reports_the_member_count_not_the_sample_size():
+def test_pattern_row_without_stats_reports_computed_totals_over_all_members_not_the_sample():
     snapshot, draft, group = pattern_world()
     row = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "pattern")
-    assert row["stats"] == {"files": 20}
+    assert row["stats"] == {"files": 20, "additions": 0, "deletions": 40, "api_added": 0, "api_removed": 0}
+
+
+def test_digest_stats_are_computed_and_ignore_numbers_written_on_the_draft():
+    snapshot, draft, group = pattern_world({"files": 3, "additions": 99, "deletions": 99, "api_added": 9, "api_removed": 9},
+                                           exports=2)
+    row = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "pattern")
+    assert row["stats"] == {"files": 20, "additions": 0, "deletions": 80, "api_added": 0, "api_removed": 40}
+    assert draft["nodes"][-1]["stats"]["api_removed"] == 9, "the draft is not mutated"
+
+
+def test_a_deletion_heavy_pattern_row_that_removes_80_exports_reaches_both_digests():
+    snapshot, draft, group = pattern_world(exports=4, description="Deletes the legacy modules; callers outside this PR may break.")
+    before = copy.deepcopy(draft)
+    row = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "pattern")
+    assert row["stats"]["api_removed"] == 80 and row["stats"]["api_added"] == 0
+    other = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "file")
+    assert other["stats"]["api_removed"] == 1, "export const old = 1; leaves the index"
+    digest = llm.build_merge_digest(draft, {}, snapshot)
+    rows = {row["id"]: row for row in digest["groups"][0]["rows"]}
+    assert rows["legacy-deleted"]["api_removed"] == 80 and rows["src-legacy-index-ts"]["api_removed"] == 1
+    assert digest["groups"][0]["api_removed"] == 81 and digest["api"]["removed"] == 81 and digest["api"]["added"] == 0
+    breaking = {item["id"]: item["api_removed"] for item in digest["api"]["breaking_rows"]}
+    assert breaking == {"legacy-deleted": 80, "src-legacy-index-ts": 1}
+    assert draft == before
+
+
+def test_a_deterministic_draft_with_exports_removed_feeds_the_digests():
+    from paircli_architecture_v2_draft import deterministic_v2_draft
+    from paircli_skeleton import build_skeleton
+    files = [make_file(f"src/legacy/t{index}.ts", "deleted", start=1,
+                       removed=[f"export function a{index}() {{}}", f"export function b{index}() {{}}"]) for index in range(40)]
+    snapshot = make_snapshot(files)
+    draft = deterministic_v2_draft(build_skeleton(snapshot, HEAD), snapshot, HEAD)
+    assert [node["kind"] for node in draft["nodes"]] == ["pattern"] and "stats" not in draft["nodes"][0]
+    group = draft["groups"][0]["id"]
+    assert llm.build_group_digest(draft, group, snapshot)["rows"][0]["stats"]["api_removed"] == 80
+    assert llm.build_merge_digest(draft, {}, snapshot)["api"]["removed"] == 80
 
 
 def test_group_digest_tolerates_malformed_pattern_and_stats_values():
@@ -440,7 +483,7 @@ def test_group_digest_tolerates_malformed_pattern_and_stats_values():
     draft["nodes"][-1]["pattern"] = {"family": "docs", "count": "x", "members": [1, None]}
     row = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "pattern")
     assert row["pattern"]["samples"] == PATTERN_MEMBERS[:3] and row["pattern"]["count"] == 3
-    assert "api_removed" not in row["stats"] and "api_added" not in row["stats"]
+    assert row["stats"]["api_removed"] == 0 and row["stats"]["api_added"] == 0, "junk draft stats never reach the digest"
     draft["nodes"][-1]["pattern"] = "broken"
     assert "pattern" not in next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"]
                                  if row["kind"] == "pattern")
@@ -451,10 +494,10 @@ def test_group_digest_of_a_draft_without_patterns_is_unchanged():
     digest = llm.build_group_digest(draft, "api", snapshot)
     for row in digest["rows"]:
         assert "pattern" not in row
-        assert set(row["stats"]) == {"files", "additions", "deletions"}
+        assert set(row["stats"]) == {"files", "additions", "deletions", "api_added", "api_removed"}
     draft["nodes"][0]["stats"] = {"files": 1, "additions": 3, "deletions": 1, "api_removed": 2, "api_added": 0}
     row = next(row for row in llm.build_group_digest(draft, "api", snapshot)["rows"] if row["id"] == draft["nodes"][0]["id"])
-    assert row["stats"]["api_removed"] == 2 and row["stats"]["api_added"] == 0
+    assert row["stats"]["api_removed"] == 0, "computed from the snapshot, not read from the draft"
 
 
 def test_group_digest_with_many_pattern_rows_stays_size_capped():
@@ -471,15 +514,14 @@ def test_group_digest_with_many_pattern_rows_stays_size_capped():
 
 
 def test_merge_digest_carries_pattern_api_totals_and_breaking_rows():
-    stats = {"files": 20, "additions": 0, "deletions": 40, "api_added": 1, "api_removed": 7}
-    snapshot, draft, group = pattern_world(stats, description="Deletes the legacy module; callers outside this PR may break.")
+    snapshot, draft, group = pattern_world(exports=1, description="Deletes the legacy module; callers outside this PR may break.")
     digest = llm.build_merge_digest(draft, {}, snapshot)
     rows = {row["id"]: row for row in digest["groups"][0]["rows"]}
     assert rows["legacy-deleted"]["pattern"] == {"family": "same-change", "count": 20}
-    assert rows["legacy-deleted"]["api_removed"] == 7 and "api_removed" not in rows["src-legacy-index-ts"]
-    assert digest["groups"][0]["api_removed"] == 7 and digest["groups"][0]["api_added"] == 1
-    assert digest["api"]["removed"] == 7 and digest["api"]["added"] == 1
-    assert [row["id"] for row in digest["api"]["breaking_rows"]] == ["legacy-deleted"]
+    assert rows["legacy-deleted"]["api_removed"] == 20 and rows["src-legacy-index-ts"]["api_removed"] == 1
+    assert digest["groups"][0]["api_removed"] == 21 and "api_added" in digest["groups"][0]
+    assert digest["api"]["removed"] == 21 and digest["api"]["added"] == 0
+    assert {row["id"] for row in digest["api"]["breaking_rows"]} == {"legacy-deleted", "src-legacy-index-ts"}
     assert "legacy module" in rows["legacy-deleted"]["description"]
     assert llm.size_of(digest) <= llm.MAX_MERGE_DIGEST_BYTES
 
@@ -493,7 +535,7 @@ def test_merge_digest_lists_a_row_whose_description_mentions_a_break_even_withou
                                                 "description": draft["nodes"][0]["description"]}]}
 
 
-def test_merge_digest_of_a_draft_without_api_numbers_has_no_api_block():
+def test_merge_digest_of_a_pr_without_api_changes_has_no_api_block():
     snapshot, draft = world()
     digest = llm.build_merge_digest(draft, {}, snapshot)
     assert "api" not in digest

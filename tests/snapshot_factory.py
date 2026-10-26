@@ -68,14 +68,33 @@ def source_lines(count: int, prefix: str = "const value") -> list[str]:
     return [f"{prefix}{index} = {index};" for index in range(count)]
 
 
-def many_files(count: int, directories: list[str] | None = None, lines: int = 6, extension: str = "ts") -> list[dict]:
-    """`count` modified files spread over `directories` (default: a few nested ones), `lines` added lines each."""
+def letters(index: int) -> str:
+    """A distinct, digit-free tag per index (digits are ignored by the change signature)."""
+    chars = "abcdefghijklmnopqrstuvwxyz"
+    text = ""
+    index += 1
+    while index:
+        index, rest = divmod(index - 1, 26)
+        text = chars[rest] + text
+    return text
+
+
+def many_files(count: int, directories: list[str] | None = None, lines: int = 6, extension: str = "ts",
+               unique: bool = False) -> list[dict]:
+    """`count` modified files spread over `directories` (default: a few nested ones), `lines` added lines each.
+
+    The files differ only in digits, so they share one change signature (one repeated change). With
+    `unique` the first added line carries a digit-free tag of its own, so no two files are alike.
+    """
     directories = directories or [f"packages/pkg{index % 7}/src/mod{index % 5}" for index in range(40)]
-    return [
-        make_file(f"{directories[index % len(directories)]}/file{index}.{extension}",
-                  added=source_lines(lines), removed=source_lines(1, "old"), start=1 + index % 3)
-        for index in range(count)
-    ]
+    files = []
+    for index in range(count):
+        added = source_lines(lines)
+        if unique and added:
+            added[0] = f"const tag = '{letters(index)}';"
+        files.append(make_file(f"{directories[index % len(directories)]}/file{index}.{extension}",
+                               added=added, removed=source_lines(1, "old"), start=1 + index % 3))
+    return files
 
 
 # --- repeated-change PRs (pattern rows) ---------------------------------------------------------
