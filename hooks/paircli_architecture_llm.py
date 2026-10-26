@@ -36,7 +36,7 @@ from paircli_snapshot import lines_available
 from paircli_summary import stage_model
 
 # Bump when a prompt or the patch shape changes: it invalidates every cached patch.
-PROMPT_VERSION = "architecture-llm-2"
+PROMPT_VERSION = "architecture-llm-3"
 DIAGNOSTICS_FOLDER = "architecture-llm"
 STATS_OUTPUT = "stats.json"
 CACHE_PARTS = (".paircli", "cache", "architecture-v2")
@@ -59,8 +59,11 @@ MAX_PATCH_BYTES = 128 * 1024
 MAX_DIGEST_BYTES = 64 * 1024
 MAX_MERGE_DIGEST_BYTES = 96 * 1024
 MAX_DIGEST_FILES, MAX_DIGEST_HUNKS, MAX_DIGEST_EDGES = 15, 8, 40
+MAX_PATTERN_SAMPLES = 12
+MERGE_DESCRIPTION_CHARS = 200
+MAX_BREAKING_ROWS = 10
 MAX_RETRY_ERRORS = 20
-MAX_RETRY_ERROR_CHARS = 300
+MAX_RETRY_ERROR_CHARS = 200
 MAX_WARNINGS = 100
 MAX_LOG_CHARS = 300
 
@@ -230,6 +233,54 @@ def edge_pairs(edges) -> set[tuple]:
 
 # --- digests -----------------------------------------------------------------------------
 
+BREAK_MENTION = re.compile(r"\bbreak(?:s|ing)?\b|exported names?|callers outside", re.IGNORECASE)
+API_KEYS = ("api_added", "api_removed")
+
+
+def count_of(value) -> int | None:
+    """A non-negative integer count, or None for anything else (booleans included)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def api_counts(node: dict) -> dict:
+    """The `api_added` / `api_removed` numbers of a row's computed stats; absent keys stay absent."""
+    stats = node.get("stats") if isinstance(node.get("stats"), dict) else {}
+    return {key: stats[key] for key in API_KEYS if count_of(stats.get(key)) is not None}
+
+
+def row_stats(node: dict, facts: dict) -> dict:
+    """Stats for the digest: computed from the snapshot, plus the draft's own pattern totals and API counts."""
+    stats = dict(facts["stats"])
+    own = node.get("stats") if isinstance(node.get("stats"), dict) else {}
+    pattern = node.get("pattern") if node.get("kind") == "pattern" and isinstance(node.get("pattern"), dict) else None
+    if pattern is not None:
+        # `files` of a pattern row is only a sample: its totals cover every member.
+        total = count_of(own.get("files")) if own else None
+        total = total if total is not None else count_of(pattern.get("count"))
+        if own and all(count_of(own.get(key)) is not None for key in ("additions", "deletions")):
+            stats.update(additions=own["additions"], deletions=own["deletions"])
+        elif total is not None:
+            stats = {"files": total}
+        if total is not None:
+            stats["files"] = total
+    stats.update(api_counts(node))
+    return stats
+
+
+def pattern_facts(node: dict) -> dict | None:
+    """Family, count, signature and up to 12 sample member paths of a pattern row; None for any other row."""
+    pattern = node.get("pattern")
+    if node.get("kind") != "pattern" or not isinstance(pattern, dict):
+        return None
+    members = pattern.get("members") if isinstance(pattern.get("members"), list) else []
+    samples = [name for name in members if isinstance(name, str)]
+    if not samples:
+        samples = [name for name in node.get("files", []) if isinstance(name, str)]
+    count = count_of(pattern.get("count"))
+    facts = {"family": pattern.get("family"), "count": count if count is not None else len(samples),
+             "signature": pattern.get("signature"), "samples": samples[:MAX_PATTERN_SAMPLES]}
+    return facts
+
 def fit(digest: dict, limit: int, shrinkers) -> dict:
     """Apply shrinkers one at a time until the compact JSON fits `limit` bytes."""
     for shrink in shrinkers:
@@ -263,9 +314,13 @@ def build_group_digest(draft, group_id: str, snapshot) -> dict:
                              new_hunks=[list(item) for item in index.ranges(file, "new")[:MAX_DIGEST_HUNKS]],
                              old_hunks=[list(item) for item in index.ranges(file, "old")[:MAX_DIGEST_HUNKS]])
             files.append(entry)
-        rows.append({"id": node["id"], "label": node.get("label"), "kind": node.get("kind"),
-                     "description": node.get("description"), "change": facts["change"], "stats": facts["stats"],
-                     "sensitive": any(entry["sensitive"] for entry in files), "files": files})
+        row = {"id": node["id"], "label": node.get("label"), "kind": node.get("kind"),
+               "description": node.get("description"), "change": facts["change"], "stats": row_stats(node, facts),
+               "sensitive": any(entry["sensitive"] for entry in files), "files": files}
+        pattern = pattern_facts(node)
+        if pattern is not None:
+            row["pattern"] = pattern
+        rows.append(row)
     edges, others = [], {}
     for edge in candidate_edges(draft, group_id)[:MAX_DIGEST_EDGES]:
         cross = False
@@ -297,7 +352,12 @@ def build_group_digest(draft, group_id: str, snapshot) -> dict:
             row["files"] = row["files"][:5]
         value["candidate_edges"] = value["candidate_edges"][:8]
 
-    return fit(digest, MAX_DIGEST_BYTES, (drop_hunks, fewer_edges, fewer_files))
+    def fewer_samples(value):
+        for row in value["rows"]:
+            if "pattern" in row:
+                row["pattern"]["samples"] = row["pattern"]["samples"][:3]
+
+    return fit(digest, MAX_DIGEST_BYTES, (drop_hunks, fewer_edges, fewer_files, fewer_samples))
 
 
 def build_merge_digest(draft, summaries: dict, snapshot) -> dict:
@@ -306,15 +366,35 @@ def build_merge_digest(draft, summaries: dict, snapshot) -> dict:
     rows_by_id = draft_rows(draft)
     pr = index.pr
     groups = []
+    api_added = api_removed = 0
+    breaking = []
     for group_id, group in draft_groups(draft).items():
         rows = []
+        group_removed = group_added = 0
         for node in dicts(draft.get("nodes")):
             if node.get("group") == group_id and isinstance(node.get("id"), str):
-                rows.append({"id": node["id"], "label": node.get("label"), "kind": node.get("kind"),
-                             "change": node_facts(node, index)["change"],
-                             "evidence": dicts(node.get("evidence"))[:2]})
-        groups.append({"id": group_id, "label": group.get("label"), "path": group.get("path", ""),
-                       "summary": summaries.get(group_id, ""), "rows": rows})
+                row = {"id": node["id"], "label": node.get("label"), "kind": node.get("kind"),
+                       "change": node_facts(node, index)["change"],
+                       "description": str(node.get("description") or "")[:MERGE_DESCRIPTION_CHARS],
+                       "evidence": dicts(node.get("evidence"))[:2]}
+                api = api_counts(node)
+                row.update({key: value for key, value in api.items() if value})
+                pattern = pattern_facts(node)
+                if pattern is not None:
+                    row["pattern"] = {"family": pattern["family"], "count": pattern["count"]}
+                group_added += api.get("api_added", 0)
+                group_removed += api.get("api_removed", 0)
+                if api.get("api_removed", 0) > 0 or BREAK_MENTION.search(str(node.get("description") or "")):
+                    breaking.append({"id": node["id"], "api_removed": api.get("api_removed", 0),
+                                     "description": row["description"]})
+                rows.append(row)
+        entry = {"id": group_id, "label": group.get("label"), "path": group.get("path", ""),
+                 "summary": summaries.get(group_id, ""), "rows": rows}
+        if group_added or group_removed:
+            entry.update(api_added=group_added, api_removed=group_removed)
+        api_added += group_added
+        api_removed += group_removed
+        groups.append(entry)
     edges = []
     for edge in dicts(draft.get("edges")):
         if not isinstance(edge.get("id"), str):
@@ -325,18 +405,25 @@ def build_merge_digest(draft, summaries: dict, snapshot) -> dict:
                       "label": edge.get("label"), "claim": edge.get("claim"), "cross_group": cross,
                       "evidence": dicts(edge.get("evidence"))[:2]})
     digest = {"pr_title": str(pr.get("title") or "")[:200], "groups": groups, "edges": edges}
+    if api_added or api_removed or breaking:
+        digest["api"] = {"removed": api_removed, "added": api_added, "breaking_rows": breaking[:MAX_BREAKING_ROWS]}
 
     def drop_evidence(value):
         for group in value["groups"]:
             for row in group["rows"]:
                 row.pop("evidence", None)
 
+    def short_descriptions(value):
+        for group in value["groups"]:
+            for row in group["rows"]:
+                row["description"] = row["description"][:80]
+
     def fewer_edges(value):
         value["edges"] = value["edges"][:MAX_EDGES]
         for edge in value["edges"]:
             edge["evidence"] = edge["evidence"][:1]
 
-    return fit(digest, MAX_MERGE_DIGEST_BYTES, (drop_evidence, fewer_edges))
+    return fit(digest, MAX_MERGE_DIGEST_BYTES, (drop_evidence, short_descriptions, fewer_edges))
 
 
 # --- prompts -----------------------------------------------------------------------------
@@ -359,6 +446,21 @@ c. Say that X imports, calls or uses Y only if the digest lists an edge from X t
    it. Otherwise describe each side without asserting a link between them.
 d. {before}
 e. When unsure, leave a field out or write a shorter plain statement of what the cited lines do."""
+
+DESCRIPTION_RULES = """Descriptions and facts (verify in the code before you write them):
+- A row description is one or two plain sentences. Lead with what the change does or breaks, never with
+  line counts or stats. A "pattern" row stands for many files (digest: pattern family, count, samples):
+  describe the shared change once, say how many files, and quote one concrete line from a sample member
+  you read.
+- Say each of these plainly, only after reading the code, never as a guess: exported names removed or
+  added (use api_removed and api_added from the row stats; write "removes N exported names; callers outside
+  this PR may break" only when api_removed is above 0); an identifier used but not defined in the changed
+  code; code after return or throw that can never run; an import of a name the target does not export.
+  If unsure, say nothing."""
+
+EDGE_RULES = """Never add an edge to or from a tests, docs or config row, or between two rows only because one tests
+the other: write "covered by tests in <file>" in the tested row's description instead. A new edge needs a real
+runtime call, data flow or import that the cited lines show."""
 
 GROUP_BEFORE = ("A claim about how things were before the PR needs cited old-side lines (side \"old\", the removed\n"
                 "   or context lines of the old file); never infer the old behavior from added lines.")
@@ -396,8 +498,8 @@ Fix them and return the corrected full JSON object only, or null if you cannot g
 def group_prompt(artifact_dir: Path, group: dict, digest_path: Path, errors=None) -> str:
     """Prompt for one group. It names the digest and the snapshot by path and inlines no evidence."""
     snapshot_path = artifact_dir / "snapshot.json"
-    prompt = f"""You are improving the text of ONE group in a pull request architecture diagram. Read only these
-two files:
+    prompt = f"""You are improving the text of ONE group in a pull request architecture diagram. Start from these
+two files; you may also read the changed files in the repository checkout (read only) to verify facts:
 - Group digest, written by code and the only source of ids: {digest_path}
 - PR snapshot with the diff hunks, for citations: {snapshot_path}
 {SNAPSHOT_GUIDE}
@@ -414,17 +516,19 @@ Rules:
 1. Ids: copy row ids and candidate edge ids exactly from the digest. Never invent ids. An id that is not
    in the digest, or a row that is not in this group, is ignored.
 2. rows: rewrite only label, description and kind of rows of this group. label is at most 80 characters,
-   description at most 300. kind is one of: {KIND_LIST}. A row whose kind is routine keeps it.
+   description at most 300. kind is one of: {KIND_LIST}. A row whose kind is routine or pattern keeps it.
 3. edges with an "id": rewrite label (at most 80) and claim (at most 400) of that candidate edge. Do not
    repeat its source, target or evidence.
 4. edges without an "id" are NEW edges, at most 10. source and target are row ids from the digest (rows of
-   this group or other_rows), must differ, and each new edge needs 1-12 evidence citations.
+   this group or other_rows), must differ, and each new edge needs 1-12 evidence citations. {EDGE_RULES}
 5. Citations: path is a file changed in the PR. start..end lies inside one hunk range: side "new" with new
    line numbers for added or context lines, side "old" with old line numbers for removed lines. Never
    cite a file marked no_line_data.
 6. Text is simple English and short. A claim is a true statement of what the diff shows. No markup.
 7. You cannot add, remove or rename rows, files or groups, or change anything else. Other keys are removed.
 8. summary: at most 300 characters on what this group changes, for the next step.
+
+{DESCRIPTION_RULES}
 
 {GROUNDING_RULES.format(before=GROUP_BEFORE)}
 """
@@ -434,8 +538,8 @@ Rules:
 def merge_prompt(artifact_dir: Path, digest_path: Path, errors=None) -> str:
     """Prompt for the merge call. It names the merge digest and the snapshot by path only."""
     snapshot_path = artifact_dir / "snapshot.json"
-    prompt = f"""You are connecting the groups of a pull request architecture diagram and writing its story. Read only
-these two files:
+    prompt = f"""You are connecting the groups of a pull request architecture diagram and writing its story. Start
+from these two files; you may also read the changed files in the repository checkout (read only) to verify facts:
 - Merge digest, written by code and the only source of ids: {digest_path}
 - PR snapshot with the diff hunks, for citations: {snapshot_path}
 {SNAPSHOT_GUIDE}
@@ -452,10 +556,14 @@ Rules:
 2. title: at most 160 characters. description: what the PR changes, at most 400 characters.
 3. edges: only NEW edges, at most 20, between rows in the digest (usually across groups). Each needs a
    unique new id (letters, digits, _ or -), differing source and target, label (at most 80), claim (at
-   most 400) and 1-12 diff citations. Do not repeat an existing source and target pair.
-4. steps: at most 24, ordered, telling the change as a short story. when is "before" (how it worked
-   before) or "after" (how it works now). nodes lists 1-16 row ids. edge is optional: an existing edge id
-   or one of your new edge ids, and both of its endpoints must be in the step's nodes.
+   most 400) and 1-12 diff citations. Do not repeat an existing source and target pair. {EDGE_RULES}
+4. steps: 3 to 8 (hard limit: at most 24). Each shows a path across at least two rows, or a before/after
+   contrast of one row's behaviour, in plain language. No step may only restate a row, only say tests or
+   docs were added, or only list files. Put the main behaviour change first and risks last. If the digest's
+   api.removed is above 0, write one step on the breaking API change ("removes N exported names; callers
+   outside this PR may break") citing the removed lines. when is "before" (how it worked before) or "after"
+   (how it works now). nodes lists 1-16 row ids. edge is optional: an existing edge id or one of your new
+   edge ids, and both of its endpoints must be in the step's nodes.
 5. An "after" step never uses a removed row or edge (change removed); a "before" step never uses an added
    row or edge (change added). Row and edge "change" values are in the digest.
 6. text is at most 400 characters of simple English. Omit flags. Each step needs 1-12 diff citations.
@@ -465,6 +573,8 @@ Rules:
 8. gaps: at most 5 honest notes (each at most 300 characters) about what the diagram cannot show.
 9. You cannot add, remove or rename rows, files or groups. Other keys are removed.
 10. The digest's pr_title is only a hint and may be wrong: describe what the code does, not what the title says.
+
+{DESCRIPTION_RULES}
 
 {GROUNDING_RULES.format(before=MERGE_BEFORE)}
 """
@@ -624,7 +734,12 @@ def check_group_patch(draft, group_id: str, patch, head: str, snapshot):
                     clean[key] = value
         if "kind" in item:
             kind = item["kind"]
-            if not isinstance(kind, str) or kind not in NODE_KINDS:
+            if not isinstance(kind, str):
+                add_problem(problems, f"{path}.kind", f"must be one of {sorted(NODE_KINDS - {'routine'})}")
+            elif kind == "pattern" or rows[name].get("kind") == "pattern":
+                if kind != rows[name].get("kind"):
+                    warn(f"{path}.kind: pattern rows keep kind pattern and others cannot become pattern; ignored")
+            elif kind not in NODE_KINDS:
                 add_problem(problems, f"{path}.kind", f"must be one of {sorted(NODE_KINDS - {'routine'})}")
             elif (kind == "routine") != (rows[name].get("kind") == "routine"):
                 warn(f"{path}.kind: routine rows keep kind routine and others cannot become routine; ignored")

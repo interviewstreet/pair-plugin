@@ -389,6 +389,208 @@ def test_merge_digest_lists_groups_rows_and_edges():
     assert llm.size_of(digest) <= llm.MAX_MERGE_DIGEST_BYTES
 
 
+# --- pattern rows, API stats and the usefulness rules ------------------------------------
+
+PATTERN_MEMBERS = [f"src/legacy/area{index}/module{index}.ts" for index in range(20)]
+
+
+def pattern_world(stats=None, count=20, description="Removes the legacy module."):
+    """A draft with one file row and one pattern row of 20 members (the shape of the v2 contract)."""
+    snapshot = make_snapshot([make_file(path, "deleted", removed=source_lines(2), start=1) for path in PATTERN_MEMBERS]
+                             + [make_file("src/legacy/index.ts", "modified", added=source_lines(2),
+                                          removed=["export const old = 1;"], start=3)])
+    draft = stub_draft(snapshot, depth=2, per_group=30)
+    group = draft["nodes"][0]["group"]
+    draft["nodes"] = [node for node in draft["nodes"] if node["files"] == ["src/legacy/index.ts"]]
+    row = {"id": "legacy-deleted", "label": "20 files: deleted", "group": group, "kind": "pattern",
+           "description": description, "files": PATTERN_MEMBERS[:3],
+           "evidence": [cite(snapshot, path) for path in PATTERN_MEMBERS[:3]],
+           "pattern": {"family": "same-change", "count": count, "signature": "9f2c4a1b7e3d5a60",
+                       "members": PATTERN_MEMBERS}}
+    if stats is not None:
+        row["stats"] = stats
+    draft["nodes"].append(row)
+    return snapshot, draft, group
+
+
+def test_group_digest_carries_the_pattern_family_count_signature_samples_and_stats():
+    stats = {"files": 20, "additions": 0, "deletions": 40, "api_added": 0, "api_removed": 7}
+    snapshot, draft, group = pattern_world(stats)
+    digest = llm.build_group_digest(draft, group, snapshot)
+    rows = {row["id"]: row for row in digest["rows"]}
+    assert set(rows) == {"src-legacy-index-ts", "legacy-deleted"}, "pattern rows are listed like file rows"
+    row = rows["legacy-deleted"]
+    assert row["kind"] == "pattern"
+    assert row["pattern"] == {"family": "same-change", "count": 20, "signature": "9f2c4a1b7e3d5a60",
+                              "samples": PATTERN_MEMBERS[:llm.MAX_PATTERN_SAMPLES]}
+    assert len(row["pattern"]["samples"]) == 12
+    assert row["stats"] == stats
+    assert [entry["path"] for entry in row["files"]] == PATTERN_MEMBERS[:3]
+    assert "pattern" not in rows["src-legacy-index-ts"]
+
+
+def test_pattern_row_without_computed_stats_reports_the_member_count_not_the_sample_size():
+    snapshot, draft, group = pattern_world()
+    row = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "pattern")
+    assert row["stats"] == {"files": 20}
+
+
+def test_group_digest_tolerates_malformed_pattern_and_stats_values():
+    snapshot, draft, group = pattern_world({"files": "many", "api_removed": True, "api_added": -1})
+    draft["nodes"][-1]["pattern"] = {"family": "docs", "count": "x", "members": [1, None]}
+    row = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "pattern")
+    assert row["pattern"]["samples"] == PATTERN_MEMBERS[:3] and row["pattern"]["count"] == 3
+    assert "api_removed" not in row["stats"] and "api_added" not in row["stats"]
+    draft["nodes"][-1]["pattern"] = "broken"
+    assert "pattern" not in next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"]
+                                 if row["kind"] == "pattern")
+
+
+def test_group_digest_of_a_draft_without_patterns_is_unchanged():
+    snapshot, draft = world()
+    digest = llm.build_group_digest(draft, "api", snapshot)
+    for row in digest["rows"]:
+        assert "pattern" not in row
+        assert set(row["stats"]) == {"files", "additions", "deletions"}
+    draft["nodes"][0]["stats"] = {"files": 1, "additions": 3, "deletions": 1, "api_removed": 2, "api_added": 0}
+    row = next(row for row in llm.build_group_digest(draft, "api", snapshot)["rows"] if row["id"] == draft["nodes"][0]["id"])
+    assert row["stats"]["api_removed"] == 2 and row["stats"]["api_added"] == 0
+
+
+def test_group_digest_with_many_pattern_rows_stays_size_capped():
+    snapshot, draft, group = pattern_world()
+    template = draft["nodes"][-1]
+    for index in range(60):
+        row = copy.deepcopy(template)
+        row["id"] = f"legacy-deleted-{index}"
+        row["pattern"]["members"] = [f"src/legacy/long/{'d' * 40}/{index}/member{number}.ts" for number in range(500)]
+        row["pattern"]["count"] = 500
+        draft["nodes"].append(row)
+    digest = llm.build_group_digest(draft, group, snapshot)
+    assert llm.size_of(digest) <= llm.MAX_DIGEST_BYTES and len(digest["rows"]) == 62
+
+
+def test_merge_digest_carries_pattern_api_totals_and_breaking_rows():
+    stats = {"files": 20, "additions": 0, "deletions": 40, "api_added": 1, "api_removed": 7}
+    snapshot, draft, group = pattern_world(stats, description="Deletes the legacy module; callers outside this PR may break.")
+    digest = llm.build_merge_digest(draft, {}, snapshot)
+    rows = {row["id"]: row for row in digest["groups"][0]["rows"]}
+    assert rows["legacy-deleted"]["pattern"] == {"family": "same-change", "count": 20}
+    assert rows["legacy-deleted"]["api_removed"] == 7 and "api_removed" not in rows["src-legacy-index-ts"]
+    assert digest["groups"][0]["api_removed"] == 7 and digest["groups"][0]["api_added"] == 1
+    assert digest["api"]["removed"] == 7 and digest["api"]["added"] == 1
+    assert [row["id"] for row in digest["api"]["breaking_rows"]] == ["legacy-deleted"]
+    assert "legacy module" in rows["legacy-deleted"]["description"]
+    assert llm.size_of(digest) <= llm.MAX_MERGE_DIGEST_BYTES
+
+
+def test_merge_digest_lists_a_row_whose_description_mentions_a_break_even_without_numbers():
+    snapshot, draft = world()
+    draft["nodes"][0]["description"] = "Removes the old export, so callers outside this PR may break."
+    digest = llm.build_merge_digest(draft, {}, snapshot)
+    assert digest["api"] == {"removed": 0, "added": 0,
+                             "breaking_rows": [{"id": draft["nodes"][0]["id"], "api_removed": 0,
+                                                "description": draft["nodes"][0]["description"]}]}
+
+
+def test_merge_digest_of_a_draft_without_api_numbers_has_no_api_block():
+    snapshot, draft = world()
+    digest = llm.build_merge_digest(draft, {}, snapshot)
+    assert "api" not in digest
+    assert all("api_removed" not in group and "pattern" not in row for group in digest["groups"] for row in group["rows"])
+
+
+def test_merge_digest_is_size_capped_with_many_rows_and_long_descriptions():
+    snapshot, draft = big_world()
+    for node in draft["nodes"]:
+        node["description"] = "x" * 300
+    digest = llm.build_merge_digest(draft, {}, snapshot)
+    assert llm.size_of(digest) <= llm.MAX_MERGE_DIGEST_BYTES
+    assert all(len(row["description"]) <= llm.MERGE_DESCRIPTION_CHARS for group in digest["groups"] for row in group["rows"])
+
+
+USEFULNESS_PHRASES = (
+    "Lead with what the change does or breaks, never with line counts",
+    "describe the shared change once, say how many files, and quote one concrete line from a sample member",
+    'write "removes N exported names; callers outside this PR may break" only when api_removed is above 0',
+    "an identifier used but not defined in the changed code",
+    "code after return or throw that can never run",
+    "an import of a name the target does not export",
+    "never as a guess",
+    "If unsure, say nothing",
+    "Never add an edge to or from a tests, docs or config row",
+    "only because one tests the other",
+    'write "covered by tests in <file>" in the tested row\'s description instead',
+    "A new edge needs a real runtime call, data flow or import that the cited lines show",
+    "repository checkout",
+)
+
+
+def test_both_prompts_carry_the_usefulness_rules_and_the_grounding_block(tmp_path):
+    prompts = (llm.group_prompt(tmp_path, {"id": "api", "label": "API"}, tmp_path / "d.json"),
+               llm.merge_prompt(tmp_path, tmp_path / "m.json"))
+    for prompt in prompts:
+        flat = " ".join(prompt.split())
+        for expected in USEFULNESS_PHRASES + GROUNDING_PHRASES:
+            assert expected in flat, expected
+
+
+def test_group_prompt_keeps_pattern_rows_as_they_are(tmp_path):
+    flat = " ".join(llm.group_prompt(tmp_path, {"id": "api", "label": "API"}, tmp_path / "d.json").split())
+    assert "A row whose kind is routine or pattern keeps it" in flat
+
+
+def test_merge_prompt_asks_for_three_to_eight_steps_that_show_a_path_or_a_contrast(tmp_path):
+    flat = " ".join(llm.merge_prompt(tmp_path, tmp_path / "m.json").split())
+    for expected in ("3 to 8", "at most 24", "path across at least two rows", "before/after contrast of one row's behaviour",
+                     "No step may only restate a row, only say tests or docs were added, or only list files",
+                     "main behaviour change first and risks last", "api.removed is above 0", "breaking API change"):
+        assert expected in flat, expected
+
+
+def test_prompts_fit_the_size_limit_for_a_253_file_digest_even_on_retry(tmp_path):
+    snapshot, draft = big_world()
+    digest = llm.build_group_digest(draft, draft["groups"][0]["id"], snapshot)
+    assert llm.size_of(digest) <= llm.MAX_DIGEST_BYTES
+    deep = tmp_path.joinpath(*(["a-long-folder-name"] * 6)) / "diagnostics" / "architecture-llm"
+    errors = [{"path": f"steps[{index}].evidence", "reason": "z" * 600} for index in range(40)]
+    for given in (None, errors):
+        group = llm.group_prompt(deep, draft["groups"][0], deep / "group-x-input.json", given)
+        merge = llm.merge_prompt(deep, deep / "merge-input.json", given)
+        assert len(group.encode()) < 12 * 1024 and len(merge.encode()) < 12 * 1024
+
+
+def test_the_prompt_version_changed_and_cache_keys_differ(monkeypatch):
+    assert llm.PROMPT_VERSION == "architecture-llm-3"
+    snapshot, draft = world()
+    digest = llm.build_merge_digest(draft, {}, snapshot)
+    group_key = llm.group_cache_key(draft, "api", snapshot, "codex", None)
+    merge_key = llm.merge_cache_key(digest, [], snapshot, "codex", None)
+    monkeypatch.setattr(llm, "PROMPT_VERSION", "architecture-llm-2")
+    assert llm.group_cache_key(draft, "api", snapshot, "codex", None) != group_key
+    assert llm.merge_cache_key(digest, [], snapshot, "codex", None) != merge_key
+
+
+def test_pattern_rows_are_editable_but_keep_their_kind(monkeypatch):
+    # The validator learns the pattern kind in a separate change; here only this module's checks are exercised.
+    monkeypatch.setattr(llm, "finalize_v2", lambda document, head, snapshot, generated_by: (document, []))
+    snapshot, draft, group = pattern_world()
+    patch = {"rows": [{"id": "legacy-deleted", "label": "20 legacy modules deleted", "kind": "service",
+                       "description": "Deletes 20 legacy modules; each file removes `export const old = 1;`."}]}
+    clean, new, warnings = llm.check_group_patch(draft, group, patch, HEAD, snapshot)
+    assert clean["rows"][0]["label"] == "20 legacy modules deleted" and "kind" not in clean["rows"][0]
+    assert any("pattern rows keep kind pattern" in warning for warning in warnings)
+    row = rows_of(new)["legacy-deleted"]
+    assert row["kind"] == "pattern" and row["description"].startswith("Deletes 20 legacy modules")
+    assert row["pattern"] == draft["nodes"][-1]["pattern"] and row["files"] == PATTERN_MEMBERS[:3]
+    clean, _, warnings = llm.check_group_patch(draft, group, {"rows": [{"id": "legacy-deleted", "kind": "pattern"}]},
+                                               HEAD, snapshot)
+    assert clean["rows"] == [] and warnings == []
+    clean, _, warnings = llm.check_group_patch(draft, group, {"rows": [{"id": "src-legacy-index-ts", "kind": "pattern"}]},
+                                               HEAD, snapshot)
+    assert clean["rows"] == [] and any("cannot become pattern" in warning for warning in warnings)
+
+
 # --- applying a group patch --------------------------------------------------------------
 
 def apply(draft, snapshot, patch, group="api"):
