@@ -30,6 +30,7 @@ from paircli_architecture import ArchitectureError, describe, save_atomic, trunc
 from paircli_architecture_v2 import (
     EVIDENCE_KEYS, ID_PATTERN, MAX_EDGES, MAX_GAPS, MAX_REFS, NODE_KINDS, STEP_KEYS,
     SnapshotIndex, check_ref, dicts, drop_invalid_steps, enrich_v2, finalize_v2, node_facts, normalize_v2,
+    strip_unbacked_removals,
 )
 from paircli_skeleton import build_skeleton, is_sensitive
 from paircli_snapshot import lines_available
@@ -922,6 +923,12 @@ def check_merge(draft, merge, head: str, snapshot):
             value = clean_text(merge[key], maximum, key, problems)
             if value is None:
                 warn(f"{problems[0]['path']}: {problems[0]['reason']}; ignored")
+            elif key == "description":
+                value, removed = strip_unbacked_removals(value, index)  # a removal copied from the PR text, not the diff
+                for sentence in removed:
+                    warn(f"description: dropped a removal claim that no deleted file backs: {sentence[:120]}")
+                if value:
+                    clean[key] = value
             else:
                 clean[key] = value
 

@@ -19,7 +19,7 @@ from paircli_architecture_v2_draft import (
 from paircli_archive import create_pr_archive
 from paircli_skeleton import build_skeleton
 from snapshot_factory import (
-    HEAD, deleted_templates, deletion_heavy_pr, make_file, make_hunk, make_snapshot, many_files, repeated_edits,
+    HEAD, deleted_templates, deletion_heavy_pr, letters, make_file, make_hunk, make_snapshot, many_files, repeated_edits,
     source_lines, version_bumps,
 )
 
@@ -1341,3 +1341,93 @@ def test_after_return_is_summed_over_every_member_of_a_pattern_row_and_a_routine
     assert row["stats"]["after_return"] == 5
     live = next(node for node in document["nodes"] if node["kind"] == "file")
     assert live["stats"]["after_return"] == 0
+
+
+# --- remainder rows split by directory cluster ----------------------------------------------------------------
+
+def scattered(directories, per_directory):
+    """`per_directory` unlike files in each directory, with names that stay unique across directories."""
+    files = []
+    for directory in directories:
+        files += many_files(per_directory, directories=[directory], lines=3, unique=True)
+    for index, file in enumerate(files):
+        file["path"] = file["path"].replace("/file", f"/f{index}_")
+    return files
+
+
+def cluster_label(label):
+    match = re.fullmatch(r"(\d+) other (?:changed files|files in (.+)|files at the repository root)", label)
+    assert match, label
+    return int(match.group(1)), match.group(2)
+
+
+def test_ade_like_scattered_leftovers_become_several_remainder_rows_and_totals_add_up():
+    files = scattered([f"packages/ade/src/components/area{index}/inner" for index in range(12)], 14)
+    assert len(files) == 168
+    snapshot, _, document = finalize(files)
+    rows = remainder_nodes(document)
+    assert len(rows) >= 3 and all(3 <= row["pattern"]["count"] <= 500 for row in rows)
+    for row in rows:
+        count, where = cluster_label(row["label"])
+        assert count == row["pattern"]["count"] and len(row["label"]) <= 80
+        assert where is None or len(where) <= 40
+        assert row["description"].startswith(f"{count} further changed files")
+    assert len(document["nodes"]) <= 60 and accounted(document) == {file["path"] for file in files}
+    assert accounting(document, snapshot) == (168, 168, [])
+    assert sum(node["stats"]["files"] for node in document["nodes"]) == 168
+    assert any("remainder rows" in gap for gap in document["gaps"])
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_a_long_directory_is_shortened_in_the_remainder_label():
+    deep = "packages/very-long-package-name/src/components/editor/notebook/rendering"
+    files = scattered([f"{deep}/a", f"{deep}/b"], 14)
+    snapshot, _, document = finalize(files)
+    labels = [row["label"] for row in remainder_nodes(document)]
+    assert labels and all(len(label) <= 80 for label in labels)
+    wheres = [cluster_label(label)[1] for label in labels]
+    assert all(where is None or (len(where) <= 40 and (where.startswith("…/") or where == deep)) for where in wheres), labels
+    assert accounting(document, snapshot)[:2] == (28, 28)
+
+
+def test_small_clusters_merge_into_one_final_remainder_row():
+    files = scattered([f"src/big{index}/inner" for index in range(3)], 20)
+    files += [make_file(f"solo{index}/inner/one.ts", added=[f"const tag = '{letters(500 + index)}';", "const more = 1;"])
+              for index in range(40)]
+    snapshot, _, document = finalize(files)
+    rows = remainder_nodes(document)
+    final = [row for row in rows if cluster_label(row["label"])[1] is None]
+    assert len(final) == 1 and final[0]["label"] == f"{final[0]['pattern']['count']} other changed files"
+    assert len(rows) <= 12
+    assert accounting(document, snapshot) == (len(files), len(files), [])
+    assert len(document["nodes"]) <= 60
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_a_thousand_scattered_files_keep_the_node_cap_and_at_most_twelve_remainder_rows():
+    files = scattered([f"app{index % 7}/mod{index}/sub" for index in range(70)], 14)
+    assert len(files) == 980
+    snapshot, _, document = finalize(files)
+    rows = remainder_nodes(document)
+    assert 2 <= len(rows) <= 12 and all(row["pattern"]["count"] <= 500 for row in rows)
+    assert len(document["nodes"]) <= 60
+    assert accounting(document, snapshot) == (980, 980, [])
+    assert sum(node["stats"]["files"] for node in document["nodes"]) == 980
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_remainder_rows_land_in_the_group_that_owns_their_directory_and_are_deterministic():
+    files = scattered(["alpha/src/one", "alpha/src/two", "beta/src/one", "beta/src/two"], 15)
+    snapshot, draft, document = finalize(files)
+    again = deterministic_v2_draft(build_skeleton(snapshot, HEAD), snapshot, HEAD)
+    assert json.dumps(draft, sort_keys=True) == json.dumps(again, sort_keys=True)
+    groups = {group["id"]: group for group in document["groups"]}
+    rows = remainder_nodes(document)
+    assert len(rows) >= 2
+    for row in rows:
+        top = row["pattern"]["members"][0].split("/")[0]
+        assert {member.split("/")[0] for member in row["pattern"]["members"]} == {top}
+        group_files = {name for node in document["nodes"] if node["group"] == row["group"] and node["kind"] != "routine"
+                       for name in (node.get("pattern") or {}).get("members", node["files"])}
+        assert any(name.startswith(top + "/") for name in group_files), (row["label"], groups[row["group"]]["label"])
+    assert accounting(document, snapshot) == (60, 60, [])

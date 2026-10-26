@@ -18,10 +18,13 @@ is the input of `finalize_v2(draft, head, snapshot, "deterministic")`, which fil
                           directory above 500, and a routine file with no group goes to the first group).
                           A same-change row's label names its most distinctive net changed line. A
                           pattern row counts as one row of the group's budget. Every other non-routine file with
-                          no row (budget cut) goes into one `remainder` pattern row (3 to 500
-                          members, split by directory above that); one or two leftovers get ordinary
-                          rows beyond the budget. One node slot per remainder row is reserved
-                          before the file rows are budgeted, so the 60-node cap holds. A group of
+                          no row (budget cut) goes into `remainder` pattern rows (3 to 500 members):
+                          one row up to 12 files, else one row per directory cluster (the deepest
+                          directory holding 3 or more of them, "12 other files in components/editor",
+                          at most 12 rows, the smallest clusters merged into a final "N other changed
+                          files" row), each placed in the group that owns that directory; one or two
+                          leftovers get ordinary rows beyond the budget. One node slot per remainder row
+                          is reserved before the file rows are budgeted, so the 60-node cap holds. A group of
                           only pattern rows that span several directories is named after the change
   edges   [{id, source, target, label, claim, evidence}]
                           file-level imports between rows, new-side and removed (old-side) ones;
@@ -54,7 +57,8 @@ from paircli_architecture_v2 import (
     dicts,
 )
 from paircli_patterns import (
-    DIGITS, MAX_MEMBERS, MIN_MEMBERS, _split_members, label_hint, net_line_set, pattern_label, verify_pattern,
+    DIGITS, MAX_MEMBERS, MAX_REMAINDER_ROWS, MIN_MEMBERS, _split_members, cluster_remainder, label_hint, net_line_set,
+    pattern_label, verify_pattern,
 )
 from paircli_skeleton import CATEGORY_PENALTY, _clean, _int, _line_kind, _plural, _slug, size_budget
 
@@ -335,7 +339,9 @@ def _describe_pattern(pattern: dict, records: dict | None = None) -> str:
         return (f"{count} files with the same change: {status}. {what} "
                 f"Together +{pattern['additions']}/-{pattern['deletions']} lines.{spans}")
     if pattern["family"] == "remainder":
-        return (f"{count} further changed files, listed in the details; they were not given their own rows. "
+        where = pattern.get("where")
+        place = (f" in {_clean(where, 120)}/" if where else " at the repository root") if isinstance(where, str) else ""
+        return (f"{count} further changed files{place}, listed in the details; they were not given their own rows. "
                 f"Together +{pattern['additions']}/-{pattern['deletions']} lines.{spans}")
     noun = {"tests": "test", "docs": "doc", "config": "config"}[pattern["family"]]
     return (f"{count} {noun} files changed in this area. "
@@ -365,7 +371,7 @@ def _pattern_node(group_id: str, pattern: dict, records: dict, cite: _Citations,
                 refs.append(evidence[depth])
     hint = pattern.get("hint")
     label = pattern_label(pattern["family"], len(members), pattern["status"], hint[1] if hint else None,
-                          hint[0] if hint else None)
+                          hint[0] if hint else None, pattern.get("where"))
     name = f"same-{pattern['status']}" if pattern["family"] == "same-change" else pattern["family"]
     stem = f"{group_id[:30].rstrip('-_') or 'g'}-{name}"
     node = {
@@ -392,33 +398,38 @@ def _file_node(group_id: str, path: str, records: dict, cite: _Citations, taken:
     }
 
 
-def _remainder_plan(leftover: list[str], cite: _Citations) -> tuple[list[list[str]], list[str]]:
+def _remainder_plan(leftover: list[str], cite: _Citations,
+                    max_rows: int = MAX_REMAINDER_ROWS) -> tuple[list[tuple[str | None, list[str]]], list[str]]:
     """Split the files that have no row and no pattern into remainder pieces and ordinary file rows.
 
     One or two files get ordinary rows (only citable ones; the rest stay unshown). Three or more form
-    remainder pieces of 3 to 500 members each, split along directories only above 500; a piece that
-    would be too small is merged into the smallest piece with room, else it gets ordinary rows. A piece
+    remainder pieces `(directory or None, members)` of 3 to 500 members each (see `cluster_remainder`: more
+    than 12 files are clustered by directory, at most `max_rows` pieces). A piece that would be too small is
+    merged into the smallest piece with no directory that has room, else it gets ordinary rows. A piece
     needs a citable sample; a piece of files with no hunk data is dropped (the draft's gaps count those).
     """
     paths = sorted(set(leftover))
     if len(paths) < MIN_MEMBERS:
         return [], [path for path in paths if cite.usable(path)]
-    pieces = [list(piece) for piece in _split_members(paths, MAX_MEMBERS)]
+    pieces = [(name, list(members)) for name, members in cluster_remainder(paths, max_rows)]
     tail: list[str] = []
-    big = [piece for piece in pieces if len(piece) >= MIN_MEMBERS]
-    for piece in (piece for piece in pieces if len(piece) < MIN_MEMBERS):
-        room = [other for other in big if len(other) + len(piece) <= MAX_MEMBERS]
+    big = [piece for piece in pieces if len(piece[1]) >= MIN_MEMBERS]
+    for _name, piece in (piece for piece in pieces if len(piece[1]) < MIN_MEMBERS):
+        room = [other for other in big if other[0] is None and len(other[1]) + len(piece) <= MAX_MEMBERS]
         if room:
-            min(room, key=len).extend(piece)
+            min(room, key=lambda other: len(other[1]))[1].extend(piece)
         else:
             tail.extend(path for path in piece if cite.usable(path))
-    return [sorted(piece) for piece in big if any(cite.usable(path) for path in piece)], sorted(tail)
+    return [(name, sorted(members)) for name, members in big if any(cite.usable(path) for path in members)], sorted(tail)
 
 
-def _remainder_pattern(members: list[str], records: dict) -> dict:
-    return {"family": "remainder", "signature": None, "members": members, "status": "modified", "hint": None,
-            "additions": sum(records[path]["additions"] for path in members),
-            "deletions": sum(records[path]["deletions"] for path in members)}
+def _remainder_pattern(members: list[str], records: dict, where: str | None = None) -> dict:
+    pattern = {"family": "remainder", "signature": None, "members": members, "status": "modified", "hint": None,
+               "additions": sum(records[path]["additions"] for path in members),
+               "deletions": sum(records[path]["deletions"] for path in members)}
+    if where is not None:
+        pattern["where"] = where  # the directory its files cluster in; names the row, never written to the document
+    return pattern
 
 
 def _change_label(rows: list[dict], status_of: dict[str, str]) -> str | None:
@@ -538,14 +549,23 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
 
     # Every non-routine file lands in a row, a pattern or the remainder: pick the rows first, then
     # reserve the remainder's slots and pick again until the reservation holds.
-    reserve = extra_routine  # a group with more than 500 routine files has several routine rows
-    for _round in range(4):
-        plans = select(reserve)
-        pieces, tail = _remainder_plan(leftover_of(plans), cite)
-        need = extra_routine + len(pieces) + len(tail)
-        if need <= reserve:
+    # Scattered leftovers get one remainder row per directory cluster; when the rows they need would squeeze the
+    # groups' own rows, fewer clusters are tried (the smallest merge first), down to a single remainder row.
+    def settle(row_limit: int):
+        reserve = extra_routine  # a group with more than 500 routine files has several routine rows
+        for _round in range(4):
+            plans = select(reserve)
+            pieces, tail = _remainder_plan(leftover_of(plans), cite, row_limit)
+            need = extra_routine + len(pieces) + len(tail)
+            if need <= reserve:
+                return plans, pieces, tail, reserve, True
+            reserve = need
+        return plans, pieces, tail, reserve, False
+
+    for row_limit in (MAX_REMAINDER_ROWS, 8, 4, 2, 1):
+        plans, pieces, tail, reserve, settled = settle(row_limit)
+        if row_limit == 1 or (settled and (MAX_NODES - reserve) // count >= min(rows_per_group, 3)):
             break
-        reserve = need
 
     groups, nodes, row_of, pattern_of = [], [], {}, {}
     block: dict[str, dict] = {}  # output group id -> its rows, remainder rows and routine row
@@ -574,7 +594,8 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
             entry["rows"].append(node)
         entry["routine"] = [_routine_node(group_id, piece, node_ids) for piece in _routine_pieces(routine)]
     # What no row or pattern holds, routine files aside: one remainder row (or an ordinary row for 1-2 files).
-    pieces, tail = _remainder_plan([path for path in non_routine if path not in row_of and path not in pattern_of], cite)
+    pieces, tail = _remainder_plan([path for path in non_routine if path not in row_of and path not in pattern_of], cite,
+                                   row_limit)
     in_remainder: list[str] = []
     default_group = prepared[0][0]
 
@@ -584,6 +605,19 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
             if home.get(path) in block:
                 held[home[path]] = held.get(home[path], 0) + 1
         return min(held, key=lambda name: (-held[name], name)) if held else default_group
+
+    def owner(directory: str | None, paths: list[str]) -> str:
+        """The group holding the most rows' files under `directory`, else the group of most members."""
+        if directory:
+            held: dict[str, int] = {}
+            for name, entry in block.items():
+                for node in entry["rows"]:
+                    held[name] = held.get(name, 0) + sum(1 for path in (node.get("pattern") or {}).get("members") or node["files"]
+                                                         if path.startswith(directory + "/"))
+            held = {name: number for name, number in held.items() if number}
+            if held:
+                return min(held, key=lambda name: (-held[name], name))
+        return host(paths)
 
     room = MAX_NODES - sum(len(entry["rows"]) + len(entry["routine"]) for entry in block.values())
     for path in tail:  # one or two leftover files get ordinary rows, beyond the budget
@@ -596,9 +630,9 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
         row_of[path] = node["id"]
         block[group_id]["rows"].append(node)
     remainder_rows = 0
-    for piece in pieces:
-        pattern = _remainder_pattern(piece, records)
-        group_id = host(piece)
+    assigned = [(name, piece, owner(name, piece)) for name, piece in pieces]  # owners are decided before any piece is added
+    for name, piece, group_id in assigned:
+        pattern = _remainder_pattern(piece, records, name)
         node = _pattern_node(group_id, pattern, records, cite, node_ids) if room > 0 else None
         if node is None:
             unlisted += len(piece)

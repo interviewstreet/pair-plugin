@@ -94,6 +94,18 @@ Principle (unchanged): the model chooses and narrates, code computes and verifie
   `count` or file count of any of its members, additions plus deletions, the sum of two such member
   counts, or a PR-wide total. Numbers up to 3, numbers inside backticks or quotes, and anything
   the check cannot tell apart pass. The deterministic overview is written by code and not checked.
+- **Removal claims need a deleted file.** For a model overview, `validate_overview` rejects (same retry
+  path) a sentence of a component description, edge claim or step text that says a file, module,
+  service, query, class, component, directory or folder is removed, deleted, dropped or retired
+  when no changed file in the PR has status `deleted`. It passes when the sentence quotes code in
+  backticks, or names (by path or file name) a file of that component that lost lines, and it
+  never fires when any file is deleted. The merge step of the detailed graph (`apply_merge`)
+  drops such a sentence from the graph `description` with a warning and keeps the rest.
+- **Type-only imports are not runtime edges.** A model edge whose cited lines are all type-only
+  imports (`import type`, `import { type A }`, Python `from typing import` or an import under
+  `if TYPE_CHECKING:`, Go `_ "..."`) is rejected when its claim uses a runtime verb (calls, uses,
+  invokes, runs, starts, spawns, executes, builds) and does not mention a type: describe it as a
+  type dependency or cite the call site.
 - **Context nodes are reached through the server.** When a changed server component starts,
   proxies or calls a context component (a process, database, service), the edge goes between the
   server component and the context component (for example `spawn, proxy`), client edges go to the
@@ -104,7 +116,9 @@ Principle (unchanged): the model chooses and narrates, code computes and verifie
 - **Names describe the change.** A pattern row can span many directories; the digest gives each
   `pattern.directories` and `pattern.common_dir`. A component is named for what it does, never for
   the directory of a sample file when `directories` is above 1, and may hold several pattern rows
-  of related edits. New pattern families (such as `remainder`) are treated like any other.
+  of related edits. A `remainder` row (files with no row of their own) is labelled with its
+  directory and its digest entry carries `pattern.top_directories` (up to 3 `{dir, files}`), so it can
+  be placed with the component that owns that area.
 - **No narrow "only" claims**: no "only", "just", "all", "every" or "none" about what a file or
   route serves, calls or contains unless the cited lines are its whole definition; prefer
   "includes" and "such as", and call listed endpoints or exports examples.

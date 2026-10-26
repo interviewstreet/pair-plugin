@@ -1453,3 +1453,31 @@ def test_accounting_counts_the_files_the_rows_stand_for_without_the_validator():
     assert accounting("junk", {}) == (0, 0, [])
     twice = snapshot(snap["pr"]["files"] + snap["pr"]["files"][:2])
     assert accounting(document, twice)[1] == len(snap["pr"]["files"]), "a repeated path counts once"
+
+
+# --- removal claims and the committed sample ----------------------------------------------------------------
+
+def test_unbacked_removal_is_conservative():
+    from paircli_architecture_v2 import SnapshotIndex, strip_unbacked_removals, unbacked_removal
+    snapshot = make_snapshot([make_file("src/a.ts", added=["x"], removed=["y", "z"]), make_file("src/b.ts", added=["q"])])
+    index = SnapshotIndex(snapshot)
+    assert unbacked_removal("Removes the old session query and service files.", index)
+    assert unbacked_removal("The legacy module was deleted.", index)
+    assert unbacked_removal("Retires the stale classes.", index)
+    assert not unbacked_removal("Removes the `oldQuery` helper from the service.", index)
+    assert not unbacked_removal("Removes the stale branch.", index)                   # no file-like noun
+    assert not unbacked_removal("Replaces the old service file.", index)              # not a removal verb
+    assert not unbacked_removal("Removes the old service check from a.ts.", index)    # a.ts lost lines
+    assert unbacked_removal("Removes the old service check from b.ts.", index)        # b.ts lost none
+    assert not unbacked_removal(None, index)
+    text = "Adds validation. Removes the old service files. Keeps names."
+    assert strip_unbacked_removals(text, index) == ("Adds validation. Keeps names.", ["Removes the old service files."])
+    deleted = make_snapshot([make_file("src/gone.ts", "deleted", removed=["y"]), make_file("src/b.ts", added=["q"])])
+    assert not unbacked_removal("Removes the old service files.", SnapshotIndex(deleted))
+
+
+def test_the_committed_sample_is_a_deterministic_output_with_the_overview_and_api_stats():
+    sample = json.loads((Path(__file__).resolve().parent.parent / "docs" / "examples" / "architecture-v2.sample.json").read_text())
+    assert sample["schema_version"] == 2 and sample["generated_by"] == "deterministic" and sample["steps"] == []
+    assert sample["overview"]["generated_by"] == "deterministic" and sample["overview"]["components"]
+    assert all({"api_added", "api_removed", "after_return"} <= set(node["stats"]) for node in sample["nodes"])

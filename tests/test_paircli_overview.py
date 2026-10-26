@@ -1561,3 +1561,169 @@ def test_overview_component_stats_carry_after_return_and_reject_a_wrong_one():
     position = next(n for n, item in enumerate(overview["components"]) if item["stats"]["after_return"])
     overview["components"][position]["stats"]["after_return"] += 1
     assert any("stats" in item["path"] for item in errors_of(overview, document, snapshot))
+
+
+# --- removal claims and type-only imports ------------------------------------------------
+
+def kept_world():
+    """The world with no deleted file: the legacy module is only edited."""
+    snapshot = world_snapshot()
+    next(file for file in snapshot["pr"]["files"] if file["path"] == LEGACY)["status"] = "modified"
+    document, warnings = finalize_v2(world_draft(snapshot), HEAD, snapshot, "deterministic")
+    assert warnings == []
+    return snapshot, document
+
+
+def kept_draft(snapshot, **edits):
+    draft = golden_draft(snapshot)
+    next(item for item in draft["components"] if item["id"] == "legacy")["description"] = "The old module is rewritten."
+    for key, value in edits.get("components", {}).items():
+        next(item for item in draft["components"] if item["id"] == key)["description"] = value
+    for key, value in edits.get("edges", {}).items():
+        next(item for item in draft["edges"] if item["id"] == key)["claim"] = value
+    for key, value in edits.get("steps", {}).items():
+        next(item for item in draft["steps"] if item["id"] == key)["text"] = value
+    return draft
+
+
+def test_the_kept_world_is_valid_without_removal_wording():
+    snapshot, document = kept_world()
+    overview, _ = finalize_overview(kept_draft(snapshot), document, HEAD, snapshot, "llm")
+    assert overview["generated_by"] == "llm"
+
+
+@pytest.mark.parametrize("edits, path", [
+    ({"components": {"service": "Removes the old notebook session query and service files."}}, "overview.components[3].description"),
+    ({"components": {"route": "Handles requests. The legacy module is deleted."}}, "overview.components[2].description"),
+    ({"edges": {"o-call": "The route calls the service and drops the old query classes."}}, "overview.edges[1].claim"),
+    ({"steps": {"o-s1": "The old session service is retired in favour of the route."}}, "overview.steps[0].text"),
+])
+def test_a_removal_claim_with_no_deleted_file_is_rejected(edits, path):
+    snapshot, document = kept_world()
+    with pytest.raises(ArchitectureError) as raised:
+        finalize_overview(kept_draft(snapshot, **edits), document, HEAD, snapshot, "llm")
+    assert any(item["path"] == path and "no changed file is deleted" in item["reason"] for item in raised.value.all_errors), \
+        raised.value.all_errors
+
+
+@pytest.mark.parametrize("text", [
+    "Removes the old notebook session query and service files.",   # a file is deleted in this snapshot
+    "The legacy module is deleted.",
+])
+def test_the_same_removal_claim_passes_when_a_file_is_deleted(world, text):
+    snapshot, document = world
+    draft = golden_draft(snapshot)
+    draft["components"][4]["description"] = text
+    overview, _ = finalize_overview(draft, document, HEAD, snapshot, "llm")
+    assert component(overview, "legacy")["description"] == text
+
+
+@pytest.mark.parametrize("text", [
+    "Removes the `legacyQuery` helper and its service files from the flow.",   # code in backticks
+    "Removes the old service check from route.ts.",                            # a named file that lost lines
+    "Now adds a service file and keeps the module.",                            # no removal verb
+    "Replaces the old query class with a store.",                               # not a remove/delete/drop/retire verb
+    "Removes the stale branch.",                                               # no file-like noun
+])
+def test_conservative_removal_wording_passes(text):
+    snapshot, document = kept_world()
+    overview, _ = finalize_overview(kept_draft(snapshot, components={"route": text}), document, HEAD, snapshot, "llm")
+    assert component(overview, "route")["description"] == text
+
+
+def test_the_removal_check_applies_to_model_overviews_only_and_is_retried(artifact, tmp_path):
+    snapshot, document = kept_world()
+    overview, _ = finalize_overview(kept_draft(snapshot), document, HEAD, snapshot, "llm")
+    overview["components"][3]["description"] = "Removes the old service files."
+    assert any("no changed file is deleted" in item["reason"] for item in errors_of(overview, document, snapshot))
+    overview["generated_by"] = "deterministic"
+    assert errors_of(overview, document, snapshot) == []
+    (tmp_path / "snapshot.json").write_text(json.dumps(snapshot))
+    bad = kept_draft(snapshot, components={"service": "Removes the old service files."})
+    stub = Stub([json.dumps(bad), json.dumps(kept_draft(snapshot))])
+    result = generate_overview(tmp_path, snapshot, HEAD, document, stub, Log())
+    assert result["stats"] == {"source": "llm", "retried": True, "steps_dropped": 0, "llm_calls": 2}
+    assert "no changed file is deleted" in stub.calls[1]["prompt"]
+
+
+def import_world(line, extra=()):
+    """The kept world whose route file starts with `line` (and `extra` lines); returns (snapshot, document)."""
+    snapshot, document = kept_world()
+    file = next(item for item in snapshot["pr"]["files"] if item["path"] == ROUTE)
+    added = [entry for entry in file["hunks"][0]["lines"] if entry["kind"] == "add"]
+    added[0]["text"] = line
+    for entry, text in zip(added[1:], extra):
+        entry["text"] = text
+    return snapshot, document
+
+
+def route_edge(snapshot, claim, offsets=(0,)):
+    draft = kept_draft(snapshot, edges={"o-call": claim})
+    next(item for item in draft["edges"] if item["id"] == "o-call")["evidence"] = [
+        cite(snapshot, ROUTE, "add", offset=offset) for offset in offsets]
+    return draft
+
+
+@pytest.mark.parametrize("line", [
+    "import type { NotebookService } from '../service';",
+    "import { type NotebookService } from '../service';",
+    "import { type A, type B as C } from '../service';",
+    "from typing import Protocol",
+    '_ "net/http/pprof"',
+])
+def test_an_edge_that_cites_only_a_type_only_import_cannot_claim_a_runtime_action(line):
+    snapshot, document = import_world(line)
+    with pytest.raises(ArchitectureError) as raised:
+        finalize_overview(route_edge(snapshot, "The MCP routes use the notebook service."), document, HEAD, snapshot, "llm")
+    assert any(item["path"] == "overview.edges[1].claim" and "type-only import" in item["reason"]
+               and "type dependency" in item["reason"] for item in raised.value.all_errors), raised.value.all_errors
+
+
+@pytest.mark.parametrize("line, claim, extra, offsets", [
+    ("import { NotebookService } from '../service';", "The MCP routes use the notebook service.", (), (0,)),
+    ("import { type A, B } from '../service';", "The MCP routes use the notebook service.", (), (0,)),
+    ("import type { NotebookService } from '../service';", "The routes depend on the notebook service type.", (), (0,)),
+    ("import type { NotebookService } from '../service';", "The routes only import the notebook service.", (), (0,)),
+    ("import type { NotebookService } from '../service';", "The MCP routes call the notebook service.",
+     ("service.start();",), (0, 1)),
+    ("import type { NotebookService } from '../service';", "The MCP routes call the notebook service.", (), (1,)),
+])
+def test_runtime_imports_call_sites_and_type_claims_pass(line, claim, extra, offsets):
+    snapshot, document = import_world(line, extra)
+    overview, _ = finalize_overview(route_edge(snapshot, claim, offsets), document, HEAD, snapshot, "llm")
+    assert overview["generated_by"] == "llm"
+
+
+def test_type_checking_blocks_and_the_helper():
+    from paircli_overview import is_type_only_import
+    assert is_type_only_import("    from service import Service", ["import os", "if TYPE_CHECKING:"])
+    assert is_type_only_import("    from service import Service", ["if typing.TYPE_CHECKING:", ""])
+    assert not is_type_only_import("    from service import Service", ["def run():", "    pass"])
+    assert not is_type_only_import("from service import Service", ["if TYPE_CHECKING:"])
+    assert not is_type_only_import("import os", [])
+    assert not is_type_only_import("import { } from 'x';", [])
+    assert is_type_only_import("import Def, { type A } from 'x';", [])
+    assert not is_type_only_import("export type { A } from 'x';", [])
+
+
+def test_the_type_only_check_applies_to_model_overviews_only():
+    snapshot, document = import_world("import type { NotebookService } from '../service';")
+    overview, _ = finalize_overview(route_edge(snapshot, "The route calls the service."), document, HEAD, snapshot, "deterministic")
+    assert errors_of(overview, document, snapshot) == []
+    overview["generated_by"] = "llm"
+    assert any("type-only import" in item["reason"] for item in errors_of(overview, document, snapshot))
+
+
+def test_digest_remainder_rows_list_their_top_directories(world):
+    snapshot, document = world
+    document = copy.deepcopy(document)
+    members = ["web/a/x.ts", "web/a/y.ts", "web/a/z.ts", "web/b/x.ts", "web/b/y.ts", "web/c/x.ts"]
+    document["nodes"].append({"id": "rest", "label": "6 other files", "group": "web", "kind": "pattern", "description": "d",
+                              "files": members[:1], "evidence": [],
+                              "pattern": {"family": "remainder", "count": 6, "members": members},
+                              "stats": {"files": 6, "additions": 6, "deletions": 0}})
+    row = next(item for item in build_overview_digest(document, snapshot)["nodes"] if item["id"] == "rest")
+    assert row["pattern"]["top_directories"] == [{"dir": "web/a", "files": 3}, {"dir": "web/b", "files": 2},
+                                                 {"dir": "web/c", "files": 1}]
+    assert row["pattern"]["common_dir"] == "web" and row["pattern"]["directories"] == 3
+    assert "remainder" in overview_prompt(Path("."), Path("d.json")) and "top_directories" in overview_prompt(Path("."), Path("d.json"))

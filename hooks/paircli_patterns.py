@@ -9,6 +9,7 @@ odd shapes; unreadable input counts as "no changed lines".
   category_members(files, cat, ...) the tests / docs / config files of a group
   verify_pattern(pattern, by_path)  structured errors for a node's `pattern` object (validator use)
   pattern_label(family, count, ...) the short row label (same-change rows may carry a snippet of the change)
+  cluster_remainder(paths, ...)     files that are in no row and no pattern, split by directory into remainder pieces
   label_hint(file, avoid)           (verb, snippet) naming a file's most distinctive net changed line
   is_pure_move(file), cluster_moved(files, ...)   renamed files with no changed line, 3 or more at a time
   after_return(file)                lexical hint: changed lines directly after a return/throw/raise/break/continue
@@ -57,6 +58,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import posixpath
 import re
 
 from paircli_skeleton import ROUTINE_CATEGORIES, _line_kind, classify
@@ -267,6 +269,83 @@ def _split_members(paths: list[str], limit: int, depth: int = 0) -> list[list[st
     if pending:
         result.append(pending)
     return result
+
+
+REMAINDER_SPLIT_ABOVE = 12  # more leftover files than this are split by directory
+MAX_REMAINDER_ROWS = 12      # at most this many remainder rows, however scattered the files
+MAX_LABEL_DIRECTORY = 40     # a directory longer than this is shortened in a label
+
+
+def short_directory(directory, limit: int = MAX_LABEL_DIRECTORY) -> str:
+    """`directory` as written, or its last segments behind an ellipsis when it is longer than `limit`."""
+    text = directory if isinstance(directory, str) else ""
+    if len(text) <= limit:
+        return text
+    kept = ""
+    for part in reversed(text.split("/")):
+        candidate = f"{part}/{kept}" if kept else part
+        if len(candidate) > limit - 2:
+            break
+        kept = candidate
+    return f"\u2026/{kept}" if kept else "\u2026" + text.rsplit("/", 1)[-1][-(limit - 1):]
+
+
+def cluster_remainder(paths, max_rows: int = MAX_REMAINDER_ROWS, *, split_above: int = REMAINDER_SPLIT_ABOVE,
+                      max_members: int = MAX_MEMBERS, min_members: int = MIN_MEMBERS) -> list[tuple[str | None, list[str]]]:
+    """Split the leftover files (no row, no pattern) into `[(directory or None, sorted members)]` pieces.
+
+    Up to `split_above` files stay one piece with no directory. More are grouped by the deepest directory
+    that holds at least `min_members` of them: each file walks up from its own directory until a directory
+    (counting its subtree) holds that many, else stops at its top-level directory (the repository root for a
+    top-level file). Each cluster of `min_members` or more is one piece named by that directory ("" for the
+    root); smaller clusters merge into one final piece with no directory (it may itself be smaller than
+    `min_members`: the caller decides what to do with it). A cluster above `max_members` is split along its
+    sub-directories. When there would be more than `max_rows` pieces the smallest clusters join the final
+    piece first; if that cannot fit either, one piece per `max_members` files, split by directory. Pure and
+    deterministic; pieces are ordered by directory with the final piece last. A single piece has no directory.
+    """
+    unique = sorted({path for path in paths if isinstance(path, str) and path})
+    limit = max(1, int(max_rows))
+
+    def single() -> list[tuple[str | None, list[str]]]:
+        return [(None, sorted(piece)) for piece in _split_members(unique, max_members)] if unique else []
+
+    if len(unique) <= split_above or limit <= 1:
+        return single()
+    counts: dict[str, int] = {}
+    for path in unique:
+        directory = posixpath.dirname(path)
+        while True:
+            counts[directory] = counts.get(directory, 0) + 1
+            if not directory:
+                break
+            directory = posixpath.dirname(directory)
+    clusters: dict[str, list[str]] = {}
+    for path in unique:
+        top = path.split("/")[0] if "/" in path else ""
+        directory = posixpath.dirname(path)
+        while directory and directory != top and counts[directory] < min_members:
+            directory = posixpath.dirname(directory)
+        clusters.setdefault(directory, []).append(path)
+    big = {name: members for name, members in clusters.items() if len(members) >= min_members}
+    final = sorted(path for name, members in clusters.items() if name not in big for path in members)
+
+    def rows(kept: dict[str, list[str]], tail: list[str]) -> int:
+        return sum(math.ceil(len(members) / max_members) for members in kept.values()) + math.ceil(len(tail) / max_members)
+
+    # Too many pieces: the smallest clusters join the final piece first.
+    for name in sorted(big, key=lambda name: (len(big[name]), name)):
+        if rows(big, final) <= limit:
+            break
+        final = sorted(final + big.pop(name))
+    if rows(big, final) > limit or not big:
+        return single()
+    pieces: list[tuple[str | None, list[str]]] = []
+    for name in sorted(big):
+        pieces.extend((name, sorted(piece)) for piece in _split_members(sorted(big[name]), max_members))
+    if final:
+        pieces.extend((None, sorted(piece)) for piece in _split_members(final, max_members))
+    return [(None, pieces[0][1])] if len(pieces) == 1 else pieces  # one piece is the plain "N other changed files" row
 
 
 def cluster_same_change(files, *, min_members: int = MIN_MEMBERS, max_members: int = MAX_MEMBERS,
@@ -498,12 +577,14 @@ def _clip(snippet, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "\u2026"
 
 
-def pattern_label(family, count, status=None, snippet=None, verb=None) -> str:
+def pattern_label(family, count, status=None, snippet=None, verb=None, where=None) -> str:
     """Short deterministic row label, at most 80 characters.
 
     A same-change row with a `verb` (one of `LABEL_VERBS`) reads `16 files: adds
     `logger.debug("renamed module", \u2026``; a renamed one `35 files: renamed, edits imports`. The snippet is
     squeezed so the whole label fits; without a usable verb the label is the status word (`40 files: deleted`).
+    A remainder row may carry the directory its files cluster in as `where` ("" for the repository root):
+    `12 other files in components/editor`, the directory shortened to at most 40 characters.
     """
     number = _int(count) if _int(count) is not None else 0
     files = f"{number} file" + ("" if number == 1 else "s")
@@ -525,6 +606,8 @@ def pattern_label(family, count, status=None, snippet=None, verb=None) -> str:
         label = f"{number} config file" + ("" if number == 1 else "s")
     elif family == "remainder":
         label = f"{number} other changed file" + ("" if number == 1 else "s")
+        if isinstance(where, str) and number > 1:
+            label = f"{number} other files in {short_directory(where)}" if where else f"{number} other files at the repository root"
     elif family == "moved":
         label = f"{files}: moved, not edited"
     elif family == "routine":

@@ -1015,6 +1015,33 @@ def test_merge_ignores_bad_title_and_gaps_without_failing():
     finalize_v2(new, HEAD, snapshot, "llm")
 
 
+def test_merge_drops_a_removal_sentence_that_no_deleted_file_backs_and_keeps_the_rest():
+    snapshot, draft = world()
+    kept = copy.deepcopy(snapshot)
+    next(file for file in kept["pr"]["files"] if file["path"] == LEGACY)["status"] = "modified"
+    description = "Adds validation to reviews. Removes the old notebook session query and service files. Names are checked."
+    new, warnings, _ = llm.apply_merge(draft, {"description": description}, HEAD, kept)
+    assert new["description"] == "Adds validation to reviews. Names are checked."
+    assert any(warning.startswith("merge: description: dropped a removal claim") and "service files" in warning
+               for warning in warnings)
+    only = {"description": "Deletes the old service files."}
+    new, warnings, _ = llm.apply_merge(draft, only, HEAD, kept)
+    assert new["description"] == draft["description"] and len(warnings) == 1
+    finalize_v2(new, HEAD, kept, "llm")
+
+
+def test_merge_keeps_removal_sentences_when_a_file_is_deleted_or_code_is_quoted():
+    snapshot, draft = world()
+    description = "Removes the old notebook session query and service files."
+    new, warnings, _ = llm.apply_merge(draft, {"description": description}, HEAD, snapshot)
+    assert new["description"] == description and not any("removal claim" in warning for warning in warnings)
+    kept = copy.deepcopy(snapshot)
+    next(file for file in kept["pr"]["files"] if file["path"] == LEGACY)["status"] = "modified"
+    quoted = "Drops the `oldQuery` helper and its service files."
+    new, _, _ = llm.apply_merge(draft, {"description": quoted}, HEAD, kept)
+    assert new["description"] == quoted
+
+
 GENERIC_GAPS = ["Runtime behaviour is not visible in the diff.", "Callers outside this PR are not shown.", "Either and/or both."]
 SPECIFIC_GAPS = ["area4 may not resolve", "src/zones/zone1 is not shown", "zone1.ts is not shown",
                  "zone1, zone3, zone4 not shown", "12 files are hidden", "3 more rows were collapsed",

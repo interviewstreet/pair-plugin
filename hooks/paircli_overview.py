@@ -24,7 +24,7 @@ from pathlib import Path
 from paircli_architecture import ArchitectureError, IDENTIFIER, MAX_BYTES, extract_json, save_atomic, truncate
 from paircli_architecture_v2 import (
     SnapshotIndex, check_evidence, check_ref, common_directory, compute_layout, convert_step_evidence,
-    edge_change, step_side,
+    edge_change, split_sentences, step_side, unbacked_removal,
 )
 
 GENERATED_BY = ("llm", "deterministic")
@@ -739,6 +739,115 @@ def check_count_claims(overview: dict, document, snapshot, check) -> None:
         verify(step.get("text"), f"overview.steps[{position}].text", step.get("components"))
 
 
+def component_scope(component: dict, nodes: dict[str, dict]) -> list[str]:
+    """Every file the detailed members of an overview component stand for."""
+    return [name for member in (component.get("members") if isinstance(component.get("members"), list) else [])
+            if isinstance(member, str) and member in nodes for name in member_files(nodes[member])]
+
+
+def check_removal_claims(overview: dict, document, snapshot, check) -> None:
+    """Reject a sentence that says files, modules or services are removed when the diff deletes no file.
+
+    Model-written overviews only. Typical source: wording copied from the PR text ("Removes the old session
+    query and service files") for a diff that only edits those files. See `unbacked_removal` for what passes:
+    any deleted file in the snapshot, backticked code or symbols, or a named file that lost lines.
+    """
+    index = SnapshotIndex(snapshot)
+    nodes = document_nodes(document)
+    components = {c["id"]: c for c in dicts(overview.get("components")) if isinstance(c.get("id"), str)}
+
+    def verify(text, path: str, names) -> None:
+        if not isinstance(text, str):
+            return
+        scope: list[str] = []
+        for name in names if isinstance(names, list) else []:
+            if isinstance(name, str) and name in components:
+                scope += component_scope(components[name], nodes)
+        for sentence in split_sentences(text):
+            check(not unbacked_removal(sentence, index, scope), path,
+                  f'says "{short(sentence, 100)}" but no changed file is deleted; say what the diff shows (what the '
+                  "lines add, change or replace), or quote the removed code in backticks")
+
+    for position, component in enumerate(dicts(overview.get("components"))):
+        verify(component.get("description"), f"overview.components[{position}].description", [component.get("id")])
+    for position, edge in enumerate(dicts(overview.get("edges"))):
+        verify(edge.get("claim"), f"overview.edges[{position}].claim", [edge.get("source"), edge.get("target")])
+    for position, step in enumerate(dicts(overview.get("steps"))):
+        verify(step.get("text"), f"overview.steps[{position}].text", step.get("components"))
+
+
+TYPE_IMPORT = re.compile(r"^\s*import\s+type\b")
+TYPE_SPECIFIERS = re.compile(r"^\s*import\s*(?:[\w$]+\s*,\s*)?\{([^}]*)\}\s*from\b")
+PY_TYPING_IMPORT = re.compile(r"^\s*from\s+(?:typing|typing_extensions)\s+import\b")
+PY_TYPE_CHECKING = re.compile(r"^\s*if\s+(?:typing\.)?TYPE_CHECKING\s*:")
+PY_IMPORT = re.compile(r"^\s*(?:from\s+\S+\s+)?import\b")
+GO_BLANK_IMPORT = re.compile(r'^\s*(?:import\s+)?_\s+"')
+RUNTIME_VERB = re.compile(r"\b(?:calls?|uses?|invokes?|runs?|starts?|spawns?|executes?|builds?)\b", re.IGNORECASE)
+
+
+def is_type_only_import(text: str, before: list[str]) -> bool:
+    """True for a TypeScript `import type` (or `import { type A }` with only type specifiers), a Python
+    `from typing import` or an import under `if TYPE_CHECKING:` (`before` are the earlier lines of the hunk,
+    nearest last), or a Go blank-identifier import."""
+    if TYPE_IMPORT.match(text) or PY_TYPING_IMPORT.match(text) or GO_BLANK_IMPORT.match(text):
+        return True
+    match = TYPE_SPECIFIERS.match(text)
+    if match:
+        specifiers = [part.strip() for part in match.group(1).split(",") if part.strip()]
+        return bool(specifiers) and all(re.match(r"type\s+\S", part) for part in specifiers)
+    if PY_IMPORT.match(text):
+        indent = len(text) - len(text.lstrip())
+        if indent:
+            for earlier in reversed(before):
+                if earlier.strip() and len(earlier) - len(earlier.lstrip()) < indent:
+                    return PY_TYPE_CHECKING.match(earlier) is not None
+    return PY_TYPE_CHECKING.match(text) is not None
+
+
+def cited_lines(ref, index: SnapshotIndex) -> list[tuple[str, list[str]]] | None:
+    """`(text, earlier lines of the hunk)` of every line a valid citation covers, or None for an invalid one."""
+    valid = check_ref(ref, "", index, silent)
+    if valid is None:
+        return None
+    file, side, start, end = valid
+    key = "new_no" if side == "new" else "old_no"
+    found: list[tuple[str, list[str]]] = []
+    for hunk in index.hunks(file):
+        seen: list[str] = []
+        for line in dicts(hunk.get("lines")):
+            text = line.get("text") if isinstance(line.get("text"), str) else ""
+            number = line.get(key)
+            on_side = line.get("kind") == "ctx" or line.get("kind") == ("add" if side == "new" else "del")
+            if on_side and is_int(number) and start <= number <= end:
+                found.append((text, list(seen)))
+            if on_side:
+                seen.append(text)
+    return found
+
+
+def check_type_only_edges(overview: dict, snapshot, check) -> None:
+    """Soft check: an edge that claims a runtime action but cites only type-only import lines is rejected.
+
+    "MCP routes use the notebook service" cited at `import type { NotebookService }` shows a type dependency,
+    not a call. Conservative: it needs every non-blank cited line of every valid citation to be a type-only
+    import, a runtime verb in the claim and no mention of a type in the claim.
+    """
+    index = SnapshotIndex(snapshot)
+    for position, edge in enumerate(dicts(overview.get("edges"))):
+        claim = edge.get("claim")
+        if not isinstance(claim, str) or not RUNTIME_VERB.search(CODE_SPAN.sub(" ", claim)) or re.search(r"\btypes?\b", claim, re.I):
+            continue
+        lines: list[tuple[str, list[str]]] = []
+        for ref in dicts(edge.get("evidence")):
+            found = cited_lines(ref, index)
+            if found is not None:
+                lines += found
+        lines = [item for item in lines if item[0].strip()]
+        if lines and all(is_type_only_import(text, before) for text, before in lines):
+            check(False, f"overview.edges[{position}].claim",
+                  "cited lines are a type-only import; describe it as a type dependency or cite the call site")
+
+
 def validate_overview(overview, document, head: str, snapshot) -> None:
     """Raise ArchitectureError listing every contract violation, or return None when valid."""
     errors: list[dict] = []
@@ -772,6 +881,8 @@ def validate_overview(overview, document, head: str, snapshot) -> None:
     graph = check_overview(overview, document, head, index, check)
     if overview.get("generated_by") == "llm":
         check_count_claims(overview, document, snapshot, check)
+        check_removal_claims(overview, document, snapshot, check)
+        check_type_only_edges(overview, snapshot, check)
     steps = overview.get("steps", [])
     if check(isinstance(steps, list) and len(steps) <= MAX_STEPS, "overview.steps", f"must be a list of at most {MAX_STEPS}"):
         seen: set[str] = set()
@@ -1058,6 +1169,8 @@ Rules:
    Name each component for what it does or what the change is, never for the directory of a sample file
    when a member's pattern.directories is above 1 (pattern.common_dir is the shared directory, "" if none).
    A component may hold several pattern rows of related edits: name it for their shared purpose.
+   A "remainder" pattern row (files with no row of their own) names its directory in its label and
+   pattern.top_directories: put it in the component that owns that area, not in one catch-all.
    Never use the id "other": code collects every node you leave out (tests, docs, config, small files) into a
    component named "Other changes". Leave tests, docs and config out unless they are the point of the PR.
 2. kind "context": something that matters but is not a changed file (a process, a database, a service). Use
@@ -1095,6 +1208,8 @@ Rules:
    named count or stats, verbatim; sampled members are not the whole set. A count that does not match is rejected.
 9. No "only", "just", "all", "every" or "none" about what a file or route serves, calls or contains unless the
    cited lines are its whole definition. Prefer "includes" and "such as"; call listed endpoints or exports examples.
+   Say a file or module is removed only if the diff deletes it (node change "removed"). An edge citing only
+   type-only imports (`import type`, `from typing import`, Go `_` imports) is a type dependency: cite the call.
 10. Verified facts, only after reading the file around the cited lines, otherwise omit them: "the imports name
    something the target does not export". When a node's stats carry after_return above 0 (code counts changed
    lines that directly follow a return, throw, raise, break or continue) you may say that N changed lines sit
@@ -1120,6 +1235,16 @@ def directory_facts(files: list[str]) -> dict:
     """Computed `directories` (distinct member directories) and `common_dir` (shared prefix, "" if none)."""
     return {"directories": len({"/".join(name.split("/")[:-1]) for name in files}),
             "common_dir": common_directory(files) if files else ""}
+
+
+def top_directories(files: list[str], limit: int = 3) -> list[dict]:
+    """The `limit` directories holding the most of `files`, as `{dir, files}` (ties by name)."""
+    counts: dict[str, int] = {}
+    for name in files:
+        directory = "/".join(name.split("/")[:-1])
+        counts[directory] = counts.get(directory, 0) + 1
+    return [{"dir": directory, "files": number}
+            for directory, number in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
 
 
 def baseline_component(component: dict, nodes: dict[str, dict], index: SnapshotIndex) -> dict:
@@ -1160,6 +1285,8 @@ def build_overview_digest(document, snapshot, baseline=None) -> dict:
             members = pattern.get("members") if isinstance(pattern.get("members"), list) else []
             row["pattern"] = {"family": pattern.get("family"), "count": count_of(pattern.get("count")) or len(members),
                               **directory_facts(member_files(node))}
+            if pattern.get("family") == "remainder":  # files with no row of their own: say where they sit
+                row["pattern"]["top_directories"] = top_directories(member_files(node))
         if node.get("kind") == "routine":
             row["claimable"] = False
         if isinstance(node.get("files"), list) and node["files"] and not any(

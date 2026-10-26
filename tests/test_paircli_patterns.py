@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paircli_patterns import (
     MAX_LABEL_CHARS, after_return, api_surface, api_total, category_members, change_signature, cluster_moved,
-    cluster_same_change, is_pure_move, label_hint, net_line_set, pattern_label, verify_pattern,
+    cluster_remainder, cluster_same_change, is_pure_move, label_hint, net_line_set, pattern_label, short_directory, verify_pattern,
 )
 from snapshot_factory import letters, make_file, make_hunk
 
@@ -869,3 +869,56 @@ def test_api_total_sums_the_net_counts():
     files = [changed("a.ts", added=["export const x = 1; // c"], removed=["export const x = 1;"]),
              changed("b.ts", added=["export const y = 1;"])]
     assert api_total(files) == {"added": 1, "removed": 0}
+
+
+# --- cluster_remainder / short_directory ----------------------------------------------------------
+
+def test_a_small_remainder_stays_one_piece_without_a_directory():
+    paths = [f"a{index % 5}/f{index}.ts" for index in range(12)]
+    assert cluster_remainder(paths) == [(None, sorted(paths))]
+    assert cluster_remainder([]) == []
+
+
+def test_a_large_remainder_clusters_by_the_deepest_directory_with_three_members():
+    paths = ([f"pkg/ui/editor/f{index}.ts" for index in range(5)] + [f"pkg/ui/editor/sub/g{index}.ts" for index in range(2)]
+             + [f"pkg/ui/menu/h{index}.ts" for index in range(4)] + [f"pkg/server/x{index}.ts" for index in range(3)]
+             + [f"root{index}.ts" for index in range(3)])
+    pieces = dict(cluster_remainder(paths))
+    assert sorted(pieces) == ["", "pkg/server", "pkg/ui/editor", "pkg/ui/menu"]
+    assert len(pieces["pkg/ui/editor"]) == 7  # the two files of `sub` walk up to the directory that holds 3 or more
+    assert sorted(path for members in pieces.values() for path in members) == sorted(paths)
+    assert cluster_remainder(paths) == cluster_remainder(list(reversed(paths)))
+
+
+def test_clusters_of_fewer_than_three_files_merge_into_a_final_piece_without_a_directory():
+    paths = [f"app/big/f{index}.ts" for index in range(10)] + [f"lib{index}/one.ts" for index in range(3)] + ["tools/a.ts", "x/b.ts"]
+    pieces = cluster_remainder(paths)
+    assert pieces[0][0] == "app/big" and len(pieces[0][1]) == 10
+    assert pieces[-1] == (None, ["lib0/one.ts", "lib1/one.ts", "lib2/one.ts", "tools/a.ts", "x/b.ts"])
+    assert len(pieces) == 2
+    # a single cluster is just the plain row
+    assert cluster_remainder([f"app/big/f{index}.ts" for index in range(20)])[0][0] is None
+
+
+def test_clusters_are_capped_by_merging_the_smallest_first_and_stay_within_500_members():
+    paths = [f"d{index:02d}/f{number}.ts" for index in range(40) for number in range(3 + index % 4)]
+    pieces = cluster_remainder(paths, 12)
+    assert len(pieces) <= 12 and sorted(path for _, members in pieces for path in members) == sorted(paths)
+    assert any(name is None for name, _ in pieces) and all(name for name, _ in pieces[:-1])
+    assert all(len(members) <= 500 for _, members in pieces)
+    one = cluster_remainder(paths, 1)
+    assert one == [(None, sorted(paths))]
+    big = [f"d{index % 3}/e{index // 3 % 5}/f{index}.ts" for index in range(1300)]
+    assert all(len(members) <= 500 for _, members in cluster_remainder(big)) and sum(len(m) for _, m in cluster_remainder(big)) == 1300
+
+
+def test_short_directory_and_the_remainder_label():
+    assert short_directory("components/editor") == "components/editor"
+    long = "packages/ade/src/components/editor/notebook/rendering"
+    short = short_directory(long)
+    assert short == "…/components/editor/notebook/rendering" and len(short) <= 40
+    assert len(short_directory("x" * 100)) <= 40
+    assert pattern_label("remainder", 12, where="components/editor") == "12 other files in components/editor"
+    assert pattern_label("remainder", 12, where="") == "12 other files at the repository root"
+    assert pattern_label("remainder", 12) == "12 other changed files"
+    assert pattern_label("remainder", 5, where=long).endswith("in " + short) and len(pattern_label("remainder", 5, where="y" * 500)) <= 80

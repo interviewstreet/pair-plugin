@@ -239,6 +239,56 @@ class SnapshotIndex:
         return result
 
 
+# --- removal claims ----------------------------------------------------------------------
+
+REMOVAL_VERB = re.compile(r"\b(?:remov(?:e|es|ed|ing)|delet(?:e|es|ed|ing)|drop(?:s|ped|ping)?|retir(?:e|es|ed|ing))\b", re.IGNORECASE)
+REMOVAL_NOUN = re.compile(r"\b(?:files?|modules?|services?|quer(?:y|ies)|class(?:es)?|components?|directory|directories|folders?)\b",
+                          re.IGNORECASE)
+REMOVAL_WINDOW = 80  # the noun must sit this close to the verb (characters, same sentence)
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`\"'(])")
+
+
+def split_sentences(text: str) -> list[str]:
+    return [part for part in SENTENCE_END.split(text.strip()) if part.strip()] if isinstance(text, str) else []
+
+
+def snapshot_deletes_files(index: SnapshotIndex) -> bool:
+    """True when some changed file of the snapshot has status `deleted`."""
+    return any(file.get("status") == "deleted" for file in index.files.values())
+
+
+def unbacked_removal(sentence: str, index: SnapshotIndex, scope=None) -> bool:
+    """True when `sentence` says files, modules, services, queries or classes are removed, deleted, dropped or
+    retired although the diff deletes no file.
+
+    Conservative: any doubt passes. It never fires when a changed file has status `deleted`, when the sentence
+    quotes code or a symbol in backticks, or when a file of `scope` (paths; every changed file when None) that
+    has deleted lines is named in the sentence by its path or file name. Removing lines from a file is not
+    removing the file, but a sentence naming such a file is probably about those lines.
+    """
+    if not isinstance(sentence, str) or "`" in sentence or snapshot_deletes_files(index):
+        return False
+    for verb in REMOVAL_VERB.finditer(sentence):
+        window = sentence[max(0, verb.start() - REMOVAL_WINDOW):verb.end() + REMOVAL_WINDOW]
+        if REMOVAL_NOUN.search(window):
+            break
+    else:
+        return False
+    for path in index.files if scope is None else [name for name in scope if name in index.files]:
+        name = path.rsplit("/", 1)[-1]
+        if (path in sentence or name in sentence) and index.lines(index.files[path])["deletions"] > 0:
+            return False
+    return True
+
+
+def strip_unbacked_removals(text: str, index: SnapshotIndex, scope=None) -> tuple[str, list[str]]:
+    """`(kept text, dropped sentences)`: `text` without the sentences `unbacked_removal` rejects."""
+    kept, dropped = [], []
+    for sentence in split_sentences(text):
+        (dropped if unbacked_removal(sentence, index, scope) else kept).append(sentence)
+    return " ".join(kept), dropped
+
+
 # --- computed fields ---------------------------------------------------------------------
 
 def pattern_members(node: dict) -> list | None:
