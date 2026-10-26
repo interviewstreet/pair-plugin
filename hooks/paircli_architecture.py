@@ -32,6 +32,7 @@ STATUS_OUTPUT = "architecture-status.json"
 FIRST_RAW_OUTPUT = "architecture-raw-1.txt"
 FIRST_ERRORS_OUTPUT = "architecture-errors-1.json"
 FAILURE_OUTPUT = "architecture-failure.txt"
+WARNINGS_OUTPUT = "architecture-warnings.txt"
 MAX_RETRY_ERRORS = 20
 MAX_RETRY_ERROR_CHARS = 300
 
@@ -41,6 +42,7 @@ class ArchitectureError(ValueError):
 
     def __init__(self, errors: list[dict]):
         self.errors = errors[:MAX_REPORTED_ERRORS]
+        self.all_errors = list(errors)  # untruncated, so callers can tell whether every error is of one kind
         super().__init__(f"architecture does not match the current-head ADE contract: {describe(self.errors)}")
 
 
@@ -264,20 +266,94 @@ def remove_stale_architecture(artifact_dir: Path) -> None:
         pass
 
 
-def parse_architecture(raw: str, head: str, snapshot: dict, log):
-    """Return the validated diagram, None for an explicit null, or raise ArchitectureError."""
-    if len(raw.encode("utf-8")) > MAX_BYTES:
-        raise ArchitectureError([{"path": "$", "reason": f"output exceeds {MAX_BYTES} bytes"}])
+FENCE_START = re.compile(r"\A```[A-Za-z0-9_+-]*[ \t]*\r?\n?")
+FENCE_END = re.compile(r"\r?\n?[ \t]*```\s*\Z")
+NULL_LITERAL = re.compile(r"null(?![A-Za-z0-9_])")
+FLOW_PATH = re.compile(r"flows\[(\d+)\]")
+
+
+def extract_json(raw: str, log):
+    """The first top-level JSON object (or a literal null) in model output, tolerating fences and prose.
+
+    A leading or trailing Markdown code fence is removed, text before the first "{" and text after the
+    object are ignored with a logged warning, and a second top-level object is rejected rather than
+    merged or guessed between.
+    """
+    body = raw.strip()
+    body = FENCE_END.sub("", FENCE_START.sub("", body, count=1), count=1).strip()
+    decoder = json.JSONDecoder()
+    start = 0
+    if not NULL_LITERAL.match(body) and not body.startswith("["):
+        start = body.find("{")
+        if start < 0:
+            start = 0  # no object at all: let the strict parser describe what is wrong
     try:
-        document = json.loads(raw)
+        value, end = decoder.raw_decode(body, start)
     except json.JSONDecodeError as error:
         raise ArchitectureError([{"path": "$", "reason": f"output is not valid JSON: {error.msg}"}]) from error
+    except RecursionError as error:
+        raise ArchitectureError([{"path": "$", "reason": "output is not valid JSON: nested too deeply"}]) from error
+    if start:
+        log.write(f"architecture output: ignored {start} leading characters\n")
+    rest = body[end:]
+    if rest.strip():
+        for match in re.finditer(r"^[ \t]*\{", rest, re.MULTILINE):
+            try:
+                decoder.raw_decode(rest, match.end() - 1)
+            except (json.JSONDecodeError, RecursionError):
+                continue
+            raise ArchitectureError([{"path": "$", "reason": "output contains more than one JSON object"}])
+        log.write(f"architecture output: ignored {len(rest.strip())} trailing characters\n")
+    return value
+
+
+def drop_invalid_flows(document: dict, error: ArchitectureError, head: str, snapshot: dict, dropped: list, log):
+    """Remove flows that fail validation when they are the only problem, keeping the graph.
+
+    Returns the document if it then validates; otherwise re-raises the original error so the caller
+    retries or falls back exactly as before.
+    """
+    reasons: dict[int, str] = {}
+    for item in error.all_errors:
+        match = FLOW_PATH.match(str(item.get("path", "")))
+        if match is None or not isinstance(document.get("flows"), list):
+            raise error
+        reasons.setdefault(int(match.group(1)), f"{item['path']}: {item['reason']}")
+    if not reasons or max(reasons) >= len(document["flows"]):
+        raise error
+    candidate = copy.deepcopy(document)
+    messages = []
+    for index in sorted(reasons, reverse=True):
+        flow = candidate["flows"].pop(index)
+        label = flow.get("id") if isinstance(flow, dict) and isinstance(flow.get("id"), str) else "?"
+        messages.append(f"dropped flows[{index}] ({str(label)[:64]}): {reasons[index]}")
+    try:
+        validate_architecture(candidate, head, snapshot)
+    except ArchitectureError:
+        raise error from None
+    for message in reversed(messages):  # report in flow order
+        log.write(f"architecture warning: {message}\n")
+        dropped.append(message)
+    return candidate
+
+
+def parse_architecture(raw: str, head: str, snapshot: dict, log, dropped: list | None = None):
+    """Return the validated diagram, None for an explicit null, or raise ArchitectureError.
+
+    Warnings about flows dropped to make the document valid are appended to `dropped`.
+    """
+    if len(raw.encode("utf-8")) > MAX_BYTES:
+        raise ArchitectureError([{"path": "$", "reason": f"output exceeds {MAX_BYTES} bytes"}])
+    document = extract_json(raw, log)
     if document is None:
         return None
     document, warnings = normalize_architecture(document)
     for warning in warnings:
         log.write(f"architecture normalized: {warning}\n")
-    validate_architecture(document, head, snapshot)
+    try:
+        validate_architecture(document, head, snapshot)
+    except ArchitectureError as error:
+        document = drop_invalid_flows(document, error, head, snapshot, dropped if dropped is not None else [], log)
     return document
 
 
@@ -289,7 +365,8 @@ def write_architecture(artifact_dir: Path, generate, log) -> Path | None:
     try:
         require(not folder.is_symlink() and not target.is_symlink() and not diagnostics.is_symlink())
         target.unlink(missing_ok=True)
-        for name in (RAW_OUTPUT, ERRORS_OUTPUT, FIRST_RAW_OUTPUT, FIRST_ERRORS_OUTPUT, FAILURE_OUTPUT):
+        for name in (RAW_OUTPUT, ERRORS_OUTPUT, FIRST_RAW_OUTPUT, FIRST_ERRORS_OUTPUT, FAILURE_OUTPUT,
+                     WARNINGS_OUTPUT):
             (diagnostics / name).unlink(missing_ok=True)
         head = artifact_dir.name
         snapshot = json.loads((artifact_dir / "snapshot.json").read_text(encoding="utf-8"))
@@ -322,7 +399,9 @@ storage, external. Change: unchanged, added, modified, removed. Layer: integer 0
 Edges use id, source, target, label, change, description, episode_ids: [], evidence.
 Nodes and edges carry episode_ids: []. Flows have exactly the keys id, label, nodes
 (no episode_ids, no other keys): nodes is the ordered list of node IDs, minimum two
-nodes connected by nonremoved directed edges. Keep episode_ids empty: this plugin
+nodes connected by nonremoved directed edges. Each consecutive pair of nodes in a flow
+must be joined by a listed, non-removed edge in that same direction; return "flows": []
+if unsure. Keep episode_ids empty: this plugin
 does not generate episodes. Return null instead of manufacturing evidence. Do not
 wrap JSON in fences.
 """
@@ -332,8 +411,9 @@ wrap JSON in fences.
         raw = generate(prompt)
         # Keep what the model said so a rejected diagram can be debugged afterwards.
         save_atomic(diagnostics, RAW_OUTPUT, truncate(raw))
+        dropped = []
         try:
-            document = parse_architecture(raw, head, snapshot, log)
+            document = parse_architecture(raw, head, snapshot, log, dropped)
         except ArchitectureError as first:
             # One retry shows the model exactly what was wrong; timeouts and crashes are not retried.
             log.write(f"architecture attempt 1 rejected ({describe(first.errors)}); retrying once\n")
@@ -347,11 +427,18 @@ Your previous answer was rejected with these errors (path: reason):
 Fix them and return the corrected full JSON object only, or null if no supported diagram exists.
 """)
             save_atomic(diagnostics, RAW_OUTPUT, truncate(raw))
-            document = parse_architecture(raw, head, snapshot, log)
+            dropped = []
+            document = parse_architecture(raw, head, snapshot, log, dropped)
         if document is None:
             log.write("architecture skipped: no supported runtime diagram\n")
             return None
         save_architecture(artifact_dir, document)
+        if dropped:
+            # Local only, beside the other diagnostics: the uploaded artifact never mentions dropped flows.
+            try:
+                save_atomic(diagnostics, WARNINGS_OUTPUT, "\n".join(dropped) + "\n")
+            except (OSError, ValueError):
+                log.write("architecture warnings not saved\n")
         log.write("wrote validated generated_artifacts/architecture.json\n")
         return target
     except ArchitectureError as error:

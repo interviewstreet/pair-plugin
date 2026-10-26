@@ -165,6 +165,8 @@ inside actual new-side PR diff hunks. Citations do not prove a model's semantic
 interpretation is correct. Deletion-only or insufficient evidence can produce no
 diagram rather than fabricated references.
 
+Parsing is tolerant: a surrounding Markdown code fence, prose before the first `{` and prose after the first top-level JSON object are ignored with a logged warning (a second top-level object, output with no object, and invalid JSON are still rejected, and the 512 KiB cap still applies). When every validation error belongs to a flow (path `flows[n]...`), those flows are dropped, highest index first, with one logged warning each, and the remaining graph is accepted even if `flows` ends up empty; the dropped flows and their reasons go to `diagnostics/architecture-warnings.txt` and never into the uploaded artifact, while any other error still triggers the retry (whose prompt lists the flow errors too) and the fallback.
+
 The writer atomically saves valid output and removes an older diagram before a
 retry. If the first output fails validation (or is not JSON, or is oversized), it
 retries exactly once with the original prompt plus the structured errors as
@@ -177,7 +179,7 @@ log shows the first few. The raw model output of the last attempt is saved to
 `diagnostics/architecture-raw.txt` (capped at 512 KiB) and, on a rejected diagram,
 the structured errors to `diagnostics/architecture-errors.json`. When a retry
 happened, the first attempt's output and errors are kept as
-`architecture-raw-1.txt` and `architecture-errors-1.json`. Stale files are
+`architecture-raw-1.txt` and `architecture-errors-1.json`. Stale files (including `architecture-warnings.txt`) are
 removed at the start of each run. The `diagnostics/` folder is local only and is
 left out of the ZIP because its content is not validated. Symlinked output paths are rejected. The existing ZIP
 retains the versioned files and exposes a root `generated_artifacts/architecture.json`

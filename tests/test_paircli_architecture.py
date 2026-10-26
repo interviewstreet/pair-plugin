@@ -560,3 +560,203 @@ def test_diagram_prompt_grounds_descriptions_in_cited_lines(tmp_path):
     prompts = []
     write_architecture(folder, lambda prompt: prompts.append(prompt) or "null", io.StringIO())
     assert "not on the PR title" in prompts[0] and "only if\nthe cited lines show it" in prompts[0]
+
+
+def raw_with(prefix="", suffix="", document=None):
+    return prefix + json.dumps(document if document is not None else diagram()) + suffix
+
+
+def test_trailing_prose_after_the_object_is_ignored_with_a_warning(tmp_path):
+    folder = prepare(tmp_path)
+    trailing = "\n\nLet me know if you want any changes."
+    log = io.StringIO()
+    result = write_architecture(folder, lambda _: raw_with(suffix=trailing), log)
+    assert json.loads(result.read_text()) == diagram()
+    assert f"ignored {len(trailing.strip())} trailing characters" in log.getvalue()
+    assert not (folder / "diagnostics" / "architecture-raw-1.txt").exists()
+
+
+@pytest.mark.parametrize("wrap", ["```json\n{}\n```", "```\n{}\n```\n", "  ```JSON\r\n{}\r\n```  "])
+def test_code_fenced_json_is_accepted(tmp_path, wrap):
+    folder = prepare(tmp_path)
+    result = write_architecture(folder, lambda _: wrap.replace("{}", json.dumps(diagram())), io.StringIO())
+    assert json.loads(result.read_text()) == diagram()
+
+
+def test_fenced_null_and_null_with_prose_mean_no_diagram(tmp_path):
+    for output in ("```json\nnull\n```", "null\nNothing to draw."):
+        folder = prepare(tmp_path / output[:6].strip("`\n"))
+        calls = []
+        assert write_architecture(folder, lambda prompt: calls.append(prompt) or output, io.StringIO()) is None
+        assert len(calls) == 1 and not (folder / "diagnostics" / "architecture-errors.json").exists()
+
+
+def test_leading_prose_is_accepted_only_through_the_first_brace(tmp_path):
+    folder = prepare(tmp_path)
+    log = io.StringIO()
+    result = write_architecture(folder, lambda _: raw_with(prefix="Here is the diagram:\n"), log)
+    assert json.loads(result.read_text()) == diagram()
+    assert "ignored 21 leading characters" in log.getvalue()
+    # Prose with its own braces before the object breaks the first-brace rule and is rejected.
+    calls = []
+    answer = raw_with(prefix="Use {braces} like so:\n")
+    assert write_architecture(prepare(tmp_path / "braces"), lambda p: calls.append(p) or answer, io.StringIO()) is None
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("output", [
+    "Sure, no diagram.", "", "```\n```", "[" + json.dumps(diagram()) + "]",
+], ids=["prose", "empty", "empty-fence", "array"])
+def test_output_without_a_json_object_is_still_rejected(tmp_path, output):
+    folder = prepare(tmp_path)
+    calls = []
+    assert write_architecture(folder, lambda prompt: calls.append(prompt) or output, io.StringIO()) is None
+    assert len(calls) == 2 and not (folder / "generated_artifacts" / "architecture.json").exists()
+    errors = json.loads((folder / "diagnostics" / "architecture-errors.json").read_text())
+    assert errors and errors[0]["path"] in ("$", "nodes")
+
+
+def test_two_top_level_objects_are_rejected_not_merged(tmp_path):
+    other = diagram()
+    other["title"] = "Another"
+    output = json.dumps(diagram()) + "\n" + json.dumps(other)
+    folder = prepare(tmp_path)
+    prompts = []
+    assert write_architecture(folder, lambda prompt: prompts.append(prompt) or output, io.StringIO()) is None
+    assert len(prompts) == 2 and "more than one JSON object" in prompts[1]
+    assert not (folder / "generated_artifacts" / "architecture.json").exists()
+    # Also with prose between the two objects.
+    spaced = json.dumps(diagram()) + "\nOr alternatively:\n" + json.dumps(other)
+    assert write_architecture(prepare(tmp_path / "spaced"), lambda _: spaced, io.StringIO()) is None
+
+
+def test_braces_in_trailing_prose_are_not_a_second_object(tmp_path):
+    result = write_architecture(prepare(tmp_path), lambda _: raw_with(suffix="\nNote: the {id} field is a slug."),
+                                io.StringIO())
+    assert json.loads(result.read_text()) == diagram()
+
+
+def three_flow_diagram():
+    document = diagram()
+    document["flows"] = [
+        {"id": "first", "label": "First", "nodes": ["api", "db"]},
+        {"id": "backwards", "label": "Backwards", "nodes": ["db", "api"]},
+        {"id": "third", "label": "Third", "nodes": ["api", "db"]},
+    ]
+    return document
+
+
+def test_an_invalid_flow_is_dropped_and_the_graph_is_kept(tmp_path):
+    folder = prepare(tmp_path)
+    calls = []
+    log = io.StringIO()
+    result = write_architecture(folder, lambda prompt: calls.append(prompt) or json.dumps(three_flow_diagram()), log)
+    written = json.loads(result.read_text())
+    expected = three_flow_diagram()
+    assert len(calls) == 1  # no retry for a flow-only problem
+    assert written["nodes"] == expected["nodes"] and written["edges"] == expected["edges"]
+    assert [flow["id"] for flow in written["flows"]] == ["first", "third"]
+    message = "dropped flows[1] (backwards): flows[1].nodes: no non-removed edge from db to api"
+    assert f"architecture warning: {message}" in log.getvalue()
+    warnings = (folder / "diagnostics" / "architecture-warnings.txt").read_text()
+    assert warnings == message + "\n"
+    assert "backwards" not in result.read_text() and "dropped" not in result.read_text()
+    assert not (folder / "diagnostics" / "architecture-errors.json").exists()
+    with zipfile.ZipFile(create_pr_archive(tmp_path, folder)) as archive:
+        assert not any("diagnostics" in name for name in archive.namelist())
+        assert b"backwards" not in archive.read("generated_artifacts/architecture.json")
+
+
+def test_dropping_several_flows_goes_from_highest_index_and_may_leave_none(tmp_path):
+    document = three_flow_diagram()
+    document["flows"] = [{"id": "a", "label": "A", "nodes": ["db", "api"]},
+                         {"id": "b", "label": "B", "nodes": ["api", "ghost"]},
+                         {"id": "c", "label": "C", "nodes": ["api"]}]
+    folder = prepare(tmp_path)
+    log = io.StringIO()
+    result = write_architecture(folder, lambda _: json.dumps(document), log)
+    written = json.loads(result.read_text())
+    assert written["flows"] == [] and written["nodes"] == diagram()["nodes"] and written["edges"] == diagram()["edges"]
+    validate_architecture(written, HEAD, snapshot())
+    lines = (folder / "diagnostics" / "architecture-warnings.txt").read_text().splitlines()
+    assert [line.split(":")[0] for line in lines] == [
+        "dropped flows[0] (a)", "dropped flows[1] (b)", "dropped flows[2] (c)"]
+    assert log.getvalue().count("architecture warning: dropped flows[") == 3
+
+
+def test_a_flow_error_alongside_a_node_error_still_retries_with_both_lines(tmp_path):
+    folder = prepare(tmp_path)
+    mixed = three_flow_diagram()
+    mixed["nodes"][1]["kind"] = "toaster"
+    prompts = []
+    answers = iter([json.dumps(mixed), json.dumps(diagram())])
+    log = io.StringIO()
+    result = write_architecture(folder, lambda prompt: prompts.append(prompt) or next(answers), log)
+    assert json.loads(result.read_text()) == diagram()
+    assert len(prompts) == 2 and "retrying once" in log.getvalue()
+    assert "nodes[1].kind: must be one of" in prompts[1]
+    assert "flows[1].nodes: no non-removed edge from db to api" in prompts[1]
+    assert "architecture warning" not in log.getvalue()
+    assert not (folder / "diagnostics" / "architecture-warnings.txt").exists()
+
+
+def test_a_second_attempt_with_mixed_errors_falls_back_without_a_warnings_file(tmp_path):
+    folder = prepare(tmp_path)
+    mixed = three_flow_diagram()
+    mixed["title"] = ""
+    assert write_architecture(folder, lambda _: json.dumps(mixed), io.StringIO()) is None
+    paths = {error["path"] for error in json.loads((folder / "diagnostics" / "architecture-errors.json").read_text())}
+    assert {"title", "flows[1].nodes"} <= paths
+    assert not (folder / "diagnostics" / "architecture-warnings.txt").exists()
+
+
+def test_a_wrong_flows_container_is_not_a_droppable_flow_error(tmp_path):
+    document = diagram()
+    document["flows"] = [dict(document["flows"][0], id=f"f{index}") for index in range(7)]
+    prompts = []
+    folder = prepare(tmp_path)
+    assert write_architecture(folder, lambda prompt: prompts.append(prompt) or json.dumps(document), io.StringIO()) is None
+    assert len(prompts) == 2 and "flows: must be a list of at most 6" in prompts[1]
+
+
+def test_only_flow_errors_past_the_reported_cap_are_still_droppable(tmp_path):
+    document = diagram()
+    document["flows"] = [{"id": f"f{index}", "label": "F", "nodes": ["db", "api"] * 8} for index in range(6)]
+    folder = prepare(tmp_path)
+    result = write_architecture(folder, lambda _: json.dumps(document), io.StringIO())
+    assert json.loads(result.read_text())["flows"] == []
+    assert len((folder / "diagnostics" / "architecture-warnings.txt").read_text().splitlines()) == 6
+
+
+def test_warnings_file_is_cleared_on_the_next_run(tmp_path):
+    folder = prepare(tmp_path)
+    warnings = folder / "diagnostics" / "architecture-warnings.txt"
+    assert write_architecture(folder, lambda _: json.dumps(three_flow_diagram()), io.StringIO()) is not None
+    assert warnings.is_file()
+    assert write_architecture(folder, lambda _: json.dumps(diagram()), io.StringIO()) is not None
+    assert not warnings.exists()
+    assert write_architecture(folder, lambda _: json.dumps(three_flow_diagram()), io.StringIO()) is not None
+    assert warnings.is_file()
+    assert write_architecture(folder, lambda _: "null", io.StringIO()) is None
+    assert not warnings.exists()
+
+
+def test_warnings_file_does_not_follow_a_symlink(tmp_path):
+    folder = prepare(tmp_path)
+    external = tmp_path / "external.txt"
+    external.write_text("untouched")
+    (folder / "diagnostics").mkdir()
+    (folder / "diagnostics" / "architecture-warnings.txt").symlink_to(external)
+    log = io.StringIO()
+    result = write_architecture(folder, lambda _: json.dumps(three_flow_diagram()), log)
+    assert external.read_text() == "untouched"
+    # The stale symlink is removed at the start, then a fresh regular file is written.
+    assert result is not None and not (folder / "diagnostics" / "architecture-warnings.txt").is_symlink()
+
+
+def test_the_prompt_tells_the_model_how_flows_must_follow_edges(tmp_path):
+    prompts = []
+    write_architecture(prepare(tmp_path), lambda prompt: prompts.append(prompt) or "null", io.StringIO())
+    flat = " ".join(prompts[0].split())
+    assert "joined by a listed, non-removed edge in that same direction" in flat
+    assert 'return "flows": [] if unsure' in flat

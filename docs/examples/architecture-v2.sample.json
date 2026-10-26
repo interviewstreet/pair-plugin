@@ -1,0 +1,734 @@
+{
+  "schema_version": 2,
+  "generated_by": "llm",
+  "head_sha": "8fced533a498f96d31502751da2e4d69cc4ba908",
+  "title": "Orders API: web client, Flask blueprint and Go gateway route for /api/orders",
+  "description": "Adds a TypeScript orders client and a list view in Orders.tsx, a Flask blueprint with GET and POST handlers backed by new store functions, and a Go gateway route for /api/orders that uses a new reverse-proxy helper.",
+  "groups": [
+    {
+      "id": "service",
+      "label": "service",
+      "path": "service",
+      "column": 2,
+      "order": 0
+    },
+    {
+      "id": "gateway",
+      "label": "gateway",
+      "path": "gateway",
+      "column": 1,
+      "order": 0
+    },
+    {
+      "id": "web",
+      "label": "web",
+      "path": "web/src",
+      "column": 0,
+      "order": 1
+    },
+    {
+      "id": "docs",
+      "label": "docs",
+      "path": "docs",
+      "column": 0,
+      "order": 0
+    }
+  ],
+  "nodes": [
+    {
+      "id": "service-orders-py-7daae3",
+      "label": "orders.py: Flask orders blueprint",
+      "group": "service",
+      "kind": "service",
+      "description": "New Flask Blueprint at url_prefix /api/orders. GET returns all orders as JSON. POST reads the JSON body, builds an Order, saves it and returns it with status 201.",
+      "files": [
+        "service/app/orders.py"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/app/orders.py",
+          "start": 1,
+          "end": 19,
+          "side": "new"
+        }
+      ],
+      "change": "added",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 19,
+        "deletions": 0
+      }
+    },
+    {
+      "id": "service-store-py-ae6d40",
+      "label": "store.py: order storage",
+      "group": "service",
+      "kind": "storage",
+      "description": "Adds save_order, which puts an order in the _ORDERS mapping by id, and all_orders, which returns the stored orders as a list.",
+      "files": [
+        "service/app/store.py"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/app/store.py",
+          "start": 9,
+          "end": 17,
+          "side": "new"
+        }
+      ],
+      "change": "modified",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 9,
+        "deletions": 0
+      }
+    },
+    {
+      "id": "service-models-py-43dfec",
+      "label": "models.py: Order model",
+      "group": "service",
+      "kind": "file",
+      "description": "Adds a currency field of type str to the order model, with default \"USD\".",
+      "files": [
+        "service/app/models.py"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/app/models.py",
+          "start": 8,
+          "end": 8,
+          "side": "new"
+        }
+      ],
+      "change": "modified",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 1,
+        "deletions": 0
+      }
+    },
+    {
+      "id": "service-test_orders-py-047fb0",
+      "label": "test_orders.py: store test",
+      "group": "service",
+      "kind": "file",
+      "description": "New test that saves an Order with id \"o1\" and checks that all_orders returns only that id.",
+      "files": [
+        "service/tests/test_orders.py"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/tests/test_orders.py",
+          "start": 1,
+          "end": 8,
+          "side": "new"
+        }
+      ],
+      "change": "added",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 8,
+        "deletions": 0
+      }
+    },
+    {
+      "id": "gateway-proxy-go-c199a7",
+      "label": "proxy.go: To() reverse proxy handler",
+      "group": "gateway",
+      "kind": "service",
+      "description": "Adds package proxy with To(target), which parses target as a URL and panics on error. It returns httputil.NewSingleHostReverseProxy for that URL.",
+      "files": [
+        "gateway/internal/proxy/proxy.go"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "gateway/internal/proxy/proxy.go",
+          "start": 1,
+          "end": 17,
+          "side": "new"
+        }
+      ],
+      "change": "added",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 17,
+        "deletions": 0
+      }
+    },
+    {
+      "id": "gateway-main-go-225fb7",
+      "label": "main.go: route /api/orders",
+      "group": "gateway",
+      "kind": "service",
+      "description": "Imports the proxy package and registers http.Handle for \"/api/orders\" using proxy.To(\"http://orders:5000\"). The server still listens on \":8080\".",
+      "files": [
+        "gateway/main.go"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "gateway/main.go",
+          "start": 6,
+          "end": 7,
+          "side": "new"
+        },
+        {
+          "type": "diff",
+          "path": "gateway/main.go",
+          "start": 11,
+          "end": 11,
+          "side": "new"
+        }
+      ],
+      "change": "modified",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 3,
+        "deletions": 0
+      }
+    },
+    {
+      "id": "gateway-proxy_test-go-794f4e",
+      "label": "proxy_test.go: bad URL test",
+      "group": "gateway",
+      "kind": "file",
+      "description": "Adds TestToRejectsBadURL. It calls To(\"://bad\") and fails if no panic occurs.",
+      "files": [
+        "gateway/internal/proxy/proxy_test.go"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "gateway/internal/proxy/proxy_test.go",
+          "start": 1,
+          "end": 13,
+          "side": "new"
+        }
+      ],
+      "change": "added",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 13,
+        "deletions": 0
+      }
+    },
+    {
+      "id": "web-client-ts-e7ec1e",
+      "label": "client.ts",
+      "group": "web",
+      "kind": "file",
+      "description": "New API client. Defines BASE as \"/api/orders\". listOrders fetches BASE and throws if the response is not ok. createOrder sends a POST with the order as JSON.",
+      "files": [
+        "web/src/api/client.ts"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/api/client.ts",
+          "start": 1,
+          "end": 14,
+          "side": "new"
+        }
+      ],
+      "change": "added",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 14,
+        "deletions": 0
+      }
+    },
+    {
+      "id": "web-Orders-tsx-51ff3d",
+      "label": "Orders.tsx",
+      "group": "web",
+      "kind": "file",
+      "description": "OrdersPage was a static \"Orders\" div. It now keeps orders in state, loads them with listOrders in useEffect, and renders a list of id, total and currency.",
+      "files": [
+        "web/src/pages/Orders.tsx"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/pages/Orders.tsx",
+          "start": 1,
+          "end": 8,
+          "side": "new"
+        }
+      ],
+      "change": "modified",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 6,
+        "deletions": 2
+      }
+    },
+    {
+      "id": "web-types-ts-961adc",
+      "label": "types.ts",
+      "group": "web",
+      "kind": "file",
+      "description": "New file. Exports the Order interface with id, total and currency fields.",
+      "files": [
+        "web/src/api/types.ts"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/api/types.ts",
+          "start": 1,
+          "end": 6,
+          "side": "new"
+        }
+      ],
+      "change": "added",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 6,
+        "deletions": 0
+      }
+    },
+    {
+      "id": "docs-api-md-3c90b1",
+      "label": "api.md",
+      "group": "docs",
+      "kind": "file",
+      "description": "Adds an Orders section. It says GET /api/orders lists orders and POST /api/orders creates one, and that the gateway forwards both to the Python service.",
+      "files": [
+        "docs/api.md"
+      ],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "docs/api.md",
+          "start": 7,
+          "end": 10,
+          "side": "new"
+        }
+      ],
+      "change": "modified",
+      "state": "changed",
+      "stats": {
+        "files": 1,
+        "additions": 4,
+        "deletions": 0
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-cdc07bc8e3",
+      "source": "gateway-main-go-225fb7",
+      "target": "gateway-proxy-go-c199a7",
+      "label": "imports proxy",
+      "claim": "main.go imports example.com/gateway/internal/proxy and calls proxy.To(\"http://orders:5000\") for the \"/api/orders\" route.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "gateway/main.go",
+          "start": 7,
+          "end": 7,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "e-b1b8b64e84",
+      "source": "service-orders-py-7daae3",
+      "target": "service-models-py-43dfec",
+      "label": "imports Order",
+      "claim": "orders.py imports Order from models.py and uses it to build an order in create_order.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/app/orders.py",
+          "start": 3,
+          "end": 3,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "e-30b02e6014",
+      "source": "service-orders-py-7daae3",
+      "target": "service-store-py-ae6d40",
+      "label": "imports store functions",
+      "claim": "orders.py imports all_orders and save_order from store.py. The GET handler calls all_orders and the POST handler calls save_order.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/app/orders.py",
+          "start": 4,
+          "end": 4,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "e-0c00c01e12",
+      "source": "service-test_orders-py-047fb0",
+      "target": "service-models-py-43dfec",
+      "label": "imports Order",
+      "claim": "test_orders.py imports Order from app.models.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/tests/test_orders.py",
+          "start": 1,
+          "end": 1,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "e-f9c127b468",
+      "source": "service-test_orders-py-047fb0",
+      "target": "service-store-py-ae6d40",
+      "label": "imports store functions",
+      "claim": "test_orders.py imports all_orders and save_order from app.store and calls both in test_save_and_list.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/tests/test_orders.py",
+          "start": 2,
+          "end": 2,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "e-fba3f2d273",
+      "source": "web-client-ts-e7ec1e",
+      "target": "web-types-ts-961adc",
+      "label": "imports Order type",
+      "claim": "client.ts imports the Order type from ./types.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/api/client.ts",
+          "start": 1,
+          "end": 1,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "e-7bd9bcb77f",
+      "source": "web-Orders-tsx-51ff3d",
+      "target": "web-client-ts-e7ec1e",
+      "label": "imports listOrders",
+      "claim": "Orders.tsx imports listOrders from ../api/client and calls it in useEffect.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/pages/Orders.tsx",
+          "start": 2,
+          "end": 2,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "e-53fe03a531",
+      "source": "web-Orders-tsx-51ff3d",
+      "target": "web-types-ts-961adc",
+      "label": "imports Order type",
+      "claim": "Orders.tsx imports the Order type from ../api/types and uses it for its state.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/pages/Orders.tsx",
+          "start": 3,
+          "end": 3,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "e-gateway-proxy_test-go-794f-gateway-proxy-go-c199a7",
+      "source": "gateway-proxy_test-go-794f4e",
+      "target": "gateway-proxy-go-c199a7",
+      "label": "tests To with bad URL",
+      "claim": "The test calls To(\"://bad\") and expects a panic.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "gateway/internal/proxy/proxy_test.go",
+          "start": 5,
+          "end": 11,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "n-web-gateway",
+      "source": "web-client-ts-e7ec1e",
+      "target": "gateway-main-go-225fb7",
+      "label": "same /api/orders path",
+      "claim": "client.ts fetches the path \"/api/orders\" and gateway main.go registers a handler for the same path. The code does not show a direct call between the two files.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/api/client.ts",
+          "start": 3,
+          "end": 6,
+          "side": "new"
+        },
+        {
+          "type": "diff",
+          "path": "gateway/main.go",
+          "start": 11,
+          "end": 11,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "n-gateway-orders",
+      "source": "gateway-main-go-225fb7",
+      "target": "service-orders-py-7daae3",
+      "label": "forwards to orders:5000",
+      "claim": "main.go proxies /api/orders to http://orders:5000, and orders.py defines a blueprint with url_prefix \"/api/orders\". The code does not show that host serving this blueprint.",
+      "change": "added",
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "gateway/main.go",
+          "start": 11,
+          "end": 11,
+          "side": "new"
+        },
+        {
+          "type": "diff",
+          "path": "service/app/orders.py",
+          "start": 6,
+          "end": 6,
+          "side": "new"
+        }
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "s1",
+      "when": "before",
+      "nodes": [
+        "web-Orders-tsx-51ff3d"
+      ],
+      "text": "OrdersPage returned a static div that only said Orders. It fetched no data.",
+      "flags": [],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/pages/Orders.tsx",
+          "start": 3,
+          "end": 4,
+          "side": "old"
+        }
+      ]
+    },
+    {
+      "id": "s2",
+      "when": "after",
+      "edge": "e-7bd9bcb77f",
+      "nodes": [
+        "web-Orders-tsx-51ff3d",
+        "web-client-ts-e7ec1e"
+      ],
+      "text": "OrdersPage keeps orders in state and calls listOrders in useEffect. It renders each order's id, total and currency in a list.",
+      "flags": [],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/pages/Orders.tsx",
+          "start": 2,
+          "end": 8,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "s3",
+      "when": "after",
+      "edge": "n-web-gateway",
+      "nodes": [
+        "web-client-ts-e7ec1e",
+        "gateway-main-go-225fb7"
+      ],
+      "text": "client.ts sends listOrders as a fetch to \"/api/orders\" and createOrder as a POST to the same path. The gateway registers a handler for that path.",
+      "flags": [],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "web/src/api/client.ts",
+          "start": 3,
+          "end": 14,
+          "side": "new"
+        },
+        {
+          "type": "diff",
+          "path": "gateway/main.go",
+          "start": 11,
+          "end": 11,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "s4",
+      "when": "after",
+      "edge": "e-cdc07bc8e3",
+      "nodes": [
+        "gateway-main-go-225fb7",
+        "gateway-proxy-go-c199a7"
+      ],
+      "text": "main.go routes /api/orders through proxy.To(\"http://orders:5000\"). To parses the URL, panics if parsing fails, and returns a single-host reverse proxy.",
+      "flags": [],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "gateway/internal/proxy/proxy.go",
+          "start": 10,
+          "end": 15,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "s5",
+      "when": "after",
+      "edge": "n-gateway-orders",
+      "nodes": [
+        "gateway-main-go-225fb7",
+        "service-orders-py-7daae3"
+      ],
+      "text": "The Flask blueprint orders.py is mounted at /api/orders, the path the gateway forwards.",
+      "flags": [],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "gateway/main.go",
+          "start": 11,
+          "end": 11,
+          "side": "new"
+        },
+        {
+          "type": "diff",
+          "path": "service/app/orders.py",
+          "start": 6,
+          "end": 6,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "s6",
+      "when": "after",
+      "edge": "e-30b02e6014",
+      "nodes": [
+        "service-orders-py-7daae3",
+        "service-store-py-ae6d40"
+      ],
+      "text": "The GET handler returns all_orders as JSON. The POST handler builds an Order from the payload and saves it with save_order, returning 201.",
+      "flags": [],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/app/orders.py",
+          "start": 9,
+          "end": 18,
+          "side": "new"
+        },
+        {
+          "type": "diff",
+          "path": "service/app/store.py",
+          "start": 10,
+          "end": 16,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "s7",
+      "when": "after",
+      "edge": "e-b1b8b64e84",
+      "nodes": [
+        "service-orders-py-7daae3",
+        "service-models-py-43dfec"
+      ],
+      "text": "Order gains a currency field that defaults to \"USD\". create_order passes payload currency, or \"USD\" if it is missing.",
+      "flags": [],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/app/models.py",
+          "start": 8,
+          "end": 8,
+          "side": "new"
+        },
+        {
+          "type": "diff",
+          "path": "service/app/orders.py",
+          "start": 17,
+          "end": 17,
+          "side": "new"
+        }
+      ]
+    },
+    {
+      "id": "s8",
+      "when": "after",
+      "nodes": [
+        "service-test_orders-py-047fb0",
+        "gateway-proxy_test-go-794f4e"
+      ],
+      "text": "Two tests are added. One saves an order and lists it. The other checks that To(\"://bad\") panics.",
+      "flags": [],
+      "evidence": [
+        {
+          "type": "diff",
+          "path": "service/tests/test_orders.py",
+          "start": 5,
+          "end": 7,
+          "side": "new"
+        },
+        {
+          "type": "diff",
+          "path": "gateway/internal/proxy/proxy_test.go",
+          "start": 5,
+          "end": 11,
+          "side": "new"
+        }
+      ]
+    }
+  ],
+  "gaps": [
+    "Generated deterministically from file structure and imports, not from reading the code.",
+    "The diagram cannot show how the orders blueprint is registered in a Flask app or how orders:5000 is deployed. Neither appears in the diff.",
+    "The orders store is not shown to be persistent across restarts, and the diff does not show how _ORDERS is defined."
+  ]
+}
