@@ -7,6 +7,7 @@ from pathlib import Path
 # `gh pr view --json commits` returns at most this many commits, so a full list may be cut short.
 GITHUB_COMMIT_LIST_LIMIT = 100
 MAX_NO_LINE_DATA_PATHS = 50
+MAX_QUOTED_PATH_CHARS = 300
 
 
 def captured_pr(artifact_dir: Path) -> dict:
@@ -23,12 +24,15 @@ def snapshot_binds_head(pr: dict, head: str) -> bool:
     """True when the captured commits can vouch for `head`.
 
     GitHub lists only the first 100 commits, so a list that reaches the limit may end before the
-    real head and cannot disprove it. A shorter list is complete and must contain the head.
+    real head and cannot disprove it. A shorter list is complete, so its last commit must be the
+    head: a later push would otherwise leave a snapshot of a newer head bound to the scanned one.
     """
     commits = [commit for commit in pr.get("commits") or [] if isinstance(commit, dict)] if isinstance(pr, dict) else []
     if not commits:
         return False
-    return any(commit.get("sha") == head for commit in commits) or len(commits) >= GITHUB_COMMIT_LIST_LIMIT
+    if len(commits) >= GITHUB_COMMIT_LIST_LIMIT:
+        return True
+    return commits[-1].get("sha") == head
 
 
 def lines_available(file: dict) -> bool:
@@ -54,11 +58,20 @@ def count_files(pr: dict) -> int:
     return len({file["path"] for file in files if isinstance(file, dict) and isinstance(file.get("path"), str) and file["path"]})
 
 
+def quote_path(path: str, limit: int = MAX_QUOTED_PATH_CHARS) -> str:
+    """A path as one JSON string on one line, cut to `limit` characters, so it cannot end a prompt block."""
+    text = path if len(path) <= limit else path[:limit - 3] + "..."
+    quoted = json.dumps(text, ensure_ascii=False)
+    for separator in ("\x85", "\u2028", "\u2029"):
+        quoted = quoted.replace(separator, f"\\u{ord(separator):04x}")
+    return quoted
+
+
 def no_line_data_note(pr: dict, limit: int = MAX_NO_LINE_DATA_PATHS) -> str:
     """One prompt line naming paths that must not be cited with line ranges, or "" when none."""
     paths = files_without_line_data(pr)
     if not paths:
         return ""
-    shown = ", ".join(json.dumps(path, ensure_ascii=False) for path in paths[:limit])
+    shown = ", ".join(quote_path(path) for path in paths[:limit])
     more = f" and {len(paths) - limit} more" if len(paths) > limit else ""
     return (f"These changed paths have no line data, so never cite them with line ranges: {shown}{more}.")

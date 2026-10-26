@@ -413,14 +413,15 @@ def test_null_on_the_retry_is_accepted_as_no_diagram(tmp_path):
 def commit_list(count, include_head=False):
     commits = [{"sha": f"{index:040x}"} for index in range(1, count + 1)]
     if include_head:
-        commits[len(commits) // 2] = {"sha": HEAD}
+        commits[-1] = {"sha": HEAD}
     return commits
 
 
 def test_snapshot_binds_head_rules():
     assert snapshot_binds_head({"commits": [{"sha": "b" * 40}, {"sha": HEAD}]}, HEAD)
-    # The head need not be last: a force-push or a late-listed commit still counts when it is present.
-    assert snapshot_binds_head({"commits": [{"sha": HEAD}, {"sha": "b" * 40}]}, HEAD)
+    # A complete list must end at the head: the scan resolved B, a push added C, so [A, B, C] is another head.
+    assert not snapshot_binds_head({"commits": [{"sha": HEAD}, {"sha": "b" * 40}]}, HEAD)
+    assert not snapshot_binds_head({"commits": [{"sha": "a" * 40}, {"sha": HEAD}, {"sha": "c" * 40}]}, HEAD)
     assert not snapshot_binds_head({"commits": [{"sha": "b" * 40}]}, HEAD)
     for pr in ({}, {"commits": []}, {"commits": None}, {"commits": ["x", 3]}, None, []):
         assert not snapshot_binds_head(pr, HEAD)
@@ -526,3 +527,36 @@ def test_prompts_reference_evidence_by_path_and_stay_small_for_huge_snapshots(tm
     assert f"{5000 - paircli_summary.MAX_LISTED_PATHS} more not listed" in prompts[0]
     assert "and 2450 more" in architecture_prompts[0]
     assert "rejected with these errors" in architecture_prompts[-1]
+
+
+def test_a_timeout_on_the_retry_is_not_reported_as_no_diagram(tmp_path):
+    from paircli_architecture import llm_failure_reason
+    folder = prepare(tmp_path)
+    answers = iter(["{}"])
+
+    def generate(_prompt):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise subprocess.TimeoutExpired("codex", 300)
+
+    assert write_architecture(folder, generate, io.StringIO()) is None
+    reason = llm_failure_reason(folder)
+    assert "no diagram" not in reason and "unavailable" in reason
+    # A later successful-but-null run starts clean and reports its own outcome.
+    assert write_architecture(folder, lambda _: "null", io.StringIO()) is None
+    assert llm_failure_reason(folder) == "llm returned no diagram"
+
+
+def test_a_validation_failure_on_the_retry_still_reports_validation(tmp_path):
+    from paircli_architecture import llm_failure_reason
+    folder = prepare(tmp_path)
+    assert write_architecture(folder, lambda _: "{}", io.StringIO()) is None
+    assert llm_failure_reason(folder) == "llm output failed validation"
+
+
+def test_diagram_prompt_grounds_descriptions_in_cited_lines(tmp_path):
+    folder = prepare(tmp_path)
+    prompts = []
+    write_architecture(folder, lambda prompt: prompts.append(prompt) or "null", io.StringIO())
+    assert "not on the PR title" in prompts[0] and "only if\nthe cited lines show it" in prompts[0]

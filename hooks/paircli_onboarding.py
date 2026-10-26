@@ -866,7 +866,10 @@ def run_diagram_step(harness: str, repo_dir: Path, artifact_dir: Path, log) -> P
     reason = ""
     try:
         generate = agent_runner(harness)
-        diagram = write_architecture(artifact_dir, lambda prompt: generate(prompt, repo_dir), log)
+        model = stage_model("diagram")
+        # Pass the model only when configured, so an unset variable keeps the CLI default.
+        extra = {"model": model} if model else {}
+        diagram = write_architecture(artifact_dir, lambda prompt: generate(prompt, repo_dir, **extra), log)
         if diagram:
             record_llm_diagram(artifact_dir, log)
             return diagram

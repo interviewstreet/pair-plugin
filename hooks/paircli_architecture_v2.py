@@ -168,17 +168,21 @@ class SnapshotIndex:
         return [(hunk[start], hunk[start] + hunk[count] - 1) for hunk in self.hunks(file) if hunk[count] > 0]
 
     def lines(self, file: dict) -> dict:
-        """`{"new": {line: kind}, "old": {line: kind}, "additions": n, "deletions": n}` for one file."""
+        """`{"new": {line: kind}, "old": {line: kind}, "additions": n, "deletions": n}` for one file.
+
+        `to_old` and `to_new` map the line numbers of context lines between the two sides.
+        """
         cached = self._lines.get(file["path"])
         if cached is not None:
             return cached
-        result = {"new": {}, "old": {}, "additions": 0, "deletions": 0}
+        result = {"new": {}, "old": {}, "additions": 0, "deletions": 0, "to_old": {}, "to_new": {}}
         for hunk in self.hunks(file):
             new, old = hunk["new_start"], hunk["old_start"]
             for line in dicts(hunk.get("lines")):
                 kind = line.get("kind")
                 if kind == "ctx":
                     result["new"][new] = result["old"][old] = "ctx"
+                    result["to_old"][new], result["to_new"][old] = old, new
                     new, old = new + 1, old + 1
                 elif kind == "add":
                     result["new"][new] = "add"
@@ -216,8 +220,14 @@ def node_facts(node: dict, index: SnapshotIndex) -> dict:
 
 
 def edge_change(edge: dict, index: SnapshotIndex) -> str:
-    """`change` of an edge from the kinds of the diff lines its valid citations point at."""
-    has_new = has_old = False
+    """`change` of an edge from the kinds of the diff lines its valid citations point at.
+
+    Every cited line is context (neither added nor deleted): `unchanged`. Added lines and no deleted
+    one: `added` when the citations are only added new-side lines, else `modified`. Deleted lines and
+    no added one: `removed` when the citations are only old-side, else `modified`. Both: `modified`.
+    """
+    added = deleted = False
+    new_side = old_side = False
     all_added = True
     refs = edge.get("evidence")
     for ref in refs[:MAX_REFS] if isinstance(refs, list) else []:
@@ -225,17 +235,22 @@ def edge_change(edge: dict, index: SnapshotIndex) -> str:
         if valid is None:
             continue
         file, side, start, end = valid
+        kinds = index.lines(file)[side]
+        cited = [kinds.get(line) for line in range(start, end + 1)]
         if side == "old":
-            has_old = True
+            old_side = True
+            deleted = deleted or "del" in cited
             continue
-        has_new = True
-        kinds = index.lines(file)["new"]
-        all_added = all_added and all(kinds.get(line) == "add" for line in range(start, end + 1))
-    if not (has_new or has_old):
+        new_side = True
+        added = added or "add" in cited
+        all_added = all_added and all(kind == "add" for kind in cited)
+    if not (added or deleted):
         return "unchanged"
-    if has_old and not has_new:
-        return "removed"
-    return "added" if has_new and not has_old and all_added else "modified"
+    if added and not deleted:
+        return "added" if all_added and not old_side else "modified"
+    if deleted and not added:
+        return "removed" if not new_side else "modified"
+    return "modified"
 
 
 def common_directory(files: list[str]) -> str:
@@ -323,8 +338,67 @@ def compute_layout(groups, nodes, edges) -> dict[str, dict]:
 
 # --- enrich ------------------------------------------------------------------------------
 
-def enrich_v2(draft, head: str, snapshot, generated_by: str = "llm"):
-    """Return a copy of `draft` with every code-owned field recomputed; leaves malformed parts alone."""
+def step_side(when) -> str | None:
+    """The side a step's citations must be on: a `before` step shows the old code, an `after` step the new."""
+    return {"before": "old", "after": "new"}.get(when) if isinstance(when, str) else None
+
+
+def convert_ref(ref, wanted: str, index: SnapshotIndex) -> list[dict] | None:
+    """Re-express one citation on the `wanted` side. None: leave it (it is not a valid citation).
+
+    A citation already on that side is kept. One on the other side converts only when every line it
+    cites is a context line, which exists on both sides under another number; a context run that is
+    not contiguous on the wanted side becomes several citations. A citation that touches an added line
+    (cited as `old`: a deleted line) cannot support the other view and gives `[]`.
+    """
+    valid = check_ref(ref, "", index, silent)
+    if valid is None:
+        return None
+    file, side, start, end = valid
+    if side == wanted:
+        return [ref]
+    facts = index.lines(file)
+    kinds, mapping = facts[side], facts["to_old" if side == "new" else "to_new"]
+    lines = range(start, end + 1)
+    if any(kinds.get(line) != "ctx" or line not in mapping for line in lines):
+        return []
+    mapped = [mapping[line] for line in lines]
+    runs = [[mapped[0], mapped[0]]]
+    for line in mapped[1:]:
+        if line == runs[-1][1] + 1:
+            runs[-1][1] = line
+        else:
+            runs.append([line, line])
+    return [{**ref, "start": first, "end": last, "side": wanted} for first, last in runs]
+
+
+def convert_step_evidence(step: dict, index: SnapshotIndex, position: int, notes: list | None) -> None:
+    """Move a step's citations to the side its `when` needs, dropping those that cannot move."""
+    wanted, refs = step_side(step.get("when")), step.get("evidence")
+    if wanted is None or not isinstance(refs, list):
+        return
+    result = []
+    for number, ref in enumerate(refs):
+        converted = convert_ref(ref, wanted, index)
+        if converted is None:
+            result.append(ref)  # not a valid citation: validation reports it
+            continue
+        if not converted and notes is not None and len(notes) < MAX_WARNINGS:
+            other = "new" if wanted == "old" else "old"
+            notes.append(f"steps[{position}].evidence[{number}]: a {step['when']} step cannot cite {other}-side "
+                         f"lines that were {'added' if other == 'new' else 'deleted'}; citation dropped")
+        for item in converted or []:
+            if item not in result:
+                result.append(item)
+    step["evidence"] = result[:MAX_REFS]
+
+
+def enrich_v2(draft, head: str, snapshot, generated_by: str = "llm", notes: list | None = None):
+    """Return a copy of `draft` with every code-owned field recomputed; leaves malformed parts alone.
+
+    Step citations move to the side the step's `when` needs (see `convert_ref`); each citation that
+    has to be dropped is described in `notes` when a list is given.
+    """
     if not one_of(generated_by, GENERATED_BY):
         raise ArchitectureError([{"path": "generated_by", "reason": f"must be one of {list(GENERATED_BY)}"}])
     if not isinstance(draft, dict):
@@ -347,6 +421,7 @@ def enrich_v2(draft, head: str, snapshot, generated_by: str = "llm"):
     for position, step in enumerate(steps if isinstance(steps, list) else []):
         if isinstance(step, dict):
             step["flags"] = []
+            convert_step_evidence(step, index, position, notes)
             steps[position] = ordered(step, STEP_KEYS)
     for collection in (nodes, edges, steps):
         for item in collection if isinstance(collection, list) else []:
@@ -571,6 +646,13 @@ def check_step(step, path: str, graph: Graph, check) -> None:
           "must be an empty list: flags are not generated yet")
     refs = check_evidence(step.get("evidence"), join(path, "evidence"), graph.index, check)
     check(bool(refs), join(path, "evidence"), "needs at least one valid diff citation")
+    wanted = step_side(when)
+    if wanted is not None:
+        for offset, ref in enumerate(step.get("evidence") if isinstance(step.get("evidence"), list) else []):
+            valid = check_ref(ref, "", graph.index, silent)
+            if valid is not None:
+                check(valid[1] == wanted, f"{path}.evidence[{offset}].side",
+                      f'a {when} step must cite {wanted}-side lines (side "{wanted}")')
 
     # Elements of a view that does not show them: removed things are absent after, added ones before.
     hidden = "removed" if when == "after" else "added" if when == "before" else None
@@ -684,7 +766,7 @@ def drop_invalid_steps(document, head: str, snapshot):
 def finalize_v2(draft, head: str, snapshot, generated_by: str):
     """normalize -> enrich -> drop invalid steps -> validate. Returns `(document, warnings)`."""
     document, warnings = normalize_v2(draft)
-    document = enrich_v2(document, head, snapshot, generated_by)
+    document = enrich_v2(document, head, snapshot, generated_by, warnings)
     document, dropped = drop_invalid_steps(document, head, snapshot)
     for entry in dropped:
         shown = "; ".join(f"{error['path']}: {error['reason']}" for error in entry["errors"][:3])

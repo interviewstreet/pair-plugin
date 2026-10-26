@@ -188,6 +188,69 @@ def test_go_imports_resolve_single_block_and_aliased_lines():
     ]
 
 
+def go_package_files():
+    """cmd/app imports internal/scan (three changed files), internal/solo (one) and internal/llm (one + a test)."""
+    main = [
+        'import (',                                           # 2
+        '\t"github.com/acme/repo/internal/scan"',            # 3: a package with several changed files
+        '\t"github.com/acme/repo/internal/solo"',            # 4: a package with exactly one changed file
+        '\t"github.com/acme/repo/internal/llm"',             # 5: one changed non-test file plus a test file
+        ')',
+    ]
+    return [make_file("cmd/app/main.go", added=main),
+            make_file("internal/scan/replay.go", added=source_lines(30)),
+            make_file("internal/scan/scan.go", added=source_lines(5)),
+            make_file("internal/scan/output.go", added=source_lines(3)),
+            make_file("internal/solo/solo.go", added=["package solo"]),
+            make_file("internal/llm/messages.go", added=["package llm"]),
+            make_file("internal/llm/messages_test.go", added=source_lines(40))]
+
+
+def test_a_go_import_is_a_file_edge_only_when_the_package_has_exactly_one_changed_file():
+    _, skeleton = build(go_package_files())
+    file_edges = [(e["target_file"], e["cite"]["line"]) for e in skeleton["edges"] if e["target_file"]]
+    assert file_edges == [("internal/solo/solo.go", 4), ("internal/llm/messages.go", 5)]
+    (package,) = [e for e in skeleton["edges"] if e["target_file"] is None]
+    assert package["target_package"] == "internal/scan" and package["cite"]["line"] == 3
+    # The package edge still carries its groups, so the v1 diagram can aggregate group to group.
+    assert package["source_group"] and package["target_group"]
+    assert package["target_anchor"].startswith("internal/scan/")
+    # No file-level edge names any of the several scan files.
+    assert not [e for e in skeleton["edges"] if (e["target_file"] or "").startswith("internal/scan/")]
+
+
+def test_a_go_package_edge_feeds_the_v1_diagram_without_naming_a_file():
+    files = [make_file("cmd/app/main.go", added=['import "github.com/acme/repo/internal/scan"']),
+             make_file("internal/scan/replay.go", added=source_lines(30)),
+             make_file("internal/scan/scan.go", added=source_lines(5))]
+    document, skeleton, _ = diagram_for(files)
+    assert [e["target_file"] for e in skeleton["edges"]] == [None]
+    (edge,) = document["edges"]
+    assert edge["description"] == "main.go imports the internal/scan package"
+    assert "replay.go" not in edge["description"] and "scan.go" not in edge["description"]
+    assert {node["id"] for node in document["nodes"]} >= {edge["source"], edge["target"]}
+
+
+def test_a_go_import_of_a_package_whose_other_files_are_deleted_or_tests_resolves_to_the_live_file():
+    files = [make_file("cmd/app/main.go", added=['import "github.com/acme/repo/internal/old"']),
+             make_file("internal/old/new.go", added=["package old"]),
+             make_file("internal/old/gone.go", status="deleted", removed=["package old"]),
+             make_file("internal/old/new_test.go", added=["package old"])]
+    _, skeleton = build(files)
+    assert edges_of(skeleton) == [("cmd/app/main.go", "internal/old/new.go", 2)]
+
+
+def test_ambiguous_python_and_alias_suffix_matches_give_no_edge():
+    files = [make_file("pkg/app/main.py", added=["from shared.util import x", "import only.here"]),
+             make_file("a/shared/util.py", added=["x = 1"]), make_file("b/shared/util.py", added=["x = 1"]),
+             make_file("lib/only/here.py", added=["y = 1"]),
+             make_file("app/page.tsx", added=["import { c } from '@/lib/client';", "import { d } from '@/lib/solo';"]),
+             make_file("one/lib/client.ts", added=["x"]), make_file("two/lib/client.ts", added=["x"]),
+             make_file("one/lib/solo.ts", added=["x"])]
+    _, skeleton = build(files)
+    assert edges_of(skeleton) == [("app/page.tsx", "one/lib/solo.ts", 3), ("pkg/app/main.py", "lib/only/here.py", 3)]
+
+
 def test_edges_are_deduplicated_ordered_and_capped():
     lines = [f"import x{index} from './t{index % 3}';" for index in range(6)]
     files = [make_file("src/a.ts", added=lines)] + [make_file(f"src/t{index}.ts", added=["x"]) for index in range(3)]

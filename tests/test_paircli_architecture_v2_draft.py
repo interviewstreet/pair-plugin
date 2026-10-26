@@ -265,6 +265,34 @@ def test_multi_language_imports_become_edges():
                      (ids["internal/handler/handler.go"], ids["internal/store/store.go"])}
 
 
+def test_an_import_on_an_unchanged_context_line_is_an_unchanged_edge_that_validates():
+    context = {"old_start": 1, "old_lines": 3, "new_start": 1, "new_lines": 4, "section": "", "lines": [
+        {"kind": "ctx", "text": "import { b } from './b';", "old_no": 1, "new_no": 1},
+        {"kind": "add", "text": "const x = 1;", "new_no": 2},
+        {"kind": "ctx", "text": "export const a = 1;", "old_no": 2, "new_no": 3},
+        {"kind": "ctx", "text": "export const c = 1;", "old_no": 3, "new_no": 4}]}
+    files = [make_file("src/a.ts", hunks=[context]), make_file("src/b.ts", added=["x"])]
+    snapshot, _, document = finalize(files)
+    (edge,) = document["edges"]
+    assert edge["evidence"] == [{"type": "diff", "path": "src/a.ts", "start": 1, "end": 1, "side": "new"}]
+    assert edge["change"] == "unchanged"
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_a_go_import_of_a_multi_file_package_draws_no_file_edge():
+    main = ['import (', '\t"github.com/acme/repo/internal/scan"', '\t"github.com/acme/repo/internal/solo"', ')']
+    files = [make_file("cmd/app/main.go", added=main),
+             make_file("internal/scan/replay.go", added=source_lines(30)),
+             make_file("internal/scan/scan.go", added=source_lines(5)),
+             make_file("internal/solo/solo.go", added=["package solo"])]
+    _, skeleton, _ = build(files)
+    assert any(edge["target_file"] is None for edge in skeleton["edges"])  # the skeleton keeps the package link
+    _, _, document = finalize(files)
+    ids = {node["files"][0]: node["id"] for node in document["nodes"]}
+    assert {(e["source"], e["target"]) for e in document["edges"]} == {(ids["cmd/app/main.go"], ids["internal/solo/solo.go"])}
+    assert all("replay.go" not in e["claim"] and "scan.go" not in e["claim"] for e in document["edges"])
+
+
 def test_edges_to_files_without_a_row_are_dropped():
     # b.ts is hunk-less (no row), c.ts is a routine file, d.ts is beyond the row limit
     files = [make_file("src/a.ts", added=["import b from './b';", "import c from './c';", "import d from './d';"]),

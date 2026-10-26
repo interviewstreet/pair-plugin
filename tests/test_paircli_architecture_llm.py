@@ -337,6 +337,46 @@ def test_merge_prompt_mirrors_the_step_rules(tmp_path):
     assert len(prompt.encode()) < 12 * 1024
 
 
+GROUNDING_PHRASES = (
+    "Base every row description, edge claim and step text on the cited lines",
+    "PR title and description may be wrong or stale",
+    "Mention only identifiers, flags, paths, options and counts that you can see in the cited code",
+    "only if the digest lists an edge from X to Y or the cited lines show",
+    "without asserting a link between them",
+    "old-side",
+    "say less rather than guess",
+)
+
+
+def test_group_prompt_grounds_text_in_the_cited_code(tmp_path):
+    prompt = " ".join(llm.group_prompt(tmp_path, {"id": "api", "label": "API"}, tmp_path / "d.json").split())
+    for expected in GROUNDING_PHRASES:
+        assert expected in prompt, expected
+    assert "never infer the old behavior from added lines" in prompt
+    assert len(prompt.encode()) < 12 * 1024
+
+
+def test_merge_prompt_grounds_text_and_requires_old_side_support_for_before_steps(tmp_path):
+    prompt = " ".join(llm.merge_prompt(tmp_path, tmp_path / "merge-input.json").split())
+    for expected in GROUNDING_PHRASES:
+        assert expected in prompt, expected
+    assert 'Every "before" step must be supported by old-side citations' in prompt
+    assert 'a "before" step may not cite added lines' in prompt
+    assert "pr_title is only a hint and may be wrong" in prompt
+    assert len(prompt.encode()) < 12 * 1024
+
+
+def test_retry_prompts_keep_the_grounding_rules_and_stay_small(tmp_path):
+    errors = [{"path": f"steps[{index}].evidence", "reason": "y" * 600} for index in range(40)]
+    for prompt in (llm.group_prompt(tmp_path, {"id": "api", "label": "API"}, tmp_path / "d.json", errors),
+                   llm.merge_prompt(tmp_path, tmp_path / "m.json", errors)):
+        assert GROUNDING_PHRASES[0] in " ".join(prompt.split()) and len(prompt.encode()) < 12 * 1024
+
+
+def test_the_prompt_version_changed_so_older_cached_patches_are_not_reused():
+    assert llm.PROMPT_VERSION != "architecture-llm-1"
+
+
 def test_merge_digest_lists_groups_rows_and_edges():
     snapshot, draft = world()
     digest = llm.build_merge_digest(draft, {"api": "API summary"}, snapshot)

@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 from paircli_architecture import save_atomic
 from paircli_skeleton import LOCK_FILES
-from paircli_snapshot import captured_pr, no_line_data_note, snapshot_binds_head
+from paircli_snapshot import captured_pr, no_line_data_note, quote_path, snapshot_binds_head
 
 
 SUMMARY_TIMEOUT_SECONDS = 5 * 60
@@ -195,7 +195,7 @@ def summary_prompt(pr_url: str, artifact_dir: Path) -> str:
     paths = list(reading_table(pr_url, artifact_dir))
     note = no_line_data_note(_captured_pr(artifact_dir))
     no_lines = f"{note}\n" if note else ""
-    references = "\n".join(paths[:MAX_LISTED_PATHS]) or "No changed files available."
+    references = "\n".join(quote_path(path) for path in paths[:MAX_LISTED_PATHS]) or "No changed files available."
     if len(paths) > MAX_LISTED_PATHS:
         references += (f"\n{len(paths) - MAX_LISTED_PATHS} more not listed; "
                        "choose only paths listed above.")
@@ -277,7 +277,8 @@ If the diff cannot support recommendations, use that text in all three groups
 and briefly explain the missing detail before the groups. Never invent entries.
 
 Each guide bullet must have exactly this form: - path/to/file.ext — short plain-English reason.
-Write the changed file path exactly as listed below, then a space, an em dash, a space
+Write the changed file path exactly as listed below (each is JSON-quoted on its own
+line; write it without the quotes), then a space, an em dash, a space
 and the reason. Add :START-END (or :N) after the path only when a line range in the
 new version of the file helps, and only inside a changed hunk; otherwise use the
 whole path. Do not write Markdown links or URLs: the plugin turns each path into a
@@ -597,11 +598,14 @@ def write_summary(harness: str, pr_url: str, repo_dir: Path, artifact_dir: Path,
             raise EvidenceMissingError(f"Pair evidence is missing: {artifact_dir / name}")
     errors = []
     try:
-        generate = agent_runner(harness)
+        runner = agent_runner(harness)
+        model = stage_model("summary")
+        # The model keyword is sent only when configured, so an unset variable keeps the CLI default.
+        generate = (lambda text: runner(text, repo_dir, model=model)) if model else (lambda text: runner(text, repo_dir))
         prompt = summary_prompt(pr_url, artifact_dir)
         for attempt in (1, 2):
             try:
-                content = validate_summary(generate(prompt, repo_dir), pr_url, artifact_dir, log)
+                content = validate_summary(generate(prompt), pr_url, artifact_dir, log)
             except SummaryValidationError as error:
                 errors.append(str(error))
                 log.write(f"{harness} summary attempt {attempt} rejected: {error}\n")

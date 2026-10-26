@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -1124,3 +1125,21 @@ def test_has_active_login_requires_matching_backend(monkeypatch, tmp_path):
 
     monkeypatch.setenv("PAIRCLI_SERVER_URL", "https://private.pair.example")
     assert not onboarding.has_active_login()
+
+
+@pytest.mark.parametrize("configured,expected", [("diagram-model", "diagram-model"), (None, None)])
+def test_v1_diagram_call_uses_the_diagram_stage_model(monkeypatch, tmp_path, configured, expected):
+    repo, artifacts, _uploads = fault_scan(monkeypatch, tmp_path)
+    if configured:
+        monkeypatch.setenv("PAIRCLI_MODEL_DIAGRAM", configured)
+    else:
+        monkeypatch.delenv("PAIRCLI_MODEL_DIAGRAM", raising=False)
+    models = []
+
+    def generate(prompt, _repo, model=None):
+        models.append(model)
+        return "null"
+
+    monkeypatch.setattr(summary_module(), "_run_codex", generate)
+    onboarding.run_diagram_step("codex", repo, artifacts, io.StringIO())
+    assert models == [expected]

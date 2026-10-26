@@ -58,9 +58,16 @@ validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
   changed), else `changed` when `change` is not `unchanged`, else `context`.
 - **Node `stats`**: `files` count, and `additions`/`deletions` summed from the
   `+`/`-` hunk lines of its files.
-- **Edge `change`**: from the hunk lines its evidence cites. Only old-side
-  citations: `removed`. New-side citations that are all added lines: `added`.
-  Any other cited lines: `modified`. No cited lines: `unchanged`.
+- **Edge `change`**: from the kinds of the hunk lines its valid citations point at.
+
+  | Cited lines | `change` |
+  | --- | --- |
+  | Every cited line is context (neither added nor deleted), on either side, or nothing valid is cited | `unchanged` |
+  | Added lines, no deleted line; the citations are only new-side added lines | `added` |
+  | Deleted lines (old side), no added line; the citations are only old-side | `removed` |
+  | Anything else with an added or deleted line (a mix, or changed lines next to context citations) | `modified` |
+
+  So an import line that exists before and after the PR is `unchanged`, not `modified`.
 - **Group `path`**: longest common directory prefix of its nodes' files (empty if none).
 - **Group `column` / `order`**: layered layout. Build the group graph from node
   edges (source group to target group, ignoring self edges). Break cycles
@@ -77,6 +84,7 @@ validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
 - `new`: `path` must be a changed file and `start..end` inside one new-side hunk range.
 - `old`: `start..end` must be inside one old-side hunk range of that file. For a
   renamed file, `path` may be the new path or its `old_path`.
+- A step's refs must match its `when`; see Steps.
 - A node needs at least one ref, and every path in `files` needs a ref. A node
   with `kind` `routine`, or an `unchanged` or external node that is an endpoint
   of an edge with valid evidence, may omit evidence.
@@ -88,6 +96,15 @@ validation. Compared with v1, `flows` is replaced by `steps`, `layer` and
 - If `edge` is set, it names an existing edge and both its endpoints are in `nodes`.
 - An `after` step may not use a node or edge whose `change` is `removed`. A
   `before` step may not use one whose `change` is `added`.
+- A `before` step cites the old code and an `after` step the new code:
+  `before` evidence must be `side: "old"`, `after` evidence `side: "new"`.
+  Enrichment moves refs that sit on the wrong side when that is exact: a ref
+  whose lines are all context lines is re-expressed on the other side with the
+  matching line numbers (a run that is not contiguous there becomes several
+  refs). A ref that touches an added line cannot support a `before` step, and
+  one that touches a deleted line cannot support an `after` step, so it is
+  dropped with a logged note. A step left with no ref is invalid and dropped.
+  Validation rejects any step ref on the wrong side.
 - `text` is at most 400 characters. `flags` must be `[]`.
 - A step that fails validation is dropped (with a logged warning) without
   dropping the graph. A graph that fails validation falls to the next tier.
@@ -104,3 +121,10 @@ Node `kind` is one of the v1 kinds (`client`, `service`, `database`, `cache`,
 `generated_by` is `llm` for model-written structure and `deterministic` for the
 skeleton-only fallback (groups, file rows and import edges, with real hunk
 citations). A docs-only PR produces no diagram.
+
+Import edges are file-level only when the import resolves to exactly one
+changed file. A Go import names a package (a directory), so it is a file edge
+only when that package has exactly one changed non-test `.go` file; otherwise
+it is a package-level link that the v1 diagram uses for group-to-group edges
+(its text names the package, never a file) and the v2 draft ignores. A Python
+or alias import whose suffix matches several changed files gives no edge.

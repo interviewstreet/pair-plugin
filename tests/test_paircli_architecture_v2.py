@@ -143,7 +143,7 @@ def test_golden_computed_fields():
         "names-ts": ("modified", "changed", {"files": 1, "additions": 1, "deletions": 1}),
     }
     assert {item["id"]: item["change"] for item in document["edges"]} == {
-        "e1": "modified", "e2": "removed", "e3": "added", "e4": "modified", "e5": "modified"}
+        "e1": "modified", "e2": "removed", "e3": "added", "e4": "modified", "e5": "unchanged"}
     assert document["groups"] == [
         {"id": "api", "label": "API", "path": "src/api", "column": 0, "order": 0},
         {"id": "db", "label": "Database", "path": "src/db", "column": 1, "order": 0},
@@ -319,7 +319,12 @@ def test_node_change_state_and_stats(name, files, kind, expected):
     ("all added lines", [ref(REVIEWS, 12, 13)], "added"),
     ("added file", [ref(SESSION, 1, 5)], "added"),
     ("added and context", [ref(REVIEWS, 11, 12)], "modified"),
-    ("context only", [ref(REVIEWS, 14, 15)], "modified"),
+    ("context only", [ref(REVIEWS, 14, 15)], "unchanged"),
+    ("context on the old side only", [ref(REVIEWS, 10, 11, "old")], "unchanged"),
+    ("context on both sides", [ref(REVIEWS, 14, 15), ref(REVIEWS, 13, 14, "old")], "unchanged"),
+    ("context plus a deleted old line", [ref(REVIEWS, 10, 12, "old")], "removed"),
+    ("deleted old line plus new context", [ref(REVIEWS, 12, 12, "old"), ref(REVIEWS, 14, 14)], "modified"),
+    ("added line plus old context", [ref(REVIEWS, 12, 13), ref(REVIEWS, 10, 11, "old")], "modified"),
     ("new and old together", [ref(REVIEWS, 12, 13), ref(REVIEWS, 12, 12, "old")], "modified"),
     ("no citations", [], "unchanged"),
     ("only invalid citations", [ref(REVIEWS, 100, 101)], "unchanged"),
@@ -709,6 +714,7 @@ def test_drop_invalid_steps_leaves_non_dict_documents_alone(value):
 def test_finalize_drops_bad_steps_with_warnings_and_keeps_the_graph():
     source = draft()
     source["steps"][1]["when"] = "after"  # an after-step on the removed edge e2
+    source["steps"][1]["evidence"] = [ref(REVIEWS, 12)]
     document, warnings = finalize_v2(source, HEAD, snapshot(), "llm")
     assert [item["id"] for item in document["steps"]] == ["s1"]
     assert len(warnings) == 1 and warnings[0].startswith("step s2 dropped: steps[1].nodes[1]")
@@ -810,3 +816,94 @@ def test_large_document_and_snapshot_finalize_quickly():
     assert warnings == [] and len(document["steps"]) == 24
     assert max(group["column"] for group in document["groups"]) <= 8
     assert len(json.dumps(document).encode()) < MAX_BYTES
+
+
+# --- before and after steps cite the matching side -------------------------------------------
+
+def step_with(when, evidence, **values):
+    return {"id": "s1", "when": when, "nodes": ["reviews-ts"], "text": "Reviews.", "flags": [],
+            "evidence": evidence, **values}
+
+
+def finalize_step(step, snap=None):
+    source = draft()
+    source["steps"] = [step]
+    return finalize_v2(source, HEAD, snap or snapshot(), "llm")
+
+
+def test_a_before_step_citing_context_lines_moves_them_to_the_old_side():
+    # New 14-15 are context lines that were old 13-14.
+    document, warnings = finalize_step(step_with("before", [ref(REVIEWS, 14, 15)]))
+    assert [step["evidence"] for step in document["steps"]] == [[ref(REVIEWS, 13, 14, "old")]]
+    assert warnings == []
+    assert validate_v2(document, HEAD, snapshot()) is None
+
+
+def test_a_before_step_citing_an_added_line_drops_the_ref_and_the_step_when_nothing_is_left():
+    document, warnings = finalize_step(step_with("before", [ref(REVIEWS, 12, 13)]))
+    assert document["steps"] == []
+    assert warnings[0] == ("steps[0].evidence[0]: a before step cannot cite new-side lines that were added; "
+                           "citation dropped")
+    assert warnings[1].startswith("step s1 dropped: steps[0].evidence: needs at least one valid diff citation")
+
+
+def test_a_before_step_citing_a_range_that_mixes_context_and_added_lines_loses_that_ref_only():
+    document, warnings = finalize_step(step_with("before", [ref(REVIEWS, 11, 12), ref(REVIEWS, 10, 11)]))
+    assert [step["evidence"] for step in document["steps"]] == [[ref(REVIEWS, 10, 11, "old")]]
+    assert len(warnings) == 1 and "evidence[0]" in warnings[0]
+
+
+def test_a_before_step_keeps_old_side_refs_on_deleted_lines():
+    document, warnings = finalize_step(step_with("before", [ref(REVIEWS, 12, 12, "old"), ref(REVIEWS, 14, 14)]))
+    assert document["steps"][0]["evidence"] == [ref(REVIEWS, 12, 12, "old"), ref(REVIEWS, 13, 13, "old")]
+    assert warnings == []
+
+
+def test_an_after_step_citing_context_on_the_old_side_moves_to_the_new_side_and_deleted_lines_drop():
+    document, warnings = finalize_step(step_with("after", [ref(REVIEWS, 13, 14, "old"), ref(REVIEWS, 12, 12, "old")]))
+    assert document["steps"][0]["evidence"] == [ref(REVIEWS, 14, 15)]
+    assert len(warnings) == 1 and "after step cannot cite old-side lines that were deleted" in warnings[0]
+
+
+def test_a_context_run_that_is_not_contiguous_on_the_other_side_splits_into_several_refs():
+    files = [changed("src/a.ts", hunks=[hunk(1, 1, "  - ")])]  # new 1,2,3 ctx; old 1,2 ctx, 3 del, 4 ctx
+    snap = snapshot(files)
+    source = {"nodes": [node("n", "g", "file", ["src/a.ts"], [ref("src/a.ts", 1)])], "steps": [
+        {"id": "s1", "when": "before", "nodes": ["n"], "text": "t", "evidence": [ref("src/a.ts", 2, 3)]}]}
+    steps = enrich_v2(source, HEAD, snap)["steps"]
+    assert steps[0]["evidence"] == [ref("src/a.ts", 2, 2, "old"), ref("src/a.ts", 4, 4, "old")]
+
+
+def test_the_renamed_file_keeps_its_cited_path_when_a_ref_changes_side():
+    document, _ = finalize_step(step_with("before", [ref(NAMES, 5, 5)], nodes=["names-ts"]))
+    # new 5 is context in " +- " (old 5 too)
+    assert document["steps"][0]["evidence"] == [ref(NAMES, 5, 5, "old")]
+
+
+@pytest.mark.parametrize("when, side, expected", [
+    ("before", "new", "steps[0].evidence[0].side"),
+    ("after", "old", "steps[0].evidence[0].side"),
+])
+def test_validation_requires_each_step_to_cite_its_own_side(when, side, expected):
+    document = valid()
+    document["steps"][0]["when"] = when
+    document["steps"][0]["evidence"] = [ref(REVIEWS, 12, 12, side)]
+    document["steps"][0]["nodes"] = ["reviews-ts", "store-ts"]
+    assert expected in paths_of(document)
+
+
+def test_validation_accepts_a_before_step_on_the_old_side_and_an_after_step_on_the_new_side():
+    document = valid()
+    assert [step["when"] for step in document["steps"]] == ["after", "before"]
+    assert {ref["side"] for step in document["steps"] for ref in step["evidence"]} == {"new", "old"}
+    assert validate_v2(document, HEAD, snapshot()) is None
+
+
+def test_drop_invalid_steps_drops_a_wrong_side_step_with_the_reason():
+    document = valid()
+    document["steps"][1]["evidence"] = [ref(LEGACY, 1, 2, "new")]  # not even a valid new-side range
+    document["steps"][0]["when"] = "before"                        # an unconverted new-side ref
+    kept, dropped = drop_invalid_steps(document, HEAD, snapshot())
+    assert [entry["id"] for entry in dropped] == ["s1", "s2"]
+    assert any("must cite old-side lines" in error["reason"] for error in dropped[0]["errors"])
+    assert kept["steps"] == []

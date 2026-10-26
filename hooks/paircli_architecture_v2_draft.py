@@ -11,7 +11,9 @@ is the input of `finalize_v2(draft, head, snapshot, "deterministic")`, which fil
                           one `file` row per top-ranked citable file, plus one `routine` row per
                           group that has routine files (lockfiles, generated, vendored, binary)
   edges   [{id, source, target, label, claim, evidence}]
-                          file-level imports between rows, new-side and removed (old-side) ones
+                          file-level imports between rows, new-side and removed (old-side) ones;
+                          only unambiguous ones (a Go import is a package, so no file edge
+                          unless the package has exactly one changed file)
   steps   []              narration is the model's job
   gaps    [str]           what was collapsed, left out or not citable (5 at most)
 
@@ -281,7 +283,9 @@ def _edges(skeleton: dict, cite: _Citations, records: dict, row_of: dict[str, st
         where = edge.get("cite") if isinstance(edge.get("cite"), dict) else {}
         source, target = edge.get("source_file"), edge.get("target_file")
         side, line = where.get("side"), _int(where.get("line"))
-        if (source not in row_of or target not in row_of or source == target or side not in ("new", "old")
+        # A package-level edge has no target file: it never becomes a file-level edge.
+        if (not isinstance(target, str) or source not in row_of or target not in row_of or source == target
+                or side not in ("new", "old")
                 or line is None or where.get("path") != source
                 or not any(low <= line <= high for low, high in cite.ranges(source, side))):
             continue

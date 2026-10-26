@@ -278,8 +278,13 @@ failure never touches it. The ZIP carries v2 under its normal path and as a root
 - **Environment.** `PAIRCLI_ARCHITECTURE_V2=0` turns v2 off (default on). `PAIRCLI_ARCH_LLM_GROUPS`
   (default 8, at most 12; 0 means no group calls), `PAIRCLI_ARCH_CONCURRENCY` (default 3, at most 8),
   `PAIRCLI_ARCH_CALL_TIMEOUT` (seconds per call, default 120) and `PAIRCLI_ARCH_DEADLINE` (seconds
-  for all calls, default 240). `PAIRCLI_MODEL_SUMMARY`, `PAIRCLI_MODEL_GROUP` and `PAIRCLI_MODEL_MERGE`
-  choose the model per stage; unset means the harness default. No model name is hardcoded.
+  for all calls, default 240). Model choice per stage: `PAIRCLI_MODEL_SUMMARY` (summary.md and its
+  retry), `PAIRCLI_MODEL_DIAGRAM` (the v1 diagram call and its retry), `PAIRCLI_MODEL_GROUP` and
+  `PAIRCLI_MODEL_MERGE` (the v2 calls). Unset means the harness default, and no model name is
+  hardcoded.
+- **Deadline and stragglers.** After the v2 deadline, abandoned model calls may keep the scan process
+  alive until their own per-call timeout (default 120 s, `PAIRCLI_ARCH_CALL_TIMEOUT`), but they never
+  delay the upload.
 - **Added scan time.** The step starts after v1, so the worst case it adds is about
   `PAIRCLI_ARCH_DEADLINE` (240 s by default) on top of the summary and v1 time; the deterministic
   parts take well under a second.

@@ -36,7 +36,7 @@ from paircli_snapshot import lines_available
 from paircli_summary import stage_model
 
 # Bump when a prompt or the patch shape changes: it invalidates every cached patch.
-PROMPT_VERSION = "architecture-llm-1"
+PROMPT_VERSION = "architecture-llm-2"
 DIAGNOSTICS_FOLDER = "architecture-llm"
 STATS_OUTPUT = "stats.json"
 CACHE_PARTS = (".paircli", "cache", "architecture-v2")
@@ -351,6 +351,20 @@ SNAPSHOT_GUIDE = """In snapshot.json each pr.files[] entry has path, status and 
 old_lines, new_start, new_lines and lines[] (kind add, del or ctx; new_no on add and ctx lines, old_no on
 del and ctx lines)."""
 
+GROUNDING_RULES = """Grounding (reviewers fact-check your text against the diff, so say less rather than guess):
+a. Base every row description, edge claim and step text on the cited lines and the code around them. The
+   PR title and description may be wrong or stale: never copy wording from them.
+b. Mention only identifiers, flags, paths, options and counts that you can see in the cited code.
+c. Say that X imports, calls or uses Y only if the digest lists an edge from X to Y or the cited lines show
+   it. Otherwise describe each side without asserting a link between them.
+d. {before}
+e. When unsure, leave a field out or write a shorter plain statement of what the cited lines do."""
+
+GROUP_BEFORE = ("A claim about how things were before the PR needs cited old-side lines (side \"old\", the removed\n"
+                "   or context lines of the old file); never infer the old behavior from added lines.")
+MERGE_BEFORE = ("Every \"before\" step must be supported by old-side citations (side \"old\"). They are checked: a\n"
+                "   \"before\" step may not cite added lines, and an \"after\" step cites new-side lines only.")
+
 GROUP_SHAPE = """{"rows":[{"id":"<row id>","label":"<=80 chars","description":"<=300 chars","kind":"<kind>"}],
  "edges":[{"id":"<candidate edge id>","label":"<=80 chars","claim":"<=400 chars"},
           {"source":"<row id>","target":"<row id>","label":"<=80 chars","claim":"<=400 chars",
@@ -411,6 +425,8 @@ Rules:
 6. Text is simple English and short. A claim is a true statement of what the diff shows. No markup.
 7. You cannot add, remove or rename rows, files or groups, or change anything else. Other keys are removed.
 8. summary: at most 300 characters on what this group changes, for the next step.
+
+{GROUNDING_RULES.format(before=GROUP_BEFORE)}
 """
     return prompt + (retry_suffix(errors) if errors else "")
 
@@ -448,6 +464,9 @@ Rules:
    reuse the evidence listed in the digest.
 8. gaps: at most 5 honest notes (each at most 300 characters) about what the diagram cannot show.
 9. You cannot add, remove or rename rows, files or groups. Other keys are removed.
+10. The digest's pr_title is only a hint and may be wrong: describe what the code does, not what the title says.
+
+{GROUNDING_RULES.format(before=MERGE_BEFORE)}
 """
     return prompt + (retry_suffix(errors) if errors else "")
 
@@ -831,7 +850,10 @@ def check_merge(draft, merge, head: str, snapshot):
 
     graph_draft, _ = combine(draft, [], {**clean, "steps": steps})
     document, _ = normalize_v2(graph_draft)
-    document = enrich_v2(document, head, snapshot, "llm")
+    conversion_notes: list[str] = []
+    document = enrich_v2(document, head, snapshot, "llm", conversion_notes)
+    for note in conversion_notes:
+        warn(note)
     document, dropped = drop_invalid_steps(document, head, snapshot)
     for entry in dropped:
         shown = "; ".join(f"{error['path']}: {error['reason']}" for error in entry["errors"][:3])

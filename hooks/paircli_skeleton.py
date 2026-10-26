@@ -19,6 +19,11 @@ is no model, no network and no repository read, and the same input always gives 
                         import line in a hunk: source_file, target_file, source_group,
                         target_group, cite {path, line, side}, kind "import". The v1 diagram
                         uses only side "new" edges; "old" edges come from removed lines.
+                        A target is a file only when resolution is unambiguous: a Go import
+                        names a package, so it is a file edge only when that package has exactly
+                        one changed non-test .go file. Otherwise the edge is package-level
+                        (`target_file` None, plus `target_package` and `target_anchor`) and serves
+                        group aggregation only. Ambiguous Python or alias matches give no edge.
   budget                size_budget() for this PR (non-routine files and changed lines)
   docs_only             no files, or every non-routine file is documentation (and one exists)
   no_citable_lines      no file has a new-side hunk line to cite
@@ -330,24 +335,10 @@ class _Resolver:
                     self._go_dirs.setdefault(posixpath.dirname(path), []).append(path)
         return self._go_dirs
 
-    @staticmethod
-    def closest(source: str, candidates: list[str]) -> str:
-        """The candidate sharing the longest directory prefix with `source`, then the smallest path."""
-        here = source.split("/")[:-1]
-
-        def shared(path: str) -> int:
-            count = 0
-            for left, right in zip(here, path.split("/")[:-1]):
-                if left != right:
-                    break
-                count += 1
-            return count
-
-        return min(candidates, key=lambda path: (-shared(path), path))
-
-    def by_suffix(self, source: str, candidate: str) -> str | None:
+    def by_suffix(self, candidate: str) -> tuple[bool, str | None]:
+        """`(matched, path)`: whether any changed file ends in `candidate`, and the path when only one does."""
         found = self.suffixes().get(candidate)
-        return self.closest(source, found) if found else None
+        return bool(found), (found[0] if found and len(found) == 1 else None)
 
     def javascript(self, source: str, spec: str) -> str | None:
         alias = spec.startswith(("@/", "~/"))
@@ -369,9 +360,9 @@ class _Resolver:
         candidates += [f"{base}/index{ext}" if base else f"index{ext}" for ext in JS_EXTENSIONS]
         for candidate in candidates:
             if alias:
-                found = self.by_suffix(source, candidate)
-                if found:
-                    return found
+                matched, found = self.by_suffix(candidate)
+                if matched:
+                    return found  # None when several files match: ambiguous, so no edge
             elif candidate in self.records:
                 return candidate
         return None
@@ -393,14 +384,20 @@ class _Resolver:
             else:
                 target = None
                 for option in (f"{relative}.py", f"{relative}/__init__.py"):
-                    target = self.by_suffix(source, option)
-                    if target:
-                        break
+                    matched, target = self.by_suffix(option)
+                    if matched:
+                        break  # target is None when several files match: ambiguous, so no edge
             if target and target not in found:
                 found.append(target)
         return found
 
-    def go(self, source: str, spec: str) -> str | None:
+    def go(self, source: str, spec: str, side: str = "new") -> tuple[str, list[str]] | None:
+        """The changed Go package an import path names, as `(directory, its changed non-test .go files)`.
+
+        An import names a package (a directory), never a file, so the caller may draw a file-level
+        edge only when the package has exactly one changed file. On the new side a deleted file no
+        longer belongs to the package.
+        """
         first = spec.split("/", 1)[0]
         if "." not in first and first in GO_STD_ROOTS:
             return None
@@ -410,7 +407,9 @@ class _Resolver:
             directory = "/".join(parts[index:])
             files = directories.get(directory)
             if files and directory != posixpath.dirname(source):
-                return min(files, key=lambda path: (-self.records[path]["additions"] - self.records[path]["deletions"], path))
+                if side == "new":
+                    files = [path for path in files if self.records[path]["status"] != "deleted"]
+                return (directory, files) if files else None
         return None
 
 
@@ -579,7 +578,7 @@ def build_skeleton(snapshot: dict, head: str) -> dict:
     ordered = sorted(records.values(), key=lambda record: record["path"])
     for edge in edges:
         edge["source_group"] = records[edge["source_file"]]["group"]
-        edge["target_group"] = records[edge["target_file"]]["group"]
+        edge["target_group"] = records[edge["target_file"] or edge["target_anchor"]]["group"]
     return {
         "head": head if isinstance(head, str) else "",
         "head_bound": snapshot_binds_head(pr, head) if isinstance(head, str) else False,
@@ -601,24 +600,44 @@ def build_skeleton(snapshot: dict, head: str) -> dict:
 
 
 def _import_edges(records: dict[str, dict], refs: dict[str, list]) -> list[dict]:
-    """Resolve each import line to another changed, non-routine file; sorted, deduplicated, capped."""
+    """Resolve each import line to another changed, non-routine file; sorted, deduplicated, capped.
+
+    A target is resolved to a file only when that is unambiguous. A Go import names a package, so
+    it gives a file edge only when the package has exactly one changed file; otherwise the edge
+    is package-level: `target_file` is None, `target_package` is the directory and `target_anchor`
+    is one changed file of that package (used only to find its group). Ambiguous Python and
+    alias suffix matches produce no edge at all.
+    """
     resolver = _Resolver({path: record for path, record in records.items() if not record["routine"]})
     found = set()
     for source in sorted(refs):
         for side, line, ref in refs[source]:
+            if ref[0] == "go":
+                package = resolver.go(source, ref[1], side)
+                if package is None:
+                    continue
+                directory, files = package
+                if len(files) == 1:
+                    found.add((source, line, side, files[0], None, None))
+                else:
+                    found.add((source, line, side, None, directory, files[0]))
+                continue
             if ref[0] == "js":
                 targets = [resolver.javascript(source, ref[1])]
-            elif ref[0] == "py":
-                targets = resolver.python(source, ref[1], ref[2], ref[3])
             else:
-                targets = [resolver.go(source, ref[1])]
+                targets = resolver.python(source, ref[1], ref[2], ref[3])
             for target in targets:
                 if target and target != source and (side == "old" or resolver.records[target]["status"] != "deleted"):
-                    found.add((source, line, side, target))
-    ordered = sorted(found, key=lambda item: (item[0], item[1], item[2], item[3]))[:MAX_SKELETON_EDGES]
-    return [{"source_file": source, "target_file": target, "source_group": None, "target_group": None,
-             "cite": {"path": source, "line": line, "side": side}, "kind": "import"}
-            for source, line, side, target in ordered]
+                    found.add((source, line, side, target, None, None))
+    ordered = sorted(found, key=lambda item: (item[0], item[1], item[2], item[3] or "", item[4] or ""))[:MAX_SKELETON_EDGES]
+    edges = []
+    for source, line, side, target, package, anchor in ordered:
+        edge = {"source_file": source, "target_file": target, "source_group": None, "target_group": None,
+                "cite": {"path": source, "line": line, "side": side}, "kind": "import"}
+        if package is not None:
+            edge.update(target_package=package, target_anchor=anchor)
+        edges.append(edge)
+    return edges
 
 
 # ---- Deterministic ADE v1 diagram -------------------------------------------------------------
@@ -793,7 +812,8 @@ def deterministic_architecture(skeleton: dict, head: str, snapshot: dict) -> dic
         cite = edge["cite"]
         if cite["side"] != "new":
             continue
-        source, target = node_for_file.get(edge["source_file"]), node_for_file.get(edge["target_file"])
+        source = node_for_file.get(edge["source_file"])
+        target = node_for_file.get(edge["target_file"] or edge["target_anchor"])
         path, line = cite["path"], cite["line"]
         if (not source or not target or source == target or len(path) > MAX_PATH_CHARS
                 or not any(start <= line <= end for start, end in ranges.get(path, []))):
@@ -805,9 +825,12 @@ def deterministic_architecture(skeleton: dict, head: str, snapshot: dict) -> dic
     change_of = {node["id"]: node["change"] for node in nodes}
     edges = []
     for number, ((source, target), items) in enumerate(chosen, start=1):
-        items = sorted(items, key=lambda item: (item["cite"]["path"], item["cite"]["line"], item["target_file"]))
+        items = sorted(items, key=lambda item: (item["cite"]["path"], item["cite"]["line"], item["target_file"] or ""))
         first = items[0]
-        text = f"{_clean(posixpath.basename(first['source_file']), 80)} imports {_clean(posixpath.basename(first['target_file']), 80)}"
+        # A package-level import (Go) names the package directory, never one of its files.
+        named = (f"the {_clean(first['target_package'], 120)} package" if first["target_file"] is None
+                 else _clean(posixpath.basename(first["target_file"]), 80))
+        text = f"{_clean(posixpath.basename(first['source_file']), 80)} imports {named}"
         if len(items) > 1:
             text += f" and {len(items) - 1} more {'import' if len(items) == 2 else 'imports'}"
         edges.append({
