@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -21,7 +22,22 @@ from urllib.request import Request, urlopen
 
 from pair_notification import notify_scan_result
 from paircli_archive import create_pr_archive
-from paircli_summary import write_summary
+from paircli_architecture import (
+    llm_failure_reason, record_llm_diagram, remove_stale_architecture, write_architecture,
+    write_fallback_architecture,
+)
+from paircli_architecture_llm import env_number, generate_v2
+from paircli_architecture_v2 import finalize_v2, validate_v2
+from paircli_architecture_v2_draft import (
+    STATUS_V2, deterministic_v2_draft, remove_stale_architecture_v2, write_architecture_v2,
+    write_no_architecture_v2,
+)
+from paircli_overview import deterministic_overview, finalize_overview, generate_overview
+from paircli_skeleton import build_skeleton
+from paircli_summary import (
+    EvidenceMissingError, STATUS_OUTPUT, agent_runner, stage_model, write_fallback_summary, write_summary,
+)
+from paircli_snapshot import captured_pr, count_files, files_without_line_data
 from paircli_tls import compatible_tls_context
 from paircli_upload import upload_archive
 
@@ -788,7 +804,8 @@ def artifact_directory(pr_url: str, repo_dir: Path) -> Path:
         raise RuntimeError(f"invalid GitHub PR URL: {pr_url}")
     commands = (
         ["git", "rev-parse", "--show-toplevel"],
-        ["gh", "pr", "view", pr_url, "--json", "commits", "--jq", ".commits[-1].oid"],
+        # headRefOid is GitHub's true head; the commits list stops at 100 entries.
+        ["gh", "pr", "view", pr_url, "--json", "headRefOid", "--jq", ".headRefOid"],
     )
     results = []
     for command in commands:
@@ -805,6 +822,233 @@ def artifact_directory(pr_url: str, repo_dir: Path) -> Path:
     return Path(root) / ".paircli" / f"pr-{match.group(1)}" / head_commit.lower()
 
 
+def artifact_root(artifact_dir: Path) -> Path:
+    """The git toplevel of `.paircli/pr-N/<sha>`; agents and packaging must work from there.
+
+    The folder lives under the toplevel even when the hook ran in a subdirectory, and a restricted
+    agent can only read inside its working directory.
+    """
+    parents = artifact_dir.parents
+    if (len(parents) < 3 or parents[1].name != ".paircli" or not re.fullmatch(r"pr-[1-9][0-9]*", parents[0].name)
+            or not re.fullmatch(r"[0-9a-f]{40}", artifact_dir.name)):
+        raise RuntimeError(f"unexpected PR artifact folder: {artifact_dir}")
+    return parents[2]
+
+
+def run_summary_step(harness: str, pr_url: str, repo_dir: Path, artifact_dir: Path, log) -> Path:
+    """Write summary.md, falling back to the deterministic one so it can never block the upload."""
+    try:
+        pr = captured_pr(artifact_dir)
+        without_lines = files_without_line_data(pr)
+        if without_lines:
+            log.write(f"{len(without_lines)} of {count_files(pr)} files have no hunk data\n")
+    except Exception:
+        pass
+    try:
+        return write_summary(harness, pr_url, repo_dir, artifact_dir, log)
+    except EvidenceMissingError:
+        raise
+    except Exception as error:
+        log.write(f"summary generation failed unexpectedly ({type(error).__name__}: {error}); using fallback\n")
+        return write_fallback_summary(pr_url, artifact_dir, [f"{type(error).__name__}: {error}"], log)
+
+
+def summary_mode(artifact_dir: Path) -> str:
+    """Read which path produced summary.md (llm, llm-retry or fallback) for the scan log."""
+    try:
+        status = json.loads((artifact_dir / "diagnostics" / STATUS_OUTPUT).read_text(encoding="utf-8"))
+        return str(status["mode"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return "unknown"
+
+
+def run_diagram_step(harness: str, repo_dir: Path, artifact_dir: Path, log) -> Path | None:
+    """Try the model's diagram, then a deterministic one; nothing here may fail the scan."""
+    reason = ""
+    try:
+        generate = agent_runner(harness)
+        model = stage_model("diagram")
+        # Pass the model only when configured, so an unset variable keeps the CLI default.
+        extra = {"model": model} if model else {}
+        diagram = write_architecture(artifact_dir, lambda prompt: generate(prompt, repo_dir, **extra), log)
+        if diagram:
+            record_llm_diagram(artifact_dir, log)
+            return diagram
+        reason = llm_failure_reason(artifact_dir)
+    except Exception as error:
+        log.write(f"architecture unavailable ({type(error).__name__}: {error}); continuing without an LLM diagram\n")
+        reason = f"llm error: {type(error).__name__}"
+        remove_stale_architecture(artifact_dir)
+    try:
+        return write_fallback_architecture(artifact_dir, reason, log)
+    except Exception as error:
+        log.write(f"architecture fallback failed ({type(error).__name__}: {error}); continuing without a diagram\n")
+        remove_stale_architecture(artifact_dir)
+        return None
+
+
+def _v2_log(log, message: str) -> None:
+    try:
+        log.write(message if message.endswith("\n") else message + "\n")
+    except Exception:
+        pass
+
+
+def _v2_no_diagram(artifact_dir: Path, reason: str, log) -> None:
+    """Record tier "none" and remove any older v2 diagram; never raises."""
+    try:
+        remove_stale_architecture_v2(artifact_dir)
+        write_no_architecture_v2(artifact_dir, reason, log, overview=_v2_no_overview())
+    except Exception as error:
+        _v2_log(log, f"architecture v2: could not record the skipped diagram ({type(error).__name__})")
+
+
+OVERVIEW_MIN_SECONDS, OVERVIEW_MAX_SECONDS = 20.0, 120.0
+OVERVIEW_DEFAULT_CALL_TIMEOUT = 120.0
+
+
+def _v2_no_overview() -> dict:
+    return {"source": "none", "retried": False, "components": 0, "edges": 0, "steps": 0, "steps_dropped": 0}
+
+
+def _v2_overview_budget(started: float) -> float:
+    """What is left of the v2 deadline for the overview call, kept between 20 and 120 seconds."""
+    deadline = env_number("PAIRCLI_ARCH_DEADLINE", 240.0, 1.0, 3600.0)
+    remaining = deadline - (time.monotonic() - started)
+    return min(OVERVIEW_MAX_SECONDS, max(OVERVIEW_MIN_SECONDS, remaining))
+
+
+def _v2_attach_overview(document, snapshot, head: str, artifact_dir: Path, log, *, generate=None,
+                        started: float | None = None):
+    """Add the overview map to a finalized detailed `document`; returns `(document, status)` and never raises.
+
+    With `generate` the model narrates the overview (`generate_overview` falls back to the deterministic
+    one by itself); without it the deterministic overview is attached and no model is called. The
+    document is re-validated with the overview attached; if that fails, or anything raises, the
+    detailed document is returned unchanged. PAIRCLI_ARCH_OVERVIEW=0 skips the overview.
+    """
+    status = _v2_no_overview()
+    try:
+        if os.environ.get("PAIRCLI_ARCH_OVERVIEW", "1").strip() == "0":
+            _v2_log(log, "architecture v2: overview disabled by PAIRCLI_ARCH_OVERVIEW=0")
+            return document, status
+        if generate is not None:
+            budget = _v2_overview_budget(started if started is not None else time.monotonic())
+            call_timeout = env_number("PAIRCLI_ARCH_CALL_TIMEOUT", OVERVIEW_DEFAULT_CALL_TIMEOUT, 1.0, 1800.0)
+            result = generate_overview(artifact_dir, snapshot, head, document, generate, log,
+                                       call_timeout=call_timeout, model=stage_model("overview"),
+                                       deadline_seconds=budget)
+            overview, stats = result.get("overview"), result.get("stats") or {}
+        else:
+            overview, _warnings = finalize_overview(deterministic_overview(document, snapshot), document, head,
+                                                    snapshot, "deterministic")
+            stats = {"source": "deterministic"}
+        status["retried"] = bool(stats.get("retried"))
+        if not isinstance(overview, dict):
+            _v2_log(log, "architecture v2: no overview produced; keeping the detailed diagram alone")
+            return document, status
+        candidate = dict(document, overview=overview)
+        validate_v2(candidate, head, snapshot)
+        source = "llm" if overview.get("generated_by") == "llm" else "deterministic"
+        status.update(source=source, components=len(overview["components"]), edges=len(overview["edges"]),
+                      steps=len(overview["steps"]),
+                      steps_dropped=stats.get("steps_dropped") if type(stats.get("steps_dropped")) is int else 0)
+        _v2_log(log, f"architecture v2: overview source={source} components={status['components']} "
+                     f"edges={status['edges']} steps={status['steps']} steps_dropped={status['steps_dropped']}")
+        return candidate, status
+    except Exception as error:
+        _v2_log(log, f"architecture v2: overview dropped ({type(error).__name__}: {str(error)[:200]}); "
+                     "keeping the detailed diagram alone")
+        return document, _v2_no_overview()
+
+
+def _v2_deterministic(draft, snapshot, head: str, artifact_dir: Path, reason: str, log) -> Path:
+    document, _warnings = finalize_v2(draft, head, snapshot, "deterministic")
+    document, overview = _v2_attach_overview(document, snapshot, head, artifact_dir, log)
+    path = write_architecture_v2(artifact_dir, document, log, tier="deterministic", reason=reason,
+                                 overview=overview)
+    _v2_log(log, f"architecture v2: tier=deterministic reason={reason}")
+    return path
+
+
+def run_diagram_v2_step(harness: str, repo_dir: Path, artifact_dir: Path, log) -> Path | None:
+    """Write generated_artifacts/architecture.v2.json (schema v2); nothing here may raise or touch v1.
+
+    Tiers: the model narrates the deterministic draft (`generate_v2`), else the draft itself is
+    written, else no file. An older v2 diagram and status are removed first so a failed run never
+    leaves a diagram that describes another run. PAIRCLI_ARCHITECTURE_V2=0 skips the step.
+    """
+    try:
+        head = artifact_dir.name
+        draft = snapshot = None
+        started = time.monotonic()
+        try:
+            remove_stale_architecture_v2(artifact_dir)
+            if not (artifact_dir / "diagnostics").is_symlink():
+                (artifact_dir / "diagnostics" / STATUS_V2).unlink(missing_ok=True)
+            if os.environ.get("PAIRCLI_ARCHITECTURE_V2", "1").strip() == "0":
+                _v2_log(log, "architecture v2: disabled by PAIRCLI_ARCHITECTURE_V2=0")
+                return None
+            try:
+                snapshot = json.loads((artifact_dir / "snapshot.json").read_text(encoding="utf-8"))
+                if not isinstance(snapshot, dict):
+                    raise ValueError("snapshot.json is not an object")
+            except (OSError, ValueError) as error:
+                _v2_log(log, f"architecture v2: snapshot unreadable ({type(error).__name__}); no v2 diagram")
+                _v2_no_diagram(artifact_dir, "snapshot unreadable", log)
+                return None
+            skeleton = build_skeleton(snapshot, head)
+            draft = deterministic_v2_draft(skeleton, snapshot, head)
+            if draft is None:
+                reason = ("docs-only change" if skeleton.get("docs_only")
+                          else "no citable lines" if skeleton.get("no_citable_lines") else "nothing to draw")
+                _v2_log(log, f"architecture v2: tier=none reason={reason}")
+                _v2_no_diagram(artifact_dir, reason, log)
+                return None
+            try:
+                runner = agent_runner(harness)
+            except Exception as error:
+                _v2_log(log, f"architecture v2: no model available ({error}); using the deterministic diagram")
+                return _v2_deterministic(draft, snapshot, head, artifact_dir, "llm unavailable", log)
+
+            def generate(prompt, *, timeout, model):
+                return runner(prompt, repo_dir, timeout=timeout, model=model)
+
+            result = generate_v2(artifact_dir, snapshot, head, copy.deepcopy(draft), generate, log,
+                                 harness=harness, skeleton=skeleton,
+                                 group_model=stage_model("group"), merge_model=stage_model("merge"))
+            document, stats = result["document"], result.get("stats") or {}
+            validate_v2(document, head, snapshot)
+            tier = "llm" if document.get("generated_by") == "llm" else "deterministic"
+            # A diagram the model did not touch gets the deterministic overview without another model call.
+            document, overview = _v2_attach_overview(document, snapshot, head, artifact_dir, log,
+                                                     generate=generate if tier == "llm" else None, started=started)
+            if tier == "llm":
+                reason = f"llm groups ok: {stats.get('groups_llm_ok')}/{stats.get('groups_selected')}, merge {stats.get('merge')}"
+                if stats.get("degraded"):
+                    reason += f" (degraded: {stats['degraded']})"
+            else:
+                reason = "no llm output applied"
+            path = write_architecture_v2(artifact_dir, document, log, tier=tier, reason=reason, llm_calls=stats,
+                                         overview=overview)
+            _v2_log(log, f"architecture v2: tier={tier} groups_llm_ok={stats.get('groups_llm_ok')}/"
+                         f"{stats.get('groups_selected')} merge={stats.get('merge')} "
+                         f"steps_dropped={stats.get('steps_dropped')} cache_hits={stats.get('cache_hits')}")
+            return path
+        except Exception as error:
+            _v2_log(log, f"architecture v2 failed ({type(error).__name__}: {str(error)[:200]}); trying the deterministic diagram")
+            reason = f"v2 error: {type(error).__name__}"
+            if draft is not None and snapshot is not None:
+                try:
+                    return _v2_deterministic(draft, snapshot, head, artifact_dir, reason, log)
+                except Exception as fallback_error:
+                    _v2_log(log, f"architecture v2 fallback failed ({type(fallback_error).__name__}); no v2 diagram")
+            _v2_no_diagram(artifact_dir, reason, log)
+            return None
+    except Exception:
+        return None
+
+
 def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
     """Generate CLI evidence, then have the triggering agent write summary.md."""
     home = onboarding_home()
@@ -813,6 +1057,7 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
     try:
         with log.open("a", encoding="utf-8") as output:
             artifact_dir = artifact_directory(pr_url, repo_dir)
+            root = artifact_root(artifact_dir)
             try:
                 run_command(
                     [str(binary), "update", "--quiet", "--plugin-version", PLUGIN_VERSION],
@@ -828,9 +1073,13 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
             )
             (artifact_dir / "summary.md").unlink(missing_ok=True)
             output.write(f"generating AI summary.md with {harness}\n")
-            summary = write_summary(harness, pr_url, repo_dir, artifact_dir, output)
-            output.write(f"wrote {summary}\n")
-            archive = create_pr_archive(repo_dir, artifact_dir)
+            summary = run_summary_step(harness, pr_url, root, artifact_dir, output)
+            output.write(f"wrote {summary} (summary mode: {summary_mode(artifact_dir)})\n")
+            diagram = run_diagram_step(harness, root, artifact_dir, output)
+            output.write(f"architecture diagram: {'produced' if diagram else 'not produced'}\n")
+            diagram_v2 = run_diagram_v2_step(harness, root, artifact_dir, output)
+            output.write(f"architecture v2 diagram: {'produced' if diagram_v2 else 'not produced'}\n")
+            archive = create_pr_archive(root, artifact_dir)
             output.write(f"packaged {archive}\n")
             artifact_id = ""
             if os.environ.get("PAIRCLI_UPLOAD_ENABLED", "1") != "0":
