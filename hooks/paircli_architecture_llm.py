@@ -36,7 +36,7 @@ from paircli_snapshot import lines_available
 from paircli_summary import stage_model
 
 # Bump when a prompt or the patch shape changes: it invalidates every cached patch.
-PROMPT_VERSION = "architecture-llm-3"
+PROMPT_VERSION = "architecture-llm-4"
 DIAGNOSTICS_FOLDER = "architecture-llm"
 STATS_OUTPUT = "stats.json"
 CACHE_PARTS = (".paircli", "cache", "architecture-v2")
@@ -233,6 +233,13 @@ def edge_pairs(edges) -> set[tuple]:
 
 # --- digests -----------------------------------------------------------------------------
 
+# A model gap must stay generic: it may not mention a path ("a/b", "x.ts") or a count of files, rows or areas.
+SPECIFIC_GAP = re.compile(
+    r"(?<![\w/])(?!and/or\b)(?!n/a\b)[\w.@~-]*/[\w./@~-]*"
+    r"|\b[\w-]+\.(?:tsx?|jsx?|mjs|cjs|py|rb|go|rs|java|kt|swift|cs|cpp|c|h|json|ya?ml|toml|md|css|scss|html|sh|sql|lock|txt)\b"
+    r"|\b\d[\d,]*\s+(?:more\s+)?(?:files?|rows?|areas?|components?|nodes?|groups?|modules?|handlers?|lines?|directories)\b"
+    r"|\b(?:area|zone|row|group|node|file|component)\d+\b",
+    re.IGNORECASE)
 BREAK_MENTION = re.compile(r"\bbreak(?:s|ing)?\b|exported names?|callers outside", re.IGNORECASE)
 API_KEYS = ("api_added", "api_removed")
 
@@ -253,8 +260,22 @@ def api_counts(facts: dict) -> dict:
     return {key: facts["stats"][key] for key in API_KEYS if count_of(facts["stats"].get(key)) is not None}
 
 
+def directory_facts(files: list[str]) -> dict:
+    """Computed `directories` (distinct member directories) and `common_dir` (longest shared directory prefix
+    of all members, "" when none), so a name is not taken from the directory of one sample."""
+    parts = [name.split("/")[:-1] for name in files]
+    shared = parts[0] if parts else []
+    for item in parts[1:]:
+        length = 0
+        while length < min(len(shared), len(item)) and shared[length] == item[length]:
+            length += 1
+        shared = shared[:length]
+    return {"directories": len({"/".join(item) for item in parts}), "common_dir": "/".join(shared)}
+
+
 def pattern_facts(node: dict) -> dict | None:
-    """Family, count, signature and up to 12 sample member paths of a pattern row; None for any other row."""
+    """Family, count, signature, up to 12 sample member paths and directory facts of a pattern row; None for
+    any other row. Unknown families (a new one may appear) pass through unchanged."""
     pattern = node.get("pattern")
     if node.get("kind") != "pattern" or not isinstance(pattern, dict):
         return None
@@ -264,8 +285,10 @@ def pattern_facts(node: dict) -> dict | None:
         samples = [name for name in node.get("files", []) if isinstance(name, str)]
     count = count_of(pattern.get("count"))
     facts = {"family": pattern.get("family"), "count": count if count is not None else len(samples),
-             "signature": pattern.get("signature"), "samples": samples[:MAX_PATTERN_SAMPLES]}
+             "signature": pattern.get("signature"), "samples": samples[:MAX_PATTERN_SAMPLES],
+             **directory_facts(samples)}
     return facts
+
 
 def fit(digest: dict, limit: int, shrinkers) -> dict:
     """Apply shrinkers one at a time until the compact JSON fits `limit` bytes."""
@@ -361,14 +384,14 @@ def build_merge_digest(draft, summaries: dict, snapshot) -> dict:
             if node.get("group") == group_id and isinstance(node.get("id"), str):
                 facts = node_facts(node, index)  # computed once per row: the draft itself has no stats yet
                 row = {"id": node["id"], "label": node.get("label"), "kind": node.get("kind"),
-                       "change": facts["change"],
+                       "change": facts["change"], "stats": row_stats(facts),
                        "description": str(node.get("description") or "")[:MERGE_DESCRIPTION_CHARS],
                        "evidence": dicts(node.get("evidence"))[:2]}
                 api = api_counts(facts)
                 row.update({key: value for key, value in api.items() if value})
                 pattern = pattern_facts(node)
                 if pattern is not None:
-                    row["pattern"] = {"family": pattern["family"], "count": pattern["count"]}
+                    row["pattern"] = {key: pattern[key] for key in ("family", "count", "directories", "common_dir")}
                 group_added += api.get("api_added", 0)
                 group_removed += api.get("api_removed", 0)
                 if api.get("api_removed", 0) > 0 or BREAK_MENTION.search(str(node.get("description") or "")):
@@ -428,7 +451,7 @@ del and ctx lines)."""
 GROUNDING_RULES = """Grounding (reviewers fact-check your text against the diff, so say less rather than guess):
 a. Base every row description, edge claim and step text on the cited lines and the code around them. The
    PR title and description may be wrong or stale: never copy wording from them.
-b. Mention only identifiers, flags, paths, options and counts that you can see in the cited code.
+b. Mention only identifiers, flags, paths and options that you can see in the cited code; no counts.
 c. Say that X imports, calls or uses Y only if the digest lists an edge from X to Y or the cited lines show
    it. Otherwise describe each side without asserting a link between them.
 d. {before}
@@ -436,14 +459,21 @@ e. When unsure, leave a field out or write a shorter plain statement of what the
 
 DESCRIPTION_RULES = """Descriptions and facts (verify in the code before you write them):
 - A row description is one or two plain sentences. Lead with what the change does or breaks, never with
-  line counts or stats. A "pattern" row stands for many files (digest: pattern family, count, samples):
-  describe the shared change once, say how many files, and quote one concrete line from a sample member
-  you read.
-- Say each of these plainly, only after reading the code, never as a guess: exported names removed or
-  added (use api_removed and api_added from the row stats; write "removes N exported names; callers outside
-  this PR may break" only when api_removed is above 0); an identifier used but not defined in the changed
-  code; code after return or throw that can never run; an import of a name the target does not export.
-  If unsure, say nothing."""
+  line counts or stats. A "pattern" row stands for many files (digest: pattern family, count, samples,
+  directories, common_dir): describe the shared change once, with one concrete line from a sample member you
+  read. Samples are only some members; never infer a count or a property of the whole set from them.
+- Never write file, line, handler or percentage counts in prose; code computes them (stats, count). Write
+  "the repeated edit" or "many files", not a number. Copy a number only from a digest field named count or
+  stats, verbatim.
+- Say each of these plainly, only after reading the file around the cited lines, never as a guess: exported
+  names removed or added (use api_removed and api_added from the row stats; write "removes N exported names;
+  callers outside this PR may break" only when api_removed is above 0); an identifier used but not defined in
+  the changed code; code after return or throw that can never run, such as "the removed call sat after
+  return, so behaviour does not change"; an import of a name the target does not export, such as "the
+  imports name something the target does not export". If unsure, omit it.
+- Do not use "only", "just", "all", "every" or "none" about what a file or route serves, calls or contains
+  unless the cited lines are its whole definition. Prefer "includes" and "such as"; when you list endpoints
+  or exports, say they are examples."""
 
 EDGE_RULES = """Never add an edge to or from a tests, docs or config row, or between two rows only because one tests
 the other: write "covered by tests in <file>" in the tested row's description instead. A new edge needs a real
@@ -504,6 +534,8 @@ Rules:
    in the digest, or a row that is not in this group, is ignored.
 2. rows: rewrite only label, description and kind of rows of this group. label is at most 80 characters,
    description at most 300. kind is one of: {KIND_LIST}. A row whose kind is routine or pattern keeps it.
+   Name a pattern row for what the repeated change does, never for the directory of a sample member when its
+   pattern.directories is above 1.
 3. edges with an "id": rewrite label (at most 80) and claim (at most 400) of that candidate edge. Do not
    repeat its source, target or evidence.
 4. edges without an "id" are NEW edges, at most 10. source and target are row ids from the digest (rows of
@@ -557,7 +589,9 @@ Rules:
 7. Citations: path is a file changed in the PR. start..end lies inside one hunk range: side "new" with new
    line numbers for added or context lines, side "old" with old line numbers for removed lines. You may
    reuse the evidence listed in the digest.
-8. gaps: at most 5 honest notes (each at most 300 characters) about what the diagram cannot show.
+8. gaps: at most 2 generic limits of the diagram, such as "runtime behaviour not visible in the diff" or
+   "callers outside this PR". NEVER a statement about specific files, directories, areas, rows or counts:
+   code adds its own computed gaps.
 9. You cannot add, remove or rename rows, files or groups. Other keys are removed.
 10. The digest's pr_title is only a hint and may be wrong: describe what the code does, not what the title says.
 
@@ -968,6 +1002,9 @@ def check_merge(draft, merge, head: str, snapshot):
     for position, gap in enumerate(raw_gaps if isinstance(raw_gaps, list) else []):
         problems = []
         value = clean_text(gap, GAP_MAX, f"gaps[{position}]", problems)
+        if value is not None and SPECIFIC_GAP.search(value):
+            warn(f"gaps[{position}]: names a path or a count, only generic gaps are accepted; dropped")
+            continue
         if value is not None and value not in gaps and len(gaps) < MAX_GAPS:
             gaps.append(value)
     clean["gaps"] = gaps

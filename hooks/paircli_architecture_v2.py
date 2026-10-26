@@ -544,6 +544,8 @@ def check_pattern(node: dict, path: str, index: SnapshotIndex, check) -> None:
         return
     for key in sorted(set(pattern) - set(PATTERN_KEYS), key=str):
         check(False, join(path, f"pattern.{str(key)[:64]}"), "unexpected key")
+    # `remainder` rows are verified by verify_pattern (3 to 500 existing, unique members, no signature
+    # key); check_pattern_ownership keeps them disjoint from every other row.
     if pattern.get("family") != "same-change":
         check(pattern.get("signature") is None, join(path, "pattern.signature"),
               "only a same-change pattern has a signature")

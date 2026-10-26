@@ -789,7 +789,7 @@ def test_tests_docs_and_config_fold_when_a_group_has_three_and_skip_same_change_
     files = ([make_file(f"src/app/t{index}.test.ts", added=[f"it('case {chr(97 + index)}', () => {{}});"]) for index in range(3)]
              + [make_file(f"src/app/c{index}.json", added=[f'{{"k{chr(97 + index)}": 1}}']) for index in range(2)]
              + [make_file(f"src/app/d{index}.md", added=[f"# {chr(97 + index)}"]) for index in range(3)]
-             + [make_file(f"src/app/same{index}.test.ts", added=[f"// same {index}"]) for index in range(3)])
+             + [make_file(f"src/app/same{index}.test.ts", added=[f"same{index}();"]) for index in range(3)])
     _, skeleton = build(files)
     found = {pattern["family"]: pattern for _, pattern in group_patterns(skeleton)}
     assert set(found) == {"same-change", "tests", "docs"}, "two config files are not enough"

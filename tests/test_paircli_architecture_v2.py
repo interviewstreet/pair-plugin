@@ -914,7 +914,9 @@ def test_drop_invalid_steps_drops_a_wrong_side_step_with_the_reason():
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paircli_architecture_v2_draft import deterministic_v2_draft  # noqa: E402
 from paircli_skeleton import build_skeleton  # noqa: E402
-from snapshot_factory import deleted_templates, make_file, make_snapshot, source_lines  # noqa: E402
+from paircli_architecture_v2 import SnapshotIndex  # noqa: E402
+from paircli_patterns import verify_pattern  # noqa: E402
+from snapshot_factory import deleted_templates, make_file, make_snapshot, many_files, source_lines  # noqa: E402
 
 
 def pattern_world():
@@ -1064,6 +1066,76 @@ def test_pattern_members_with_hunkless_files_still_count_in_stats_and_status():
                "src/legacy/templates/t0.ts", "src/legacy/templates/t1.ts", "src/legacy/templates/gone.ts"]}}
     computed = enrich_v2({"nodes": [row]}, HEAD, snap)["nodes"][0]
     assert computed["stats"]["files"] == 3 and computed["change"] == "removed"
+
+
+def remainder_world():
+    """A real draft of 20 unlike files in one directory: 12 file rows plus one remainder row of 8, finalized and valid."""
+    files = many_files(20, directories=["src/misc"], unique=True)
+    snap = make_snapshot(files, head=HEAD)
+    draft = deterministic_v2_draft(build_skeleton(snap, HEAD), snap, HEAD)
+    document, warnings = finalize_v2(draft, HEAD, snap, "deterministic")
+    assert warnings == []
+    return document, snap
+
+
+def remainder_row(document):
+    return next(node for node in document["nodes"] if node["kind"] == "pattern" and node["pattern"]["family"] == "remainder")
+
+
+def remainder_errors(mutate):
+    document, snap = remainder_world()
+    mutate(document)
+    with pytest.raises(ArchitectureError) as caught:
+        validate_v2(document, HEAD, snap)
+    return [(error["path"], error["reason"]) for error in caught.value.errors]
+
+
+def test_a_remainder_row_is_valid_and_its_computed_fields_cover_all_members():
+    document, snap = remainder_world()
+    assert validate_v2(document, HEAD, snap) is None
+    row = remainder_row(document)
+    assert row["label"] == "8 other changed files" and row["pattern"]["count"] == 8
+    assert list(row["pattern"]) == ["family", "count", "members"], "no signature field"
+    assert row["stats"]["files"] == 8 and row["change"] == "modified" and len(row["files"]) <= 12
+    rowed = {name for node in document["nodes"] if node["kind"] == "file" for name in node["files"]}
+    assert rowed.isdisjoint(row["pattern"]["members"]) and len(rowed) + 8 == 20
+
+
+REMAINDER_FAULTS = [
+    ("signature present", lambda d: remainder_row(d)["pattern"].update(signature="a" * 16), "pattern.signature"),
+    ("signature empty", lambda d: remainder_row(d)["pattern"].update(signature=""), "pattern.signature"),
+    ("too few members", lambda d: remainder_row(d)["pattern"].update(members=remainder_row(d)["pattern"]["members"][:2], count=2),
+     "pattern.members"),
+    ("unknown member", lambda d: remainder_row(d)["pattern"]["members"].__setitem__(0, "src/misc/ghost.ts"), "pattern.members[0]"),
+    ("duplicate member", lambda d: remainder_row(d)["pattern"]["members"].__setitem__(1, remainder_row(d)["pattern"]["members"][0]),
+     "pattern.members[1]"),
+    ("count mismatch", lambda d: remainder_row(d)["pattern"].update(count=9), "pattern.count"),
+    ("member also has a file row", lambda d: next(n for n in d["nodes"] if n["kind"] == "file").update(
+        files=[remainder_row(d)["pattern"]["members"][0]]), "files[0]"),
+    ("member also in another pattern row", lambda d: d["nodes"].append(
+        {**copy.deepcopy(remainder_row(d)), "id": "second-remainder"}), "already a member of"),
+]
+
+
+@pytest.mark.parametrize("name, mutate, expected", REMAINDER_FAULTS, ids=[fault[0] for fault in REMAINDER_FAULTS])
+def test_validate_rejects_a_bad_remainder_row(name, mutate, expected):
+    errors = remainder_errors(mutate)
+    assert any(expected in path or expected in reason for path, reason in errors), errors
+
+
+def test_a_remainder_may_hold_up_to_500_members_and_no_more():
+    files = [make_file(f"src/bulk/f{index:04d}.ts", added=[f"const unique{index} = {index};"]) for index in range(501)]
+    snap = make_snapshot(files, head=HEAD)
+    names = sorted(file["path"] for file in files)
+
+    def row(members):
+        return {"id": "r", "label": f"{len(members)} other changed files", "group": "g", "kind": "pattern", "description": "d",
+                "files": [], "evidence": [], "pattern": {"family": "remainder", "count": len(members), "members": members}}
+
+    assert enrich_v2({"nodes": [row(names[:500])]}, HEAD, snap)["nodes"][0]["stats"]["files"] == 500
+    index = SnapshotIndex(snap)
+    assert verify_pattern(row(names[:500])["pattern"], index.files) == []
+    assert verify_pattern(row(names)["pattern"], index.files)
 
 
 # --- the optional top-level overview ---------------------------------------------------------

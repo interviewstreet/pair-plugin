@@ -163,8 +163,9 @@ A node with `kind: "pattern"` stands for several files:
              "members": ["src/legacy/area0/module0.ts", "..."]}}
 ```
 
-- `pattern.family` is `same-change` (identical change signature), or `tests`, `docs`,
-  `config` (files of that category in the group; used when a group has at least 3).
+- `pattern.family` is `same-change` (identical change signature), `tests`, `docs`,
+  `config` (files of that category in the group; used when a group has at least 3), or
+  `remainder` (see Remainder rows).
 - `pattern.members` lists every member path (at most 500; larger sets are split by
   directory into several pattern rows). `count` equals `len(members)`, at least 3, and
   every member is a changed file. Members are unique across all pattern rows, and a member
@@ -178,14 +179,26 @@ A node with `kind: "pattern"` stands for several files:
   members span several directories says so in its `description` ("Spans N directories."), and the
   group's computed `path` is the common directory of all members of the rows in it (empty when there
   is none). `tests`, `docs` and `config` folding stays per group.
+- **Group names.** A group that keeps real single-file rows keeps its directory label. A group
+  whose rows are all pattern rows with members in more than one directory is named after the change
+  ("Repeated changes", "Renamed and edited files", "Repeated deletions", "Repeated additions",
+  "Test files", ...; a second group with the same name gets " (2)"), never after one member's
+  directory. Group ids stay the directory slugs, so they remain stable and unique.
 - `files` is a sample of at most 12 members; each needs a citation, as for any node.
   `evidence` has at most 12 refs and must cover the sample (the validator requires a valid
   citation of every sample file).
 - **Same-change signature** (computed by `change_signature` in `hooks/paircli_patterns.py`):
-  the sorted set of the file's distinct added and deleted lines (how often a line repeats
-  is ignored), trimmed, with every run of digits replaced by `#`, plus the file status. Context lines are ignored. The validator
-  recomputes the signature of every member and rejects the row if any differs. So "these N
-  files have the same change" is checked by code, not asserted by the model.
+  the sorted sets of net added and net deleted lines, ignoring comments, plus the file status.
+  Each changed line is trimmed and loses a trailing line comment (`//` for ts/js/go/java/c/rs and
+  similar, `#` for py/sh/rb/yaml/toml/Makefile, `--` for sql/lua; only when the marker follows
+  whitespace and sits outside quotes, so `https://x` and `"a // b"` are kept); blank and pure comment
+  lines (`/* ... */`, `*` continuation lines) are dropped; unknown extensions are not stripped. Net means
+  `added - deleted` and `deleted - added` as sets, so a line edited only in its comment cancels out and
+  how often a line repeats is ignored; then every run of digits becomes `#` (a version bump is still a
+  change). A file whose net change is empty has no signature and never joins a same-change row.
+  Context lines are ignored. The validator recomputes the signature of every member and rejects the
+  row if any differs. So "these N files have the same change" is checked by code, not asserted by
+  the model.
 - `tests`/`docs`/`config` members must classify into that category.
 - Computed fields cover all members: `stats.files` = `count`, additions/deletions summed
   over members, `change` from member statuses, `state` `changed`.
@@ -194,6 +207,30 @@ A node with `kind: "pattern"` stands for several files:
   how many members it covers (computed) and whose evidence samples up to 3 of the import
   lines. Edges between two pattern rows collapse likewise. No edge is drawn to or from a
   `tests`, `docs` or `config` pattern row.
+
+## Remainder rows (additive)
+
+Rows and patterns are limited, but a diagram that silently omits changed files is wrong. After the
+file rows and pattern rows are chosen, every non-routine changed file that has no row and is in no
+pattern goes into a `pattern` row with `family: "remainder"`:
+
+```json
+{"id": "src-remainder-3fa91c", "label": "369 other changed files", "group": "src", "kind": "pattern",
+ "description": "369 further changed files, listed in the details; they were not given their own rows. ...",
+ "files": ["<up to 12 largest members>"], "evidence": ["<a citation for each sample>"],
+ "pattern": {"family": "remainder", "count": 369, "members": ["...", "..."]}}
+```
+
+- `members` are 3 to 500 changed files, unique across all rows, sorted. There is no `signature`
+  (a validator error if the key is present). A remainder row may only hold files that no other row or
+  pattern holds, so with the existing ownership rule every changed file is in at most one row.
+  Members may include files without hunk data; at least one sample must be citable.
+- More than 500 leftover files are split by directory into several remainder rows. One or two
+  leftover files are not a remainder: they get ordinary file rows beyond the group budget. The draft
+  reserves one node slot per remainder row before it budgets file rows, so the 60-node cap holds.
+- Computed fields cover all members, like any pattern row. No edge is drawn to or from a remainder row.
+- The draft's gaps report the remainder count; the "not listed individually because of the row
+  limit" gap no longer exists for files that sit in a remainder row.
 
 ## API surface stats (additive)
 

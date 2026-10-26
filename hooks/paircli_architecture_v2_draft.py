@@ -13,14 +13,19 @@ is the input of `finalize_v2(draft, head, snapshot, "deterministic")`, which fil
                           the skeleton found (its members get no file rows; `files` is a sample of
                           up to 12 with real citations), plus one `routine` row per group that has
                           routine files (lockfiles, generated, vendored, binary). A pattern row
-                          counts as one row of the group's budget
+                          counts as one row of the group's budget. Every other non-routine file with
+                          no row (budget cut) goes into one `remainder` pattern row (3 to 500
+                          members, split by directory above that); one or two leftovers get ordinary
+                          rows beyond the budget. One node slot per remainder row is reserved
+                          before the file rows are budgeted, so the 60-node cap holds. A group of
+                          only pattern rows that span several directories is named after the change
   edges   [{id, source, target, label, claim, evidence}]
                           file-level imports between rows, new-side and removed (old-side) ones;
                           only unambiguous ones (a Go import is a package, so no file edge
                           unless the package has exactly one changed file). Imports between a row
                           and many members of one pattern collapse into one edge, labelled
                           "imports (N)", with a computed claim and up to 3 sample citations; no edge
-                          is drawn to or from a tests/docs/config pattern row
+                          is drawn to or from a tests/docs/config/remainder pattern row
   steps   []              narration is the model's job
   gaps    [str]           what was collapsed, left out or not citable (5 at most)
 
@@ -44,7 +49,7 @@ from paircli_architecture_v2 import (
     ID_PATTERN, MAX_EDGES, MAX_FILES_PER_NODE, MAX_GAPS, MAX_GROUPS, MAX_NODES, MAX_REFS, SnapshotIndex, common_directory,
     dicts,
 )
-from paircli_patterns import MIN_MEMBERS, pattern_label, verify_pattern
+from paircli_patterns import MAX_MEMBERS, MIN_MEMBERS, _split_members, pattern_label, verify_pattern
 from paircli_skeleton import CATEGORY_PENALTY, _clean, _int, _line_kind, _plural, _slug, size_budget
 
 ARCHITECTURE_V2 = "architecture.v2.json"
@@ -58,6 +63,11 @@ MAX_PATTERN_EDGE_REFS = 3  # sample citations on an edge that stands for several
 MODIFIED_SOURCE_BONUS = 1.0  # row selection: a modified source file outranks added boilerplate
 PATTERN_BONUS = 2.0
 CATEGORY_OF_FAMILY = {"tests": "test", "docs": "docs", "config": "config"}
+FAMILY_GROUP_LABELS = {"tests": "Test files", "docs": "Doc files", "config": "Config files", "remainder": "Other changed files"}
+SAME_CHANGE_GROUP_LABELS = {"renamed": "Renamed and edited files", "deleted": "Repeated deletions",
+                            "added": "Repeated additions"}
+CHANGE_LABELS = frozenset({*FAMILY_GROUP_LABELS.values(), *SAME_CHANGE_GROUP_LABELS.values(), "Repeated changes",
+                           "Tests, docs and config"})
 MAX_PATH_CHARS = 300
 MAX_GAP_CHARS = 300
 OTHER_LABEL = "Other changes"
@@ -234,6 +244,9 @@ def _describe_pattern(pattern: dict) -> str:
                 else "Each makes the same edit (digits aside).")
         return (f"{count} files with the same change: {status}. {what} "
                 f"Together +{pattern['additions']}/-{pattern['deletions']} lines.{spans}")
+    if pattern["family"] == "remainder":
+        return (f"{count} further changed files, listed in the details; they were not given their own rows. "
+                f"Together +{pattern['additions']}/-{pattern['deletions']} lines.{spans}")
     noun = {"tests": "test", "docs": "doc", "config": "config"}[pattern["family"]]
     return (f"{count} {noun} files changed in this area. "
             f"Together +{pattern['additions']}/-{pattern['deletions']} lines.{spans}")
@@ -270,6 +283,69 @@ def _pattern_node(group_id: str, pattern: dict, records: dict, cite: _Citations,
         node["pattern"]["signature"] = pattern["signature"]
     node["pattern"]["members"] = list(members)
     return node
+
+
+def _file_node(group_id: str, path: str, records: dict, cite: _Citations, taken: set[str]) -> dict | None:
+    """One `file` row, or None when the file has nothing to cite."""
+    evidence = cite.evidence(path)
+    if not evidence:
+        return None
+    return {
+        "id": _node_id(group_id, path, taken), "label": _clean(posixpath.basename(path), 80) or _clean(path, 80),
+        "group": group_id, "kind": "file", "description": _describe(records[path]),
+        "files": [path], "evidence": evidence,
+    }
+
+
+def _remainder_plan(leftover: list[str], cite: _Citations) -> tuple[list[list[str]], list[str]]:
+    """Split the files that have no row and no pattern into remainder pieces and ordinary file rows.
+
+    One or two files get ordinary rows (only citable ones; the rest stay unshown). Three or more form
+    remainder pieces of 3 to 500 members each, split along directories only above 500; a piece that
+    would be too small is merged into the smallest piece with room, else it gets ordinary rows. A piece
+    needs a citable sample; a piece of files with no hunk data is dropped (the draft's gaps count those).
+    """
+    paths = sorted(set(leftover))
+    if len(paths) < MIN_MEMBERS:
+        return [], [path for path in paths if cite.usable(path)]
+    pieces = [list(piece) for piece in _split_members(paths, MAX_MEMBERS)]
+    tail: list[str] = []
+    big = [piece for piece in pieces if len(piece) >= MIN_MEMBERS]
+    for piece in (piece for piece in pieces if len(piece) < MIN_MEMBERS):
+        room = [other for other in big if len(other) + len(piece) <= MAX_MEMBERS]
+        if room:
+            min(room, key=len).extend(piece)
+        else:
+            tail.extend(path for path in piece if cite.usable(path))
+    return [sorted(piece) for piece in big if any(cite.usable(path) for path in piece)], sorted(tail)
+
+
+def _remainder_pattern(members: list[str], records: dict) -> dict:
+    return {"family": "remainder", "signature": None, "members": members, "status": "modified",
+            "additions": sum(records[path]["additions"] for path in members),
+            "deletions": sum(records[path]["deletions"] for path in members)}
+
+
+def _change_label(rows: list[dict], status_of: dict[str, str]) -> str | None:
+    """A group label drawn from its change, or None when the group keeps its directory label.
+
+    That is the case for a group with a real file row, and for one whose pattern rows all sit in one
+    directory. A group of only pattern rows whose members span several directories is named after what
+    changed, never after one member's directory.
+    """
+    if not rows or any(node["kind"] != "pattern" for node in rows):
+        return None
+    members = [path for node in rows for path in node["pattern"]["members"]]
+    if len({posixpath.dirname(path) for path in members}) < 2:
+        return None
+    families = {node["pattern"]["family"] for node in rows}
+    if families == {"same-change"}:
+        statuses = {status_of.get(node["id"]) for node in rows}
+        return SAME_CHANGE_GROUP_LABELS.get(next(iter(statuses)), "Repeated changes") if len(statuses) == 1 \
+            else "Repeated changes"
+    if len(families) == 1:
+        return FAMILY_GROUP_LABELS[next(iter(families))]
+    return "Tests, docs and config" if families <= {"tests", "docs", "config"} else "Repeated changes"
 
 
 def _cap(text: str) -> str:
@@ -321,65 +397,125 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
             routine_by_group.setdefault(record["group"], []).append(record["path"])
 
     count = len(eligible)
-    per_group = min(rows_per_group, max(1, MAX_NODES // count))
     group_ids: set[str] = set()
     node_ids: set[str] = set()
-    groups, nodes, row_of, pattern_of = [], [], {}, {}
-    spread: set[str] = set()
-    unlisted = folded = 0
-    pattern_rows = 0
+    prepared = []  # (output group id, group, routine paths, own file candidates, patterns)
+    home: dict[str, str] = {}  # path -> output id of the group whose files hold it
     for group in eligible:
         group_id = _identifier(str(group.get("id")), group_ids, "group")
         routine = sorted(path for source in group.get("merged_ids") or [group["id"]]
                          for path in routine_by_group.get(source, []))
-        shown = max(1, per_group - 1) if routine else per_group
         singles, patterns = rows_of(group)
-        own = set(group["files"])
-        if not group.get("merged") and any(path not in own for pattern in patterns for path in pattern["members"]):
-            spread.add(group_id)  # its label names a directory, but a pattern here reaches beyond it
-        groups.append({"id": group_id, "label": _clean(group.get("label"), 80) or "Changes"})
+        prepared.append((group_id, group, routine, singles, patterns))
+        for path in group["files"]:
+            home.setdefault(path, group_id)
+    non_routine = sorted(path for path, record in records.items() if not record.get("routine"))
 
-        # Rows compete for the budget: a pattern row is one row however many files it stands for.
-        # `order` is the display rank (the skeleton score order for files); `priority` decides who is cut.
-        candidates = [(_file_priority(records[path]), records[path].get("score", 0), path, None) for path in singles]
-        candidates += [(_pattern_priority(pattern), _pattern_priority(pattern), pattern["members"][0], pattern)
-                       for pattern in patterns]
-        chosen = sorted(candidates, key=lambda item: (-item[0], item[2]))[:shown]
-        unlisted += (len(singles) + sum(len(pattern["members"]) for pattern in patterns)
-                     - sum(1 if item[3] is None else len(item[3]["members"]) for item in chosen))
-        for _priority, _order, path, pattern in sorted(chosen, key=lambda item: (-item[1], item[2])):
+    def select(reserve: int) -> list[list]:
+        """Per group, the rows that win its budget; `reserve` slots of the node cap are kept for remainder rows."""
+        per_group = min(rows_per_group, max(1, (MAX_NODES - reserve) // count))
+        plans = []
+        for _group_id, _group, routine, singles, patterns in prepared:
+            shown = max(1, per_group - 1) if routine else per_group
+            # Rows compete for the budget: a pattern row is one row however many files it stands for.
+            # `order` is the display rank (the skeleton score order for files); `priority` decides who is cut.
+            candidates = [(_file_priority(records[path]), records[path].get("score", 0), path, None) for path in singles]
+            candidates += [(_pattern_priority(pattern), _pattern_priority(pattern), pattern["members"][0], pattern)
+                           for pattern in patterns]
+            plans.append(sorted(sorted(candidates, key=lambda item: (-item[0], item[2]))[:shown],
+                                key=lambda item: (-item[1], item[2])))
+        return plans
+
+    def leftover_of(plans: list[list]) -> list[str]:
+        shown = {path for plan in plans for _p, _o, path, pattern in plan if pattern is None}
+        shown.update(path for plan in plans for _p, _o, _path, pattern in plan if pattern is not None
+                     for path in pattern["members"])
+        return [path for path in non_routine if path not in shown]
+
+    # Every non-routine file lands in a row, a pattern or the remainder: pick the rows first, then
+    # reserve the remainder's slots and pick again until the reservation holds.
+    reserve = 0
+    for _round in range(4):
+        plans = select(reserve)
+        pieces, tail = _remainder_plan(leftover_of(plans), cite)
+        need = len(pieces) + len(tail)
+        if need <= reserve:
+            break
+        reserve = need
+
+    groups, nodes, row_of, pattern_of = [], [], {}, {}
+    block: dict[str, dict] = {}  # output group id -> its rows, remainder rows and routine row
+    status_of: dict[str, str] = {}  # pattern row id -> its status, for naming a group after its change
+    unlisted = folded = 0
+    pattern_rows = 0
+    for (group_id, group, routine, _singles, _patterns), plan in zip(prepared, plans):
+        groups.append({"id": group_id, "label": _clean(group.get("label"), 80) or "Changes"})
+        entry = block[group_id] = {"rows": [], "remainder": [], "routine": None}
+        for _priority, _order, path, pattern in plan:
             if pattern is not None:
                 node = _pattern_node(group_id, pattern, records, cite, node_ids)
-                if node is None:
-                    unlisted += len(pattern["members"])
+                if node is None:  # its members fall through to the remainder
                     continue
                 for member in pattern["members"]:
                     pattern_of[member] = node["id"]
+                status_of[node["id"]] = pattern["status"]
                 folded += len(pattern["members"])
                 pattern_rows += 1
-                nodes.append(node)
+                entry["rows"].append(node)
                 continue
-            record = records[path]
-            evidence = cite.evidence(path)
-            if not evidence:
-                unlisted += 1
+            node = _file_node(group_id, path, records, cite, node_ids)
+            if node is None:
                 continue
-            node_id = _node_id(group_id, path, node_ids)
-            row_of[path] = node_id
-            nodes.append({
-                "id": node_id, "label": _clean(posixpath.basename(path), 80) or _clean(path, 80),
-                "group": group_id, "kind": "file", "description": _describe(record),
-                "files": [path], "evidence": evidence,
-            })
+            row_of[path] = node["id"]
+            entry["rows"].append(node)
         if routine:
-            nodes.append({
+            entry["routine"] = {
                 "id": _identifier(f"{group_id[:55]}-routine", node_ids, "routine"),
                 "label": _plural(len(routine), "routine file"), "group": group_id, "kind": "routine",
                 "description": f"{_plural(len(routine), 'routine file')} (lockfiles, generated, vendored or binary) "
                                "changed; not shown individually.",
                 "files": [path for path in routine if len(path) <= MAX_PATH_CHARS][:MAX_FILES_PER_NODE],
                 "evidence": [],
-            })
+            }
+    # What no row or pattern holds, routine files aside: one remainder row (or an ordinary row for 1-2 files).
+    pieces, tail = _remainder_plan([path for path in non_routine if path not in row_of and path not in pattern_of], cite)
+    in_remainder: list[str] = []
+    default_group = prepared[0][0]
+
+    def host(paths: list[str]) -> str:
+        held: dict[str, int] = {}
+        for path in paths:
+            if home.get(path) in block:
+                held[home[path]] = held.get(home[path], 0) + 1
+        return min(held, key=lambda name: (-held[name], name)) if held else default_group
+
+    room = MAX_NODES - sum(len(entry["rows"]) + (entry["routine"] is not None) for entry in block.values())
+    for path in tail:  # one or two leftover files get ordinary rows, beyond the budget
+        group_id = home.get(path) if home.get(path) in block else host([path])
+        node = _file_node(group_id, path, records, cite, node_ids) if room > 0 else None
+        if node is None:
+            unlisted += 1
+            continue
+        room -= 1
+        row_of[path] = node["id"]
+        block[group_id]["rows"].append(node)
+    remainder_rows = 0
+    for piece in pieces:
+        pattern = _remainder_pattern(piece, records)
+        group_id = host(piece)
+        node = _pattern_node(group_id, pattern, records, cite, node_ids) if room > 0 else None
+        if node is None:
+            unlisted += len(piece)
+            continue
+        room -= 1
+        for member in piece:
+            pattern_of[member] = node["id"]
+        status_of[node["id"]] = pattern["status"]
+        in_remainder.extend(piece)
+        remainder_rows += 1
+        block[group_id]["remainder"].append(node)
+    for entry in block.values():
+        nodes.extend(entry["rows"] + entry["remainder"] + ([entry["routine"]] if entry["routine"] else []))
     nodes = nodes[:MAX_NODES]
     if not any(node["kind"] in ("file", "pattern") for node in nodes):
         return None
@@ -390,17 +526,23 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
     shown_groups = {node["group"] for node in nodes}
     groups = [group for group in groups if group["id"] in shown_groups]
     for group in groups:
-        if group["id"] in spread:
-            reach = [path for node in nodes if node["group"] == group["id"]
-                     for path in (node["pattern"]["members"] if node["kind"] == "pattern" else node["files"])]
-            where = common_directory(reach).split("/")[-2:]
-            group["label"] = _clean("/".join(part for part in where if part), 80) or "Repeated changes"
+        label = _change_label([node for node in nodes if node["group"] == group["id"] and node["kind"] != "routine"],
+                              status_of)
+        if label:
+            group["label"] = label
+    seen: dict[str, int] = {}  # two groups named after the same kind of change get a counter
+    for group in groups:
+        if group["label"] in CHANGE_LABELS:
+            seen[group["label"]] = seen.get(group["label"], 0) + 1
+            if seen[group["label"]] > 1:
+                group["label"] = f"{group['label']} ({seen[group['label']]})"
 
     edges = _edges(skeleton, cite, row_of, pattern_of, pattern_nodes)
 
     totals = skeleton.get("totals") if isinstance(skeleton.get("totals"), dict) else {}
     routine_total = _int(totals.get("routine_files")) or 0
-    no_hunks = sum(1 for path, record in records.items() if not record.get("routine") and not cite.usable(path))
+    shown_paths = set(row_of) | set(pattern_of)
+    no_hunks = sum(1 for path in non_routine if path not in shown_paths and not cite.usable(path))
     gaps = []
     if routine_total:
         gaps.append(f"{_plural(routine_total, 'routine file')} (lockfiles, generated, vendored or binary) "
@@ -408,13 +550,16 @@ def _build(skeleton: dict, snapshot, head) -> dict | None:
     if folded:
         gaps.append(f"{_plural(folded, 'changed file')} folded into {_plural(pattern_rows, 'pattern row')} "
                     "(the same change repeated, or tests, docs and config of one area).")
+    if in_remainder:
+        gaps.append(f"{_plural(len(in_remainder), 'further changed file')} grouped into "
+                    f"{_plural(remainder_rows, 'remainder row')}: listed in the details, no rows of their own.")
+    if merged_count:
+        gaps.append(f"{_plural(merged_count, 'smaller area')} merged into {OTHER_LABEL} to fit the size limit.")
     if no_hunks:
         gaps.append(f"{_plural(no_hunks, 'changed file')} with no usable hunk data cannot be cited and "
                     f"{'is' if no_hunks == 1 else 'are'} not shown.")
-    if merged_count:
-        gaps.append(f"{_plural(merged_count, 'smaller area')} merged into {OTHER_LABEL} to fit the size limit.")
     if unlisted:
-        gaps.append(f"{_plural(unlisted, 'changed file')} not listed individually because of the row limit.")
+        gaps.append(f"{_plural(unlisted, 'changed file')} not shown because the diagram is full.")
     gaps = [_cap(gap) for gap in gaps[:MAX_GAPS - 1]]
     gaps.append("Generated deterministically from file structure and imports, not from reading the code.")
 

@@ -31,7 +31,7 @@ is no model, no network and no repository read, and the same input always gives 
   no_citable_lines      no file has a new-side hunk line to cite
 
 Patterns: same-change clustering runs once over ALL non-routine files with line data
-(`paircli_patterns.cluster_same_change`: identical change signature, 3 or more files), whatever their
+(`paircli_patterns.cluster_same_change`: identical net change signature, comments ignored, 3 or more files), whatever their
 directory, so a repeated change in a flat monorepo layout is one pattern, not one per directory. Each
 cluster is assigned to ONE group, the one holding most of its members (ties: smallest group id), and
 appears only in that group's `patterns`. Members that live in other groups stay in those groups'

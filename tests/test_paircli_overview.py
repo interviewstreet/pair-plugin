@@ -1243,7 +1243,7 @@ def test_digest_lists_pattern_member_counts(world):
                                                                            "members": [TEST, GUIDE, LOCK]},
                               "stats": {"files": 3, "additions": 3, "deletions": 0}})
     digest = build_overview_digest(document, snapshot)
-    assert next(item for item in digest["nodes"] if item["id"] == "pat")["pattern"] == {"family": "tests", "members": 3}
+    assert next(item for item in digest["nodes"] if item["id"] == "pat")["pattern"] == {"family": "tests", "count": 3, "directories": 3, "common_dir": ""}
 
 
 def test_digest_is_capped_for_huge_documents(artifact, world):
@@ -1353,3 +1353,156 @@ def test_generate_is_deterministic_for_a_fixed_answer(tmp_path, world):
                                  Stub([json.dumps(golden_draft(snapshot))]), Log())
                for name in ("a", "b")] if all((tmp_path / name).mkdir() is None for name in ("a", "b")) else []
     assert answers[0]["overview"] == answers[1]["overview"]
+
+
+# --- prose counts, naming, context routing and the other prompt rules --------------------
+
+def with_text(snapshot, document, **edits):
+    """The golden draft with component description / edge claim / step text overridden, finalized for llm."""
+    draft = golden_draft(snapshot)
+    for key, value in edits.get("components", {}).items():
+        next(item for item in draft["components"] if item["id"] == key)["description"] = value
+    for key, value in edits.get("edges", {}).items():
+        next(item for item in draft["edges"] if item["id"] == key)["claim"] = value
+    for key, value in edits.get("steps", {}).items():
+        next(item for item in draft["steps"] if item["id"] == key)["text"] = value
+    return finalize_overview(draft, document, HEAD, snapshot, "llm")
+
+
+@pytest.mark.parametrize("edits, path", [
+    ({"components": {"store": "Rewrites 111 files and +222 -111 lines of state."}}, "overview.components[0].description"),
+    ({"components": {"store": "Touches 480 more files across the app."}}, "overview.components[0].description"),
+    ({"edges": {"o-call": "The route calls the service in 1,200 handlers."}}, "overview.edges[1].claim"),
+    ({"steps": {"o-s1": "The route now calls the service across 90 modules."}}, "overview.steps[0].text"),
+])
+def test_prose_counts_that_no_computed_count_backs_are_rejected(world, edits, path):
+    snapshot, document = world
+    with pytest.raises(ArchitectureError) as raised:
+        with_text(snapshot, document, **edits)
+    found = raised.value.all_errors
+    assert any(item["path"] == path and "count" in item["reason"] for item in found), found
+
+
+@pytest.mark.parametrize("edits", [
+    {"components": {"store": "Adds 13 lines of state."}},                    # the component's own additions
+    {"components": {"view": "Changes 5 lines: 4 added and 1 removed."}},     # additions + deletions
+])
+def test_prose_counts_that_match_computed_counts_pass(world, edits):
+    snapshot, document = world
+    overview, _ = with_text(snapshot, document, **edits)
+    assert overview["generated_by"] == "llm"
+
+
+def test_prose_counts_ignore_small_numbers_code_spans_quotes_and_non_counts(world):
+    snapshot, document = world
+    overview, _ = with_text(snapshot, document, components={
+        "store": "Adds 2 handlers and 3 modules; the `500 files` literal and the \"900 lines\" label are text.",
+        "view": "Runs in 100% of cases for step 7 of the flow."}, steps={
+        "o-s1": "The route calls the service; v2 files and utf8 files are untouched."})
+    assert component(overview, "store")["description"].startswith("Adds 2 handlers")
+
+
+def test_prose_counts_accept_member_pattern_counts_and_sums_of_them(world):
+    snapshot, document = world
+    document = copy.deepcopy(document)
+    members = [f"web/src/gen{n}.ts" for n in range(40)]
+    document["nodes"].append({"id": "gen", "label": "40 files", "group": "web", "kind": "pattern", "description": "d",
+                              "files": members[:3], "evidence": [],
+                              "pattern": {"family": "same-change", "count": 40, "members": members},
+                              "stats": {"files": 40, "additions": 80, "deletions": 0}})
+    other = {"id": "gen2", "label": "9 files", "group": "web", "kind": "pattern", "description": "d", "files": [],
+             "evidence": [], "pattern": {"family": "remainder", "count": 9, "members": [f"web/x{n}.ts" for n in range(9)]},
+             "stats": {"files": 9, "additions": 9, "deletions": 0}}
+    document["nodes"].append(other)
+    draft = golden_draft(snapshot)
+    draft["components"][0]["members"] = ids(STORE) + ["gen", "gen2"]
+    for text in ("The same edit repeats in 40 files.", "It adds 80 lines in 49 files in total.",
+                 "Seen in 9 files with the family remainder."):
+        draft["components"][0]["description"] = text
+        overview, _ = finalize_overview(draft, document, HEAD, snapshot, "llm")
+        assert component(overview, "store")["stats"]["files"] == 50
+    draft["components"][0]["description"] = "The same edit repeats in 43 files."
+    with pytest.raises(ArchitectureError):
+        finalize_overview(draft, document, HEAD, snapshot, "llm")
+    # an unknown future family is tolerated by the digest and the validator
+    digest = build_overview_digest(document, snapshot)
+    assert next(item for item in digest["nodes"] if item["id"] == "gen2")["pattern"]["family"] == "remainder"
+
+
+def test_the_count_check_applies_to_model_overviews_only(world):
+    snapshot, document = world
+    overview, _ = finalize_overview(golden_draft(snapshot), document, HEAD, snapshot, "llm")
+    overview["components"][0]["description"] = "Rewrites 111 files."
+    assert any("count" in item["reason"] for item in errors_of(overview, document, snapshot))
+    overview["generated_by"] = "deterministic"
+    assert errors_of(overview, document, snapshot) == []
+
+
+def test_a_prose_count_is_retried_once_with_the_error_then_accepted(artifact, world):
+    bad = golden_draft(world[0])
+    bad["components"][0]["description"] = "Rewrites 111 files."
+    stub = Stub([json.dumps(bad), json.dumps(golden_draft(world[0]))])
+    result, _ = run(artifact, world, stub)
+    assert result["stats"] == {"source": "llm", "retried": True, "steps_dropped": 0, "llm_calls": 2}
+    assert "components[0].description" in stub.calls[1]["prompt"] and "count" in stub.calls[1]["prompt"]
+    stub = Stub([json.dumps(bad)] * 2)
+    result, _ = run(artifact, world, stub)
+    assert result["stats"]["source"] == "deterministic" and result["stats"]["retried"] is True
+
+
+def test_count_claims_helper():
+    from paircli_overview import count_claims
+    assert count_claims("111 files, 1,200 lines and 4 more handlers") == [111, 1200, 4]
+    assert count_claims("`111 files` and \"22 modules\" and 'x 33 files'") == []
+    assert count_claims("no numbers, 5 stars, step 3") == []
+    assert count_claims(None) == []
+
+
+def test_digest_pattern_rows_carry_directories_and_common_dir(world):
+    snapshot, document = world
+    document = copy.deepcopy(document)
+    members = ["zone0/a/x.ts", "zone1/a/x.ts", "zone2/b/y.ts", "zone3/z.ts", "zone4/z.ts", "zone4/w.ts"]
+    document["nodes"] += [
+        {"id": "wide", "label": "6 files", "group": "web", "kind": "pattern", "description": "d", "files": members[:1],
+         "evidence": [], "pattern": {"family": "same-change", "count": 6, "members": members},
+         "stats": {"files": 6, "additions": 6, "deletions": 0}},
+        {"id": "narrow", "label": "2 files", "group": "web", "kind": "pattern", "description": "d", "files": [],
+         "evidence": [], "pattern": {"family": "tests", "count": 2, "members": ["web/src/a/x.test.ts", "web/src/a/y.test.ts"]},
+         "stats": {"files": 2, "additions": 2, "deletions": 0}}]
+    digest = build_overview_digest(document, snapshot, deterministic_overview(document, snapshot))
+    rows = {item["id"]: item for item in digest["nodes"]}
+    assert rows["wide"]["pattern"] == {"family": "same-change", "count": 6, "directories": 5, "common_dir": ""}
+    assert rows["narrow"]["pattern"] == {"family": "tests", "count": 2, "directories": 1, "common_dir": "web/src/a"}
+    for hint in digest["baseline"]["components"]:
+        assert "stats" in hint and "id" in hint
+    first = digest["baseline"]["components"][0]
+    assert first["stats"]["files"] >= 1 and "directories" in first and "common_dir" in first
+    assert "stats" in rows[ids(STORE)[0]]
+
+
+PROMPT_RULES = (
+    "never for the directory of a sample file when a member's pattern.directories is above 1",
+    "A component may hold several pattern rows of related edits: name it for their shared purpose",
+    "never write file, line, handler or percentage counts in prose",
+    "Copy a number only from a digest field named count or stats, verbatim",
+    "No \"only\", \"just\", \"all\", \"every\" or \"none\" about what a file or route serves",
+    "Prefer \"includes\" and \"such as\"",
+    "put the edge between that server component and the context component",
+    "route client edges to the server component, never straight to the context one",
+    "is started by the server",
+    "cite the lines that start or call it",
+    "A security or trust boundary the diff adds (an allowlist, auth check, sandbox, proxy, permission gate)",
+    "says plainly what it allows or blocks",
+    "the removed call sat after return, so behaviour does not change",
+    "the imports name something the target does not export",
+    "otherwise omit them",
+)
+
+
+def test_overview_prompt_carries_the_new_rules_and_stays_small(tmp_path):
+    for errors in (None, [{"path": "overview.steps[0].text", "reason": "states the count 111 in prose"}]):
+        flat = " ".join(overview_prompt(tmp_path, tmp_path / "d.json", errors).split())
+        for phrase in PROMPT_RULES:
+            assert phrase.lower() in flat.lower(), phrase
+        assert len(flat.encode()) < 8 * 1024
+    assert "mention only identifiers, flags and paths" in flat.lower() and "counts you" not in flat

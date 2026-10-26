@@ -27,10 +27,10 @@ Principle (unchanged): the model chooses and narrates, code computes and verifie
     "change": "unchanged", "state": "context", "stats": {"files": 0, "additions": 0, "deletions": 0, "api_added": 0, "api_removed": 0}
   }],
   "edges": [{"id": "o-spawn", "source": "notebook-service", "target": "jupyter", "label": "spawn, proxy",
-             "claim": "NotebookService starts Jupyter on 127.0.0.1 and proxies only allowlisted routes.",
+             "claim": "NotebookService starts Jupyter on 127.0.0.1 and proxies allowlisted routes.",
              "change": "added", "evidence": [{"type": "diff", "path": "...", "start": 210, "end": 214, "side": "new"}]}],
   "steps": [{"id": "o-s1", "when": "after", "edge": "o-spawn", "components": ["notebook-service", "jupyter"],
-             "text": "NotebookService starts Jupyter on localhost and proxies only allowlisted routes.",
+             "text": "NotebookService starts Jupyter on localhost and proxies allowlisted routes.",
              "flags": [], "evidence": [{"type": "diff", "path": "...", "start": 210, "end": 214, "side": "new"}]}]
 }
 ```
@@ -74,6 +74,43 @@ Principle (unchanged): the model chooses and narrates, code computes and verifie
   `removed`; else `modified`; if every member is unchanged, `unchanged`. Context: `unchanged`.
 - A step that fails validation is dropped without dropping the overview. An overview that fails
   validation is replaced by the deterministic overview. The detailed graph is never affected.
+
+## Prose rules (what the model may write)
+
+- **No counts in prose.** Code owns every number (component `stats`, the digest's `count`,
+  `stats` and `pattern.directories` fields). The model writes "the repeated edit" or "many files",
+  never "111 files" or "+222 -111", and copies a number only from a digest field named `count` or
+  `stats`, verbatim: sampled members are not the whole set.
+- **Validator guard.** For a model overview (`generated_by: "llm"`), `validate_overview` rejects
+  (an ordinary `ArchitectureError`, so the single retry shows it to the model) a component
+  description, edge claim or step text that contains a number followed by `files`, `handlers`,
+  `modules`, `lines` or `components` (with optional "more") unless the number is a computed count:
+  the component's `stats` (or both edge ends', or the step's components'), the `stats` or pattern
+  `count` or file count of any of its members, additions plus deletions, the sum of two such member
+  counts, or a PR-wide total. Numbers up to 3, numbers inside backticks or quotes, and anything
+  the check cannot tell apart pass. The deterministic overview is written by code and not checked.
+- **Context nodes are reached through the server.** When a changed server component starts,
+  proxies or calls a context component (a process, database, service), the edge goes between the
+  server component and the context component (for example `spawn, proxy`), client edges go to the
+  server component and never straight to the context component, and the text says the server
+  starts it when the diff shows that, citing the lines that start or call it.
+- **Trust boundaries get their own component or step** (an allowlist, auth check, sandbox, proxy,
+  permission gate) with a plain statement, grounded in cited lines, of what it allows or blocks.
+- **Names describe the change.** A pattern row can span many directories; the digest gives each
+  `pattern.directories` and `pattern.common_dir`. A component is named for what it does, never for
+  the directory of a sample file when `directories` is above 1, and may hold several pattern rows
+  of related edits. New pattern families (such as `remainder`) are treated like any other.
+- **No narrow "only" claims**: no "only", "just", "all", "every" or "none" about what a file or
+  route serves, calls or contains unless the cited lines are its whole definition; prefer
+  "includes" and "such as", and call listed endpoints or exports examples.
+- **Verified facts or nothing**: statements such as "the removed call sat after return, so
+  behaviour does not change" or "the imports name something the target does not export" need the
+  model to have read the file around the cited lines; when unsure it omits them.
+- **Gaps** (detailed document, merge call): the model writes at most 2 generic limits ("runtime
+  behaviour not visible in the diff"), never statements about specific files, directories, areas
+  or counts. `apply_merge` drops (with a warning) any model gap containing a path-like token
+  (a `/` or a known file extension), a number followed by files/rows/areas/etc., or a name such as
+  `area4`; code adds its own computed gaps.
 
 ## Deterministic overview (fallback)
 

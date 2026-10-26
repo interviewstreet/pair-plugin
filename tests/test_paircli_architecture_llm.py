@@ -332,7 +332,7 @@ def test_merge_prompt_mirrors_the_step_rules(tmp_path):
     assert str(tmp_path / "merge-input.json") in prompt and str(tmp_path / "snapshot.json") in prompt
     for expected in ("at most 24", "1-16 row ids", "never uses a removed", "never uses an added",
                      "Omit flags", "at most 400", "both of its endpoints must be in the step's nodes",
-                     "the single word null", "untrusted data", "Do not modify files", "at most 5"):
+                     "the single word null", "untrusted data", "Do not modify files", "at most 2 generic limits"):
         assert expected in prompt, expected
     assert len(prompt.encode()) < 12 * 1024
 
@@ -340,7 +340,7 @@ def test_merge_prompt_mirrors_the_step_rules(tmp_path):
 GROUNDING_PHRASES = (
     "Base every row description, edge claim and step text on the cited lines",
     "PR title and description may be wrong or stale",
-    "Mention only identifiers, flags, paths, options and counts that you can see in the cited code",
+    "Mention only identifiers, flags, paths and options that you can see in the cited code; no counts",
     "only if the digest lists an edge from X to Y or the cited lines show",
     "without asserting a link between them",
     "old-side",
@@ -428,7 +428,8 @@ def test_group_digest_carries_the_pattern_family_count_signature_samples_and_sta
     row = rows["legacy-deleted"]
     assert row["kind"] == "pattern"
     assert row["pattern"] == {"family": "same-change", "count": 20, "signature": "9f2c4a1b7e3d5a60",
-                              "samples": PATTERN_MEMBERS[:llm.MAX_PATTERN_SAMPLES]}
+                              "samples": PATTERN_MEMBERS[:llm.MAX_PATTERN_SAMPLES],
+                              "directories": 20, "common_dir": "src/legacy"}
     assert len(row["pattern"]["samples"]) == 12
     assert row["stats"] == stats
     assert [entry["path"] for entry in row["files"]] == PATTERN_MEMBERS[:3]
@@ -517,7 +518,9 @@ def test_merge_digest_carries_pattern_api_totals_and_breaking_rows():
     snapshot, draft, group = pattern_world(exports=1, description="Deletes the legacy module; callers outside this PR may break.")
     digest = llm.build_merge_digest(draft, {}, snapshot)
     rows = {row["id"]: row for row in digest["groups"][0]["rows"]}
-    assert rows["legacy-deleted"]["pattern"] == {"family": "same-change", "count": 20}
+    assert rows["legacy-deleted"]["pattern"] == {"family": "same-change", "count": 20, "directories": 20,
+                                                  "common_dir": "src/legacy"}
+    assert rows["legacy-deleted"]["stats"]["files"] == 20, "the true count sits next to the row"
     assert rows["legacy-deleted"]["api_removed"] == 20 and rows["src-legacy-index-ts"]["api_removed"] == 1
     assert digest["groups"][0]["api_removed"] == 21 and "api_added" in digest["groups"][0]
     assert digest["api"]["removed"] == 21 and digest["api"]["added"] == 0
@@ -553,13 +556,13 @@ def test_merge_digest_is_size_capped_with_many_rows_and_long_descriptions():
 
 USEFULNESS_PHRASES = (
     "Lead with what the change does or breaks, never with line counts",
-    "describe the shared change once, say how many files, and quote one concrete line from a sample member",
+    "describe the shared change once, with one concrete line from a sample member you read",
     'write "removes N exported names; callers outside this PR may break" only when api_removed is above 0',
     "an identifier used but not defined in the changed code",
     "code after return or throw that can never run",
     "an import of a name the target does not export",
     "never as a guess",
-    "If unsure, say nothing",
+    "If unsure, omit it",
     "Never add an edge to or from a tests, docs or config row",
     "only because one tests the other",
     'write "covered by tests in <file>" in the tested row\'s description instead',
@@ -603,7 +606,7 @@ def test_prompts_fit_the_size_limit_for_a_253_file_digest_even_on_retry(tmp_path
 
 
 def test_the_prompt_version_changed_and_cache_keys_differ(monkeypatch):
-    assert llm.PROMPT_VERSION == "architecture-llm-3"
+    assert llm.PROMPT_VERSION == "architecture-llm-4"
     snapshot, draft = world()
     digest = llm.build_merge_digest(draft, {}, snapshot)
     group_key = llm.group_cache_key(draft, "api", snapshot, "codex", None)
@@ -1010,6 +1013,96 @@ def test_merge_ignores_bad_title_and_gaps_without_failing():
     assert new["title"] == draft["title"] and new["description"] == draft["description"]
     assert new["gaps"] == ["ok", "a", "b", "c", "d"]
     finalize_v2(new, HEAD, snapshot, "llm")
+
+
+GENERIC_GAPS = ["Runtime behaviour is not visible in the diff.", "Callers outside this PR are not shown.", "Either and/or both."]
+SPECIFIC_GAPS = ["area4 may not resolve", "src/zones/zone1 is not shown", "zone1.ts is not shown",
+                 "zone1, zone3, zone4 not shown", "12 files are hidden", "3 more rows were collapsed",
+                 "40 areas are not drawn", "Check config.json and package.lock", "See ./docs/readme.md"]
+
+
+def test_merge_keeps_generic_gaps_and_drops_gaps_about_paths_files_or_counts():
+    snapshot, draft = world()
+    answer = {"gaps": SPECIFIC_GAPS[:4] + GENERIC_GAPS[:1] + SPECIFIC_GAPS[4:] + GENERIC_GAPS[1:]}
+    new, warnings, _ = llm.apply_merge(draft, answer, HEAD, snapshot)
+    assert new["gaps"] == GENERIC_GAPS
+    dropped = [warning for warning in warnings if "only generic gaps are accepted" in warning]
+    assert len(dropped) == len(SPECIFIC_GAPS) and all(warning.startswith("merge: gaps[") for warning in dropped)
+    finalize_v2(new, HEAD, snapshot, "llm")
+
+
+@pytest.mark.parametrize("gap", ["The 2 steps are examples.", "Version 2 of the flow.", "Runtime behaviour is not visible in the diff"])
+def test_merge_gap_filter_does_not_reject_plain_numbers_in_generic_text(gap):
+    snapshot, draft = world()
+    new, _, _ = llm.apply_merge(draft, {"gaps": [gap]}, HEAD, snapshot)
+    assert new["gaps"] == [gap]
+
+
+def test_the_merge_prompt_limits_gaps_to_two_generic_limits(tmp_path):
+    flat = " ".join(llm.merge_prompt(tmp_path, tmp_path / "m.json").split())
+    for phrase in ("gaps: at most 2 generic limits of the diagram", "runtime behaviour not visible in the diff",
+                   "callers outside this PR", "NEVER a statement about specific files, directories, areas, rows or counts",
+                   "code adds its own computed gaps"):
+        assert phrase in flat, phrase
+    assert "at most 5 honest notes" not in flat
+
+
+NEW_RULE_PHRASES = (
+    'Do not use "only", "just", "all", "every" or "none" about what a file or route serves, calls or contains',
+    'unless the cited lines are its whole definition',
+    'Prefer "includes" and "such as"',
+    "say they are examples",
+    "Never write file, line, handler or percentage counts in prose",
+    'Copy a number only from a digest field named count or stats, verbatim',
+    "Samples are only some members",
+    'such as "the removed call sat after return, so behaviour does not change"',
+    'such as "the imports name something the target does not export"',
+    "after reading the file around the cited lines",
+    "If unsure, omit it",
+)
+
+
+def test_both_prompts_carry_the_only_claim_number_and_verified_fact_rules(tmp_path):
+    for prompt in (llm.group_prompt(tmp_path, {"id": "api", "label": "API"}, tmp_path / "d.json"),
+                   llm.merge_prompt(tmp_path, tmp_path / "m.json")):
+        flat = " ".join(prompt.split())
+        for phrase in NEW_RULE_PHRASES:
+            assert phrase in flat, phrase
+        assert "say how many files" not in flat
+    group = " ".join(llm.group_prompt(tmp_path, {"id": "api", "label": "API"}, tmp_path / "d.json").split())
+    assert "never for the directory of a sample member when its pattern.directories is above 1" in group
+
+
+def test_pattern_digest_rows_carry_directories_and_common_dir_in_both_digests():
+    snapshot, draft, group = pattern_world()
+    members = ["zone0/a/x.ts", "zone1/a/x.ts", "zone2/b/y.ts", "zone3/z.ts", "zone3/w.ts"]
+    draft["nodes"][-1]["pattern"].update(members=members, count=5)
+    row = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "pattern")
+    assert row["pattern"]["directories"] == 4 and row["pattern"]["common_dir"] == ""
+    merged = next(row for row in llm.build_merge_digest(draft, {}, snapshot)["groups"][0]["rows"] if row["kind"] == "pattern")
+    assert merged["pattern"]["directories"] == 4 and merged["pattern"]["common_dir"] == "" and merged["pattern"]["count"] == 5
+    draft["nodes"][-1]["pattern"].update(members=["src/a/x.ts", "src/a/y.ts", "src/a/b/z.ts"], count=3)
+    row = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "pattern")
+    assert row["pattern"]["directories"] == 2 and row["pattern"]["common_dir"] == "src/a"
+
+
+def test_unknown_pattern_families_pass_through_the_digests():
+    snapshot, draft, group = pattern_world()
+    draft["nodes"][-1]["pattern"]["family"] = "remainder"
+    draft["nodes"][-1]["label"] = "20 other changed files"
+    row = next(row for row in llm.build_group_digest(draft, group, snapshot)["rows"] if row["kind"] == "pattern")
+    assert row["pattern"]["family"] == "remainder"
+    merged = next(row for row in llm.build_merge_digest(draft, {}, snapshot)["groups"][0]["rows"] if row["kind"] == "pattern")
+    assert merged["pattern"]["family"] == "remainder"
+    draft["nodes"][-1]["pattern"] = {"family": 7, "count": 2}
+    llm.build_group_digest(draft, group, snapshot)
+    llm.build_merge_digest(draft, {}, snapshot)
+
+
+def test_merge_digest_rows_carry_computed_stats():
+    snapshot, draft, group = pattern_world()
+    rows = {row["id"]: row for row in llm.build_merge_digest(draft, {}, snapshot)["groups"][0]["rows"]}
+    assert rows["legacy-deleted"]["stats"]["files"] == 20 and rows["legacy-deleted"]["stats"]["deletions"] == 40
 
 
 # --- orchestration -----------------------------------------------------------------------

@@ -217,7 +217,9 @@ def test_a_routine_row_lists_at_most_fifteen_files_and_costs_one_slot():
     routine = next(node for node in draft["nodes"] if node["kind"] == "routine")
     assert routine["label"] == "20 routine files" and len(routine["files"]) == 15
     rows = [node for node in draft["nodes"] if node["group"] == routine["group"]]
-    assert len(rows) == 12 and routine in rows  # 12 rows for this size: 11 files and the routine row
+    # 12 rows for this size: 11 files and the routine row; the one file left over gets an ordinary row beyond it
+    assert len(rows) == 13 and routine in rows
+    assert sum(node["kind"] == "file" for node in rows) == 12 and not any(node["kind"] == "pattern" for node in rows)
 
 
 # --- edges -----------------------------------------------------------------------------------
@@ -345,14 +347,19 @@ def test_a_thousand_files_respect_the_v2_caps_and_stay_fast():
     assert len(draft["groups"]) == 12 and "other" in {group["id"] for group in draft["groups"]}
     assert next(group for group in draft["groups"] if group["id"] == "other")["label"] == "Other changes"
     assert any("merged into Other changes" in gap for gap in draft["gaps"])
-    assert any("row limit" in gap for gap in draft["gaps"])
+    assert not any("row limit" in gap for gap in draft["gaps"])
+    assert any("further changed file" in gap and "remainder row" in gap for gap in draft["gaps"])
     assert len(draft["gaps"]) <= 5 and all(len(gap) <= 300 for gap in draft["gaps"])
     document, warnings = finalize_v2(draft, HEAD, snapshot, "deterministic")
     assert warnings == [] and len(document["nodes"]) == len(draft["nodes"])
     per_group = {}
+    remainders = [node for node in draft["nodes"] if node["kind"] == "pattern" and node["pattern"]["family"] == "remainder"]
     for node in draft["nodes"]:
-        per_group[node["group"]] = per_group.get(node["group"], 0) + 1
-    assert max(per_group.values()) <= 5
+        if node not in remainders:
+            per_group[node["group"]] = per_group.get(node["group"], 0) + 1
+    assert max(per_group.values()) <= 4, "one slot per remainder row is reserved before the file rows are budgeted"
+    assert len(remainders) >= 2 and all(node["pattern"]["count"] <= 500 for node in remainders) and sum(node["pattern"]["count"] for node in remainders) + len(
+        [node for node in draft["nodes"] if node["kind"] == "file"]) == 1000, "every changed file is in a row or the remainder"
 
 
 def test_the_edge_cap_keeps_the_best_connected_pairs():
@@ -830,7 +837,9 @@ def test_a_pattern_row_wins_budget_over_a_small_file_and_modified_source_over_ad
     labels = [node["label"] for node in document["nodes"]]
     assert "5 files: deleted" in labels, "the repeated deletion keeps its row"
     assert "core.ts" in labels, "an edited source file outranks added boilerplate when rows run out"
-    assert len([node for node in document["nodes"] if node["group"] == document["nodes"][0]["group"]]) <= 12
+    rows = [node for node in document["nodes"] if node["group"] == document["nodes"][0]["group"]]
+    assert len(rows) <= 12 + 2, "at most two leftover files get an ordinary row beyond the budget"
+    assert not any(node["kind"] == "pattern" and node["pattern"]["family"] == "remainder" for node in rows)
 
 
 def test_pattern_members_may_be_renamed_and_hunkless_files_are_left_out():
@@ -851,8 +860,10 @@ def test_a_pattern_row_is_one_row_of_the_group_budget():
               for index in range(30)]
     _, skeleton, draft = build(files)
     rows = [node for node in draft["nodes"] if node["group"] == draft["nodes"][0]["group"]]
-    assert len(rows) <= skeleton["budget"]["max_rows_per_group"]
-    assert sum(node["kind"] == "pattern" for node in draft["nodes"]) == 1
+    remainder = [node for node in rows if node["kind"] == "pattern" and node["pattern"]["family"] == "remainder"]
+    assert len(rows) - len(remainder) <= skeleton["budget"]["max_rows_per_group"]
+    assert len(remainder) == 1, "the files that did not fit are one remainder row, not dropped"
+    assert sum(node["kind"] == "pattern" and node["pattern"]["family"] == "same-change" for node in draft["nodes"]) == 1
 
 
 def test_pattern_drafts_are_deterministic_and_fast_for_a_thousand_files():
@@ -894,3 +905,197 @@ def test_an_import_of_part_of_a_pattern_counts_the_files_it_covers():
     _, _, document = finalize(templates + [index])
     (edge,) = document["edges"]
     assert edge["label"] == "imports (4)" and edge["claim"] == 'index.ts imported 4 of the 10 files in "10 files: deleted".'
+
+
+# --- net-change signatures, the remainder row and group names ---------------------------------
+
+def handler_pr(count=480, zones=6, kinds=4):
+    """`count` modified handlers over `zones` zones: one inserted line of `kinds` kinds, and a `// reviewed` comment
+    appended to one existing line that differs per file (a different line, with different text, in every file)."""
+    inserted = ["trace(ctx);", "audit(ctx.user);", "metrics.inc('hit');", "if (!ctx) return;"][:kinds]
+    files = []
+    for index in range(count):
+        existing = f"respond{letters_of(index)}(request, {index});"
+        files.append(make_file(f"src/zone{index % zones}/handlers/h{index}.ts", start=3 + index % 7,
+                               removed=[existing], added=[inserted[index % kinds], existing + " // reviewed"]))
+    return files
+
+
+def letters_of(index):
+    return "".join(LETTERS[(index // 52 ** place) % 52] for place in range(2))
+
+
+def remainder_nodes(document):
+    return [node for node in patterns_of(document) if node["pattern"]["family"] == "remainder"]
+
+
+def file_nodes(document):
+    return [node for node in document["nodes"] if node["kind"] == "file"]
+
+
+def accounted(document):
+    seen = [name for node in file_nodes(document) for name in node["files"]]
+    seen += [name for node in patterns_of(document) for name in node["pattern"]["members"]]
+    assert len(seen) == len(set(seen)), "a file is in two rows"
+    return set(seen)
+
+
+def test_a_comment_appended_to_a_different_line_per_file_still_forms_four_patterns():
+    files = handler_pr()
+    snapshot, _, document = finalize(files)
+    patterns = patterns_of(document)
+    assert sorted(node["pattern"]["count"] for node in patterns) == [120, 120, 120, 120]
+    assert remainder_nodes(document) == [] and covered(document) == 480
+    assert accounted(document) == {file["path"] for file in files}
+    validate_v2(document, HEAD, snapshot)
+    assert not any("row limit" in gap for gap in document["gaps"])
+
+
+def test_cross_zone_patterns_are_not_named_after_a_zone():
+    _, _, document = finalize(handler_pr())
+    labels = [node["label"] for node in document["nodes"]] + [group["label"] for group in document["groups"]]
+    assert not any("zone" in label for label in labels), labels
+    assert [group["label"] for group in document["groups"]][0] == "Repeated changes"
+    assert all(group["label"].startswith("Repeated changes") for group in document["groups"])
+    assert len({group["label"] for group in document["groups"]}) == len(document["groups"])
+    assert all(node["label"] == "120 files: same edit" for node in patterns_of(document))
+
+
+def renamed_across_zones(zones=4, per_zone=12):
+    """The rename_heavy shape: files moved src/old/zoneN -> src/core/zoneN, with a few edit variants."""
+    files = []
+    for zone in range(zones):
+        for number in range(per_zone):
+            added = ['import { shared } from "../core/shared";']
+            if number % 2:
+                added.append(f'logger.debug("renamed module", {{ zone: "{zone}" }});')
+            files.append(make_file(f"src/core/zone{zone}/file{number}.ts", "renamed", old_path=f"src/old/zone{zone}/file{number}.ts",
+                                   start=2, removed=['import { shared } from "../old/shared";'], added=added))
+    return files
+
+
+def test_a_rename_heavy_pr_names_neither_rows_nor_groups_after_a_zone():
+    files = renamed_across_zones()
+    snapshot, _, document = finalize(files)
+    patterns = patterns_of(document)
+    assert sorted(node["pattern"]["count"] for node in patterns) == [24, 24]
+    assert all("Spans 4 directories." in node["description"] for node in patterns)
+    labels = [node["label"] for node in document["nodes"]] + [group["label"] for group in document["groups"]]
+    assert not any(re.search(r"zone\d", label) for label in labels), labels
+    assert {group["label"] for group in document["groups"]} <= {"Renamed and edited files", "Renamed and edited files (2)"}
+    assert all(group["path"] == "" or "zone" not in group["path"] for group in document["groups"])
+    assert len({group["id"] for group in document["groups"]}) == len(document["groups"])
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_a_group_with_a_real_file_row_keeps_its_directory_label():
+    files = handler_pr(count=40, zones=4, kinds=2) + [make_file("src/zone0/handlers/own.ts", added=["const own = 'x';"] * 2)]
+    _, _, document = finalize(files)
+    group = next(group for group in document["groups"] if group["id"] == next(node["group"] for node in file_nodes(document)))
+    assert "zone" in group["label"] or "handlers" in group["label"] or group["label"] == "src/zone0/handlers", group
+    assert group["label"] not in {"Repeated changes", "Renamed and edited files"}
+
+
+def test_a_group_of_patterns_inside_one_directory_keeps_its_directory_label():
+    files = [make_file(f"src/only/t{index}.ts", status="deleted", removed=[f"// {index}", "export const A = 1;"]) for index in range(5)]
+    _, _, document = finalize(files)
+    assert [group["label"] for group in document["groups"]] == ["src"] and len(patterns_of(document)) == 1
+
+
+def unlike_files(count, directory="src/misc", lines=4):
+    return many_files(count, directories=[directory], lines=lines, unique=True)
+
+
+def test_files_beyond_the_row_budget_are_one_remainder_row_so_totals_add_up():
+    files = unlike_files(40)
+    snapshot, _, document = finalize(files)
+    skeleton = build_skeleton(snapshot, HEAD)
+    (row,) = remainder_nodes(document)
+    shown = file_nodes(document)
+    assert row["label"] == f"{row['pattern']['count']} other changed files" and row["pattern"]["count"] == 40 - len(shown)
+    assert len(shown) == skeleton["budget"]["max_rows_per_group"]
+    assert "signature" not in row["pattern"] and row["pattern"]["members"] == sorted(row["pattern"]["members"])
+    assert accounted(document) == {file["path"] for file in files}
+    assert len(row["files"]) == 12 and len(row["files"]) == len(set(row["files"]))
+    assert all(name in row["pattern"]["members"] for name in row["files"])
+    assert row["description"].startswith(f"{row['pattern']['count']} further changed files, listed in the details; ")
+    assert row["stats"]["files"] == row["pattern"]["count"]
+    assert any("further changed file" in gap and "1 remainder row" in gap for gap in document["gaps"])
+    assert not any("row limit" in gap or "not listed individually" in gap for gap in document["gaps"])
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_the_remainder_sample_is_the_biggest_members_and_is_cited():
+    files = unlike_files(40)
+    for index, file in enumerate(files):  # make file 0..39 differ in size: bigger index, bigger diff
+        file["hunks"][0]["lines"].extend({"kind": "add", "text": f"extra{LETTERS[index]}{line};", "new_no": 50 + line}
+                                         for line in range(index))
+        file["hunks"][0]["new_lines"] += index
+    snapshot, _, document = finalize(files)
+    (row,) = remainder_nodes(document)
+    members = row["pattern"]["members"]
+    sizes = {file["path"]: sum(line["kind"] != "ctx" for line in file["hunks"][0]["lines"]) for file in files}
+    assert row["files"] == sorted(members, key=lambda path: (-sizes[path], path))[:12]
+    cited = {ref["path"] for ref in row["evidence"]}
+    assert set(row["files"]) <= cited
+
+
+def test_one_or_two_leftover_files_get_ordinary_rows_beyond_the_budget():
+    for count, extra in ((13, 1), (14, 2)):
+        files = unlike_files(count)
+        snapshot, _, document = finalize(files)
+        skeleton = build_skeleton(snapshot, HEAD)
+        assert remainder_nodes(document) == [] and len(file_nodes(document)) == count
+        assert count - extra == skeleton["budget"]["max_rows_per_group"]
+        assert accounted(document) == {file["path"] for file in files}
+        assert not any("remainder" in gap or "row limit" in gap for gap in document["gaps"])
+    _, _, document = finalize(unlike_files(15))
+    (row,) = remainder_nodes(document)
+    assert row["pattern"]["count"] == 3 and len(file_nodes(document)) == 12
+
+
+def test_a_remainder_over_500_files_is_split_by_directory_and_the_node_cap_holds():
+    directories = [f"src/area{index}" for index in range(4)]
+    files = many_files(1500, directories=directories, lines=3, unique=True)
+    snapshot, _, document = finalize(files)
+    rows = remainder_nodes(document)
+    assert len(rows) >= 3 and all(3 <= row["pattern"]["count"] <= 500 for row in rows)
+    assert len(document["nodes"]) <= 60 and accounted(document) == {file["path"] for file in files}
+    assert {row["pattern"]["count"] for row in rows} != {1500}
+    validate_v2(document, HEAD, snapshot)
+
+
+def test_remainder_rows_take_their_slot_before_file_rows_so_the_sixty_node_cap_holds():
+    files = []
+    for area in range(12):
+        files += many_files(40, directories=[f"area{area:02d}/src"], lines=3, unique=True)
+    for index, file in enumerate(files):
+        file["path"] = file["path"].replace("/file", f"/f{index}_")
+    snapshot, skeleton, document = finalize(files)
+    assert len(document["nodes"]) <= 60 and len(remainder_nodes(document)) >= 1
+    assert accounted(document) == {file["path"] for file in files}
+    assert max(sum(node["group"] == group["id"] for node in file_nodes(document)) for group in document["groups"]) <= 4
+
+
+def test_a_remainder_row_has_no_import_edges_and_the_draft_is_deterministic():
+    files = unlike_files(30)
+    files[0]["hunks"][0]["lines"].append({"kind": "add", "text": "import x from './file1';", "new_no": 40})
+    files[0]["hunks"][0]["new_lines"] += 1
+    snapshot, _, document = finalize(files)
+    remainder_members = set(remainder_nodes(document)[0]["pattern"]["members"])
+    ids = {node["id"] for node in remainder_nodes(document)}
+    assert not any(edge["source"] in ids or edge["target"] in ids for edge in document["edges"])
+    _, skeleton, draft = build(files)
+    assert json.dumps(draft) == json.dumps(deterministic_v2_draft(skeleton, snapshot, HEAD)) and remainder_members
+
+
+def test_hunkless_files_join_a_remainder_row_but_a_remainder_of_only_hunkless_files_is_not_drawn():
+    files = unlike_files(14) + [make_file(f"src/misc/h{index}.ts", "renamed", old_path=f"src/old/h{index}.ts", no_hunks=True)
+                                for index in range(4)]
+    snapshot, _, document = finalize(files)
+    (row,) = remainder_nodes(document)
+    assert sum(path.startswith("src/misc/h") for path in row["pattern"]["members"]) == 4
+    assert all(not name.startswith("src/misc/h") for name in row["files"])
+    only = [make_file(f"src/misc/h{index}.ts", "renamed", old_path=f"src/old/h{index}.ts", no_hunks=True) for index in range(4)]
+    _, _, document = finalize(unlike_files(3) + only)
+    assert remainder_nodes(document) == [] and any("no usable hunk data" in gap for gap in document["gaps"])

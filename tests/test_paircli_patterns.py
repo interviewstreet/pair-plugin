@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paircli_patterns import (
     api_surface, api_total, category_members, change_signature, cluster_same_change, pattern_label, verify_pattern,
 )
-from snapshot_factory import make_file, make_hunk
+from snapshot_factory import letters, make_file, make_hunk
 
 
 def changed(path, added=(), removed=(), status="modified", **kwargs):
@@ -91,6 +91,89 @@ def test_signature_performance():
     assert len(signatures) == 1
 
 
+# --- change_signature: net change, comments ignored --------------------------------------------
+
+def test_signature_comment_only_edit_cancels_out():
+    edited = changed("a.ts", removed=["handle(request);"], added=["handle(request); // reviewed"])
+    assert change_signature(edited) is None
+    pure = changed("a.py", removed=["run()"], added=["run()  # reviewed"])
+    assert change_signature(pure) is None
+    both = changed("a.ts", removed=["handle(request);"], added=["handle(request); // reviewed", "audit();"])
+    assert change_signature(both) == change_signature(changed("b.ts", added=["audit();"]))
+
+
+def test_signature_comment_appended_to_different_lines_is_the_same():
+    first = changed("a.ts", removed=["foo(1);"], added=["foo(1); // reviewed", "audit(1);"])
+    second = changed("b.ts", removed=["bar(zzz);"], added=["bar(zzz); // reviewed", "audit(2);"])
+    third = changed("c.ts", removed=["baz();"], added=["baz(); // reviewed", "audit(3);"])
+    assert change_signature(first) == change_signature(second) == change_signature(third) is not None
+    assert change_signature(first) != change_signature(changed("d.ts", added=["audit(3); // x", "other();"]))
+
+
+def test_signature_large_pr_variants_collapse_to_the_inserted_line_kinds():
+    kinds = ["trace(ctx);", "audit(ctx.user);", "metrics.inc('hit');", "if (!ctx) return;"]
+    signatures = set()
+    for index in range(480):
+        existing = f"respond{index % 24}(req, {index});"
+        inserted = kinds[index % 4]
+        signatures.add(change_signature(changed(
+            f"zone{index % 7}/handlers/h{index}.ts", start=1 + index % 9,
+            removed=[existing], added=[inserted, existing + " // reviewed"])))
+    assert None not in signatures and len(signatures) == 4
+
+
+def test_signature_keeps_comment_markers_inside_urls_and_strings():
+    url = change_signature(changed("a.ts", added=['const home = "https://example.com/a"; // note']))
+    assert url == change_signature(changed("b.ts", added=['const home = "https://example.com/a";']))
+    assert url != change_signature(changed("c.ts", added=['const home = "https:";']))
+    assert change_signature(changed("a.ts", added=["fetch(https://x.dev/api);"])) != change_signature(
+        changed("a.ts", added=["fetch(https:"]))
+    quoted = change_signature(changed("a.ts", added=['const a = "x // y";']))
+    assert quoted != change_signature(changed("a.ts", added=['const a = "x']))
+    assert quoted == change_signature(changed("a.ts", added=['const a = "x // y";  // trailing']))
+    assert change_signature(changed("a.ts", added=["call();// glued"])) != change_signature(changed("a.ts", added=["call();"]))
+    # an unclosed quote keeps the rest of the line
+    assert change_signature(changed("a.ts", added=["it's // x"])) != change_signature(changed("a.ts", added=["it's"]))
+
+
+def test_signature_python_hash_comments():
+    assert change_signature(changed("a.py", removed=["x = 1"], added=["x = 1  # reviewed"])) is None
+    first = change_signature(changed("a.py", added=["audit()  # added", "# just a note"]))
+    assert first == change_signature(changed("b.py", added=["audit()"]))
+    string = change_signature(changed("a.py", added=['color = "#fff"']))
+    assert string != change_signature(changed("a.py", added=['color = "']))
+    assert change_signature(changed("a.py", added=["echo $# args"])) == change_signature(changed("b.py", added=["echo $# args  # c"]))
+    assert change_signature(changed("a.sh", added=["echo hi # c"])) == change_signature(changed("a.sh", added=["echo hi"]))
+    assert change_signature(changed("a.sql", added=["select 1 -- c"])) == change_signature(changed("a.sql", added=["select 1"]))
+    assert change_signature(changed("Makefile", added=["all: build # c"])) == change_signature(changed("Makefile", added=["all: build"]))
+
+
+def test_signature_pure_comment_files_have_none():
+    assert change_signature(changed("a.ts", added=["// reviewed", "   // again", "/* block */", "/**", " * doc", " */"])) is None
+    assert change_signature(changed("a.py", added=["# only a note"], removed=["# old note"])) is None
+    assert change_signature(changed("a.ts", added=["*ptr = 1;"])) is not None
+
+
+def test_signature_unknown_extensions_keep_comments():
+    marked = change_signature(changed("a.txt", added=["x // y"]))
+    assert marked != change_signature(changed("a.txt", added=["x"]))
+    assert change_signature(changed("a.txt", removed=["x"], added=["x // y"])) is not None
+    assert change_signature(changed("a.md", added=["// note"])) is not None
+
+
+def test_signature_status_still_matters_with_comments():
+    lines = ["audit(); // reviewed"]
+    signatures = {change_signature(changed("a.ts", added=lines, status=status)) for status in ("added", "modified", "deleted")}
+    assert len(signatures) == 3
+
+
+def test_signature_digit_only_edit_is_still_a_change():
+    bump = changed("package.json", removed=['  "version": "1.2.3",'], added=['  "version": "1.3.0",'])
+    assert change_signature(bump) == change_signature(changed("b/package.json", removed=['  "version": "9.9.9",'],
+                                                                 added=['  "version": "2.0.0",']))
+    assert change_signature(bump) is not None
+
+
 # --- cluster_same_change ------------------------------------------------------------------------
 
 def deleted_template(count, directory="src/legacy"):
@@ -121,6 +204,15 @@ def test_modified_files_cluster_and_mixed_status_not_merged():
     clusters = cluster_same_change(modified + added)
     assert [(cluster["status"], len(cluster["members"])) for cluster in clusters] == [("modified", 6), ("added", 3)]
     assert (clusters[0]["additions"], clusters[0]["deletions"]) == (6, 6)
+
+
+def test_comment_only_files_do_not_join_a_cluster_and_comment_noise_does_not_split_one():
+    commented = [changed(f"a/c{index}.ts", removed=[f"call{letters(index)}();"],
+                         added=[f"call{letters(index)}(); // reviewed", "audit();"]) for index in range(4)]
+    comment_only = [changed(f"b/n{index}.ts", removed=["x();"], added=["x(); // reviewed"]) for index in range(5)]
+    (cluster,) = cluster_same_change(commented + comment_only)
+    assert cluster["members"] == sorted(file["path"] for file in commented)
+    assert (cluster["additions"], cluster["deletions"]) == (8, 4)
 
 
 def test_cluster_below_min_members_dropped_and_none_signatures_ignored():
@@ -293,6 +385,34 @@ def test_verify_garbage_files_by_path():
     assert len(verify_pattern(pattern, {path: None for path in pattern["members"]})) == 4
 
 
+def test_verify_same_change_member_with_comment_only_edit_has_no_signature():
+    pattern, by_path = valid_pattern()
+    bad = dict(by_path)
+    bad[pattern["members"][0]] = changed(pattern["members"][0], removed=["x();"], added=["x(); // reviewed"])
+    errors = verify_pattern(pattern, bad)
+    assert list(reasons(errors)) == ["pattern.members[0]"] and "net changed line" in errors[0]["reason"]
+
+
+def test_verify_remainder_family():
+    files = {f"src/f{index}.ts": changed(f"src/f{index}.ts", added=[f"unique{letters(index)}();"]) for index in range(5)}
+    members = sorted(files)
+    assert verify_pattern({"family": "remainder", "count": 5, "members": members}, files) == []
+    assert verify_pattern({"family": "remainder", "count": 3, "members": members[:3]}, files) == []
+    # a same-change signature has no place on a remainder row, not even an empty one
+    assert "pattern.signature" in reasons(verify_pattern(
+        {"family": "remainder", "count": 3, "members": members[:3], "signature": "0" * 16}, files))
+    assert "pattern.signature" in reasons(verify_pattern(
+        {"family": "remainder", "count": 3, "members": members[:3], "signature": None}, files))
+    assert "pattern.members" in reasons(verify_pattern({"family": "remainder", "count": 2, "members": members[:2]}, files))
+    assert "pattern.members[1]" in reasons(verify_pattern(
+        {"family": "remainder", "count": 3, "members": [members[0], "nope.ts", members[2]]}, files))
+    assert "pattern.members[1]" in reasons(verify_pattern(
+        {"family": "remainder", "count": 3, "members": [members[0], members[0], members[2]]}, files))
+    big = {f"m{index}.ts": changed(f"m{index}.ts", added=["a();"]) for index in range(501)}
+    assert verify_pattern({"family": "remainder", "count": 500, "members": sorted(big)[:500]}, big) == []
+    assert "pattern.members" in reasons(verify_pattern({"family": "remainder", "count": 501, "members": sorted(big)}, big))
+
+
 def test_verify_caps_errors():
     members = [f"m{index}.ts" for index in range(500)]
     errors = verify_pattern({"family": "tests", "count": 500, "members": members}, {})
@@ -311,6 +431,8 @@ def test_pattern_labels():
     assert pattern_label("docs", 6) == "6 doc files"
     assert pattern_label("config", 4) == "4 config files"
     assert pattern_label("tests", 1) == "1 test file"
+    assert pattern_label("remainder", 369) == "369 other changed files"
+    assert pattern_label("remainder", 1) == "1 other changed file"
     assert pattern_label("bogus", 5) == "5 files"
     assert pattern_label(None, None, 3) == "0 files"
     assert len(pattern_label("same-change", 10 ** 100, "modified")) <= 80

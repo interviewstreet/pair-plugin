@@ -11,10 +11,16 @@ odd shapes; unreadable input counts as "no changed lines".
   pattern_label(family, count, ...) the short row label
   api_surface(file), api_total(fs)  lexical counts of exported names added and removed
 
-Change signature: sha256 over the file status and the sorted set of its distinct added and deleted lines (how often a
-line repeats is ignored), each trimmed, with every run of ASCII digits replaced by `#`. Context lines and lines that are empty
-after trimming are ignored; an add and a delete of the same text stay distinct. A file with no such
-line (binary, no hunks, whitespace-only edits) has no signature.
+Change signature: sha256 over the file status and the sorted sets of its NET added and NET deleted lines (how
+often a line repeats is ignored). Each changed line is trimmed and loses a trailing line comment; lines that are
+empty or pure comments after that are ignored, as are context lines. The net change is `added - deleted` and
+`deleted - added` as sets, so a line edited only in its comment (delete `x();`, add `x(); // reviewed`) cancels out,
+and the same comment appended to different lines of different files gives the same signature. Only then does every
+run of ASCII digits in the remaining lines become `#` (so a version bump is still a change). Comments are
+recognised by file extension: `//` for ts/js/go/java/c/rs and similar, `#` for py/sh/rb/yaml/toml/Makefile, `--` for
+sql/lua, plus `/* ... */` and `*` lines in the `//` languages. A marker counts only at the start of the line or after
+whitespace and outside a quoted span, so `https://x` and `"a // b"` stay intact; unknown extensions are not
+stripped. A file with no net changed line (binary, no hunks, whitespace-only or comment-only edits) has no signature.
 
 API surface (see docs/architecture-v2-contract.md): lexical, one language per file extension.
   TypeScript/JavaScript  `export` declarations (function, class, const, let, var, type, interface, enum,
@@ -40,7 +46,7 @@ import re
 from paircli_skeleton import _line_kind, classify
 
 SIGNATURE_CHARS = 16
-FAMILIES = ("same-change", "tests", "docs", "config")
+FAMILIES = ("same-change", "tests", "docs", "config", "remainder")
 CATEGORY_FAMILIES = {"tests": "test", "docs": "docs", "config": "config"}  # family -> skeleton category
 MIN_MEMBERS = 3
 MAX_MEMBERS = 500
@@ -107,18 +113,80 @@ def _path(file) -> str:
 
 # --- change signature ---------------------------------------------------------------------------
 
+SLASH_LANGUAGES = frozenset("ts tsx js jsx mjs cjs go java c h cc cpp cxx hpp rs kt kts swift cs php scala dart".split())
+HASH_LANGUAGES = frozenset("py sh bash zsh rb yaml yml toml pl r mk dockerfile".split())
+DASH_LANGUAGES = frozenset({"sql", "lua"})
+HASH_NAMES = frozenset({"makefile", "gnumakefile", "dockerfile"})
+QUOTES = "\"'`"
+
+
+def _comment_marker(path: str) -> str | None:
+    """The line-comment marker of a file's language by extension, or None when its comments are unknown."""
+    name = path.rsplit("/", 1)[-1].lower()
+    extension = name.rsplit(".", 1)[-1] if "." in name else ""
+    if extension in SLASH_LANGUAGES:
+        return "//"
+    if extension in HASH_LANGUAGES or name in HASH_NAMES:
+        return "#"
+    if extension in DASH_LANGUAGES:
+        return "--"
+    return None
+
+
+def _strip_comment(text: str, marker: str) -> str:
+    """`text` (already trimmed) without a trailing line comment; unchanged when unsure.
+
+    The marker must sit at the start or after whitespace and outside a quoted span (an unclosed quote
+    keeps the rest of the line, so an odd line is never cut). C-like languages also lose a
+    trailing `/* ... */`, and a line that is only a block-comment line (`/*`, `*`, `*/`) is emptied.
+    """
+    c_like = marker == "//"
+    if c_like and (text == "*" or text.startswith(("*/", "* ", "*\t")) or (
+            text.startswith("/*") and ("*/" not in text or text.endswith("*/")))):
+        return ""
+    quote, index, size = "", 0, len(text)
+    while index < size:
+        char = text[index]
+        if quote:
+            if char == "\\":
+                index += 1
+            elif char == quote:
+                quote = ""
+        elif char in QUOTES:
+            quote = char
+        elif (text.startswith(marker, index) or (c_like and text.startswith("/*", index) and text.endswith("*/"))) \
+                and (index == 0 or text[index - 1].isspace()):
+            return text[:index].rstrip()
+        index += 1
+    return text
+
+
+def _net_lines(file) -> tuple[list[str], list[str]]:
+    """The sorted net added and net deleted lines of a file, without comment noise and digit-normalised.
+
+    The net sets are taken before digits become `#`, so a line changed only in a digit (a version bump)
+    still counts as a change, while one changed only in its comment cancels out.
+    """
+    marker = _comment_marker(_path(file))
+    added: set[str] = set()
+    deleted: set[str] = set()
+    for kind, text in _changed_lines(file):
+        text = text.strip()
+        if marker and text:
+            text = _strip_comment(text, marker)
+        if text:
+            (added if kind == "add" else deleted).add(text)
+    return (sorted({DIGITS.sub("#", text) for text in added - deleted}),
+            sorted({DIGITS.sub("#", text) for text in deleted - added}))
+
+
 def change_signature(file) -> str | None:
-    """Return the 16-hex change signature of a snapshot file entry, or None without changed lines."""
+    """Return the 16-hex change signature of a snapshot file entry, or None without a net changed line."""
     try:
-        lines = []
-        for kind, text in _changed_lines(file):
-            text = text.strip()
-            if text:
-                lines.append(("+" if kind == "add" else "-") + DIGITS.sub("#", text))
-        if not lines:
+        added, deleted = _net_lines(file)
+        if not added and not deleted:
             return None
-        lines = sorted(set(lines))
-        payload = json.dumps([_text(file.get("status")), lines], ensure_ascii=False, separators=(",", ":"))
+        payload = json.dumps([_text(file.get("status")), added, deleted], ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:SIGNATURE_CHARS]
     except Exception:  # noqa: BLE001 - odd input must never break a diagram
         return None
@@ -263,6 +331,8 @@ def verify_pattern(pattern, files_by_path) -> list[dict]:
     signature = pattern.get("signature")
     if family == "same-change" and (not isinstance(signature, str) or not signature):
         fail("pattern.signature", "same-change needs a signature")
+    if family == "remainder" and "signature" in pattern:
+        fail("pattern.signature", "a remainder pattern has no signature")
     seen: set[str] = set()
     for index, member in enumerate(members):
         where = f"pattern.members[{index}]"
@@ -280,7 +350,7 @@ def verify_pattern(pattern, files_by_path) -> list[dict]:
         if family == "same-change" and isinstance(signature, str) and signature:
             actual = change_signature(file)
             if actual is None:
-                fail(where, f"{member} has no changed lines, so no change signature")
+                fail(where, f"{member} has no net changed line (comments ignored), so no change signature")
             elif actual != signature:
                 fail(where, f"{member} has change signature {actual}, not {signature}")
         elif family in CATEGORY_FAMILIES and classify(member)[1] != CATEGORY_FAMILIES[family]:
@@ -301,6 +371,8 @@ def pattern_label(family, count, status=None) -> str:
         label = f"{number} doc file" + ("" if number == 1 else "s")
     elif family == "config":
         label = f"{number} config file" + ("" if number == 1 else "s")
+    elif family == "remainder":
+        label = f"{number} other changed file" + ("" if number == 1 else "s")
     else:
         label = files
     return label[:MAX_LABEL_CHARS]

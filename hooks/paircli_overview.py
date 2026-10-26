@@ -661,6 +661,84 @@ def check_overview_step(step, path: str, graph: Graph, check) -> None:
                       "both endpoints of the edge must be in the step's components")
 
 
+COUNT_CLAIM = re.compile(r"\b(\d[\d,]*)\s+(?:more\s+)?(?:files?|handlers?|modules?|lines?|components?)\b", re.IGNORECASE)
+CODE_SPAN = re.compile(r"`[^`\n]*`|\"[^\"\n]*\"|'[^'\n]*'")
+SMALL_COUNT = 3  # "2 files" or "3 handlers" is plain counting of what the lines show; only larger numbers are checked
+
+
+def count_claims(text) -> list[int]:
+    """Numbers written as counts ("111 files", "40 more lines") outside code spans and quotes."""
+    if not isinstance(text, str):
+        return []
+    claims = []
+    for match in COUNT_CLAIM.finditer(CODE_SPAN.sub(" ", text)):
+        try:
+            claims.append(int(match.group(1).replace(",", "")))
+        except ValueError:
+            continue
+    return claims
+
+
+def known_counts(component: dict, nodes: dict[str, dict]) -> set[int]:
+    """Every count code knows about a component: its stats, its members' stats, files and pattern counts, and sums."""
+    values: set[int] = set()
+    stats = component.get("stats") if isinstance(component.get("stats"), dict) else {}
+    values.update(count_of(stats.get(key)) for key in STATS_KEYS)
+    values.add(count_of(stats.get("additions")) + count_of(stats.get("deletions")))
+    parts: list[int] = []
+    for name in component.get("members") if isinstance(component.get("members"), list) else []:
+        node = nodes.get(name) if isinstance(name, str) else None
+        if node is None:
+            continue
+        own = node.get("stats") if isinstance(node.get("stats"), dict) else {}
+        pattern = node.get("pattern") if isinstance(node.get("pattern"), dict) else {}
+        found = [count_of(own.get(key)) for key in STATS_KEYS] + [count_of(pattern.get("count")), len(member_files(node))]
+        values.update(found)
+        values.add(count_of(own.get("additions")) + count_of(own.get("deletions")))
+        parts += [count_of(own.get("files")), count_of(pattern.get("count")), len(member_files(node))]
+    parts = [part for part in parts if part]
+    values.update(parts)
+    for position, first in enumerate(parts):
+        values.update(first + second for second in parts[position + 1:])
+    return values
+
+
+def check_count_claims(overview: dict, document, snapshot, check) -> None:
+    """Reject prose counts ("111 files") that no computed count backs; unsure cases pass.
+
+    Applies to model-written overviews only (the deterministic one is written by code). Numbers up to 3,
+    in code spans and in quotes are ignored. A number passes when it equals a computed count of the
+    component (or of both ends of an edge, or of the step's components), a sum of two such member counts,
+    or a PR-wide total.
+    """
+    nodes = document_nodes(document)
+    components = {c["id"]: c for c in dicts(overview.get("components")) if isinstance(c.get("id"), str)}
+    allowed = {name: known_counts(component, nodes) for name, component in components.items()}
+    pr_files = dicts(SnapshotIndex(snapshot).pr.get("files"))
+    totals = {len(pr_files)}
+    totals.update(sum(count_of(c.get("stats", {}).get(key)) for c in components.values() if isinstance(c.get("stats"), dict))
+                  for key in STATS_KEYS)
+    totals.add(sum(count_of(c.get("stats", {}).get("additions")) + count_of(c.get("stats", {}).get("deletions"))
+                   for c in components.values() if isinstance(c.get("stats"), dict)))
+
+    def verify(text, path: str, names) -> None:
+        known = set(totals)
+        for name in names if isinstance(names, list) else []:
+            if isinstance(name, str):
+                known |= allowed.get(name, set())
+        for number in count_claims(text):
+            check(number <= SMALL_COUNT or number in known, path,
+                  f"states the count {number} in prose; the code computes counts, write \"the repeated edit\" or "
+                  "\"many files\" instead, or copy a number from a digest count or stats field exactly")
+
+    for position, component in enumerate(dicts(overview.get("components"))):
+        verify(component.get("description"), f"overview.components[{position}].description", [component.get("id")])
+    for position, edge in enumerate(dicts(overview.get("edges"))):
+        verify(edge.get("claim"), f"overview.edges[{position}].claim", [edge.get("source"), edge.get("target")])
+    for position, step in enumerate(dicts(overview.get("steps"))):
+        verify(step.get("text"), f"overview.steps[{position}].text", step.get("components"))
+
+
 def validate_overview(overview, document, head: str, snapshot) -> None:
     """Raise ArchitectureError listing every contract violation, or return None when valid."""
     errors: list[dict] = []
@@ -692,6 +770,8 @@ def validate_overview(overview, document, head: str, snapshot) -> None:
 
     check(document.get("head_sha") == head, "overview", "the detailed document must be the one of the current head")
     graph = check_overview(overview, document, head, index, check)
+    if overview.get("generated_by") == "llm":
+        check_count_claims(overview, document, snapshot, check)
     steps = overview.get("steps", [])
     if check(isinstance(steps, list) and len(steps) <= MAX_STEPS, "overview.steps", f"must be a list of at most {MAX_STEPS}"):
         seen: set[str] = set()
@@ -975,11 +1055,19 @@ Rules:
    ("members": 1 to 40 node ids, copied exactly; a node is in at most one component; never a routine node).
    label: at most 40 characters, the name a developer would use. description: one or two plain sentences,
    at most 300 characters, leading with what the component now does or what changed in its behaviour.
+   Name each component for what it does or what the change is, never for the directory of a sample file
+   when a member's pattern.directories is above 1 (pattern.common_dir is the shared directory, "" if none).
+   A component may hold several pattern rows of related edits: name it for their shared purpose.
    Never use the id "other": code collects every node you leave out (tests, docs, config, small files) into a
    component named "Other changes". Leave tests, docs and config out unless they are the point of the PR.
 2. kind "context": something that matters but is not a changed file (a process, a database, a service). Use
    it only when the diff shows it is used. members is [], evidence is 1 to 12 diff citations of the lines that
-   show it, and it must be an endpoint of at least one edge.
+   show it, and it must be an endpoint of at least one edge. When a changed server component starts,
+   proxies or calls the context component, put the edge between that server component and the context
+   component (label such as "spawn, proxy"), route client edges to the server component, never straight to
+   the context one, and say it is started by the server when the diff shows that; cite the lines that start
+   or call it. A security or trust boundary the diff adds (an allowlist, auth check, sandbox, proxy,
+   permission gate) gets its own component or step that says plainly what it allows or blocks, from cited lines.
 3. groups: at most 8, each {{id, label}} (label at most 40 characters); every component names one. Layout
    is computed, so do not order them.
 4. edges: at most 30, source and target are different component ids. An edge is a RUNTIME action in one to
@@ -999,9 +1087,16 @@ Rules:
    no_line_data.
 7. Grounding (reviewers fact-check you against the diff, so say less rather than guess): base every
    description, claim and step on the cited code and the code around it, never on the PR title or description
-   (pr_title_hint in the digest may be wrong or stale). Mention only identifiers, flags, paths and counts you
-   can see in the cited code. Do not invent components or relations. Every member id must come from the
-   digest. The digest's "baseline" is a mechanical grouping you may start from or improve on.
+   (pr_title_hint in the digest may be wrong or stale). Mention only identifiers, flags and paths you can see
+   in the cited code. Do not invent components or relations. Every member id must come from the digest. The
+   digest's "baseline" is a mechanical grouping you may start from or improve on.
+8. Numbers: never write file, line, handler or percentage counts in prose; code computes them (component
+   stats). Write "the repeated edit" or "many files", not a number. Copy a number only from a digest field
+   named count or stats, verbatim; sampled members are not the whole set. A count that does not match is rejected.
+9. No "only", "just", "all", "every" or "none" about what a file or route serves, calls or contains unless the
+   cited lines are its whole definition. Prefer "includes" and "such as"; call listed endpoints or exports examples.
+10. Verified facts, only after reading the file around the cited lines, otherwise omit them: "the removed call
+   sat after return, so behaviour does not change"; "the imports name something the target does not export".
 """
     if errors:
         prompt += f"""
@@ -1014,6 +1109,27 @@ Fix them and return the corrected full JSON object only, or null if you cannot g
 
 def size_of(value) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def directory_facts(files: list[str]) -> dict:
+    """Computed `directories` (distinct member directories) and `common_dir` (shared prefix, "" if none)."""
+    return {"directories": len({"/".join(name.split("/")[:-1]) for name in files}),
+            "common_dir": common_directory(files) if files else ""}
+
+
+def baseline_component(component: dict, nodes: dict[str, dict], index: SnapshotIndex) -> dict:
+    """A baseline hint with the true, computed `stats` and directory facts of its members."""
+    ids = component.get("members")
+    entry = {"id": component.get("id"), "label": component.get("label"), "members": ids}
+    try:
+        stats = member_facts(ids, nodes, index)["stats"]
+        entry["stats"] = {key: stats[key] for key in STATS_KEYS if stats.get(key)}
+        files = component_files(component, nodes)
+        if files:
+            entry.update(directory_facts(files))
+    except Exception:  # the hint is optional; never fail the digest over it
+        pass
+    return entry
 
 
 def build_overview_digest(document, snapshot, baseline=None) -> dict:
@@ -1037,7 +1153,8 @@ def build_overview_digest(document, snapshot, baseline=None) -> dict:
         pattern = node.get("pattern") if isinstance(node.get("pattern"), dict) else None
         if node.get("kind") == "pattern" and pattern:
             members = pattern.get("members") if isinstance(pattern.get("members"), list) else []
-            row["pattern"] = {"family": pattern.get("family"), "members": count_of(pattern.get("count")) or len(members)}
+            row["pattern"] = {"family": pattern.get("family"), "count": count_of(pattern.get("count")) or len(members),
+                              **directory_facts(member_files(node))}
         if node.get("kind") == "routine":
             row["claimable"] = False
         if isinstance(node.get("files"), list) and node["files"] and not any(
@@ -1052,9 +1169,9 @@ def build_overview_digest(document, snapshot, baseline=None) -> dict:
     digest = {"pr_title_hint": short(pr.get("title"), 200), "groups": groups, "nodes": rows, "edges": edges,
               "steps": steps}
     if isinstance(baseline, dict):
+        by_id = document_nodes(document)
         digest["baseline"] = {
-            "components": [{"id": c.get("id"), "label": c.get("label"), "members": c.get("members")}
-                           for c in dicts(baseline.get("components"))],
+            "components": [baseline_component(c, by_id, index) for c in dicts(baseline.get("components"))],
             "edges": [{"source": e.get("source"), "target": e.get("target"), "label": e.get("label")}
                       for e in dicts(baseline.get("edges"))]}
 
