@@ -262,5 +262,35 @@ the model's diagram was not used ("llm output failed validation", "llm returned 
 lines", "deterministic diagram failed: <class>"). Like the rest of `diagnostics/` it stays out of the
 ZIP.
 
+## Schema v2 artifact
+
+`scan()` also writes `generated_artifacts/architecture.v2.json` (schema in
+`docs/architecture-v2-contract.md`) after the v1 diagram step. ADE does not read it yet, and v1
+(`architecture.json`, `diagnostics/architecture-status.json`) is unchanged and runs first, so a v2
+failure never touches it. The ZIP carries v2 under its normal path and as a root alias, like v1.
+
+- **Tiers.** `llm`: the model narrates the deterministic draft (one call per group, then one merge
+  call) and the result is validated. `deterministic`: the draft itself, when the harness is missing
+  or unsupported, no model output applied, or the LLM step failed. `none`: docs-only or no citable
+  lines, or even the deterministic write failed; no file is written. `generated_by` in the document
+  is `llm` or `deterministic`. An older v2 file is removed at the start of every run, so a failed
+  run never uploads a stale diagram. Nothing in the step can fail the scan.
+- **Environment.** `PAIRCLI_ARCHITECTURE_V2=0` turns v2 off (default on). `PAIRCLI_ARCH_LLM_GROUPS`
+  (default 8, at most 12; 0 means no group calls), `PAIRCLI_ARCH_CONCURRENCY` (default 3, at most 8),
+  `PAIRCLI_ARCH_CALL_TIMEOUT` (seconds per call, default 120) and `PAIRCLI_ARCH_DEADLINE` (seconds
+  for all calls, default 240). `PAIRCLI_MODEL_SUMMARY`, `PAIRCLI_MODEL_GROUP` and `PAIRCLI_MODEL_MERGE`
+  choose the model per stage; unset means the harness default. No model name is hardcoded.
+- **Added scan time.** The step starts after v1, so the worst case it adds is about
+  `PAIRCLI_ARCH_DEADLINE` (240 s by default) on top of the summary and v1 time; the deterministic
+  parts take well under a second.
+- **Cache.** Accepted group and merge answers are cached in `<git toplevel>/.paircli/cache/architecture-v2/`
+  (keyed by the hunks, harness and model), so a re-scan of an unchanged group makes no call. The
+  cache is local and never uploaded.
+- **Diagnostics** (local only, excluded from the ZIP): `diagnostics/architecture-v2-status.json`
+  (`tier`, `reason`, `generated_by`, `counts` of groups, nodes, edges and steps, and the `llm_calls`
+  stats) and `diagnostics/architecture-llm/` (per-call inputs, raw answers, errors and `stats.json`).
+  `scan()` logs one line such as `architecture v2: tier=llm groups_llm_ok=5/8 merge=ok
+  steps_dropped=1 cache_hits=2`.
+
 This does not change upload paths, capture offsets, publication versioning, or the
 separate `/pair` JSON review-brief agent contract.

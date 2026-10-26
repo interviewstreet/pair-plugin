@@ -83,3 +83,41 @@ def test_archive_bytes_ignore_file_timestamps(tmp_path):
     first = create_pr_archive(tmp_path, folder).read_bytes()
     os.utime(summary, (1_000_000, 1_000_000))
     assert create_pr_archive(tmp_path, folder).read_bytes() == first
+
+
+def test_both_architecture_files_get_a_zip_root_alias_and_diagnostics_stay_out(tmp_path):
+    folder = tmp_path / ".paircli" / "pr-42" / ("a" * 40)
+    (folder / "generated_artifacts").mkdir(parents=True)
+    (folder / "diagnostics" / "architecture-llm").mkdir(parents=True)
+    (folder / "summary.md").write_text("summary")
+    (folder / "generated_artifacts" / "architecture.json").write_text('{"schema_version": 1}')
+    (folder / "generated_artifacts" / "architecture.v2.json").write_text('{"schema_version": 2}')
+    (folder / "generated_artifacts" / "other.json").write_text("{}")
+    (folder / "diagnostics" / "architecture-v2-status.json").write_text("{}")
+    (folder / "diagnostics" / "architecture-llm" / "stats.json").write_text("{}")
+
+    with zipfile.ZipFile(create_pr_archive(tmp_path, folder)) as archive:
+        names = archive.namelist()
+        assert len(names) == len(set(names))
+        assert sorted(names) == sorted([
+            "overview.md",
+            f".paircli/pr-42/{'a' * 40}/summary.md",
+            f".paircli/pr-42/{'a' * 40}/generated_artifacts/architecture.json",
+            f".paircli/pr-42/{'a' * 40}/generated_artifacts/architecture.v2.json",
+            f".paircli/pr-42/{'a' * 40}/generated_artifacts/other.json",
+            "generated_artifacts/architecture.json",
+            "generated_artifacts/architecture.v2.json",
+        ])
+        assert archive.read("generated_artifacts/architecture.v2.json") == b'{"schema_version": 2}'
+        assert archive.read("generated_artifacts/architecture.json") == b'{"schema_version": 1}'
+
+
+def test_v2_alone_is_aliased_when_v1_is_missing(tmp_path):
+    folder = tmp_path / ".paircli" / "pr-42" / ("a" * 40)
+    (folder / "generated_artifacts").mkdir(parents=True)
+    (folder / "summary.md").write_text("summary")
+    (folder / "generated_artifacts" / "architecture.v2.json").write_text("{}")
+
+    with zipfile.ZipFile(create_pr_archive(tmp_path, folder)) as archive:
+        assert "generated_artifacts/architecture.v2.json" in archive.namelist()
+        assert "generated_artifacts/architecture.json" not in archive.namelist()

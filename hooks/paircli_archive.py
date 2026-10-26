@@ -10,6 +10,8 @@ from pathlib import Path
 
 
 MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
+# Also stored at the ZIP root, where ADE's extracted-bundle reader looks for them.
+ROOT_ALIASES = ("generated_artifacts/architecture.json", "generated_artifacts/architecture.v2.json")
 
 
 def _write_entry(archive, source: Path, name: str) -> None:
@@ -53,8 +55,9 @@ def create_pr_archive(repo_dir: Path, artifact_dir: Path) -> Path:
                         raise ValueError(f"PR artifact contains a symlink: {path.relative_to(folder)}")
                     if path.is_file():
                         _write_entry(archive, path, path.relative_to(repo_root).as_posix())
-                        if path.relative_to(folder).as_posix() == "generated_artifacts/architecture.json":
-                            _write_entry(archive, path, "generated_artifacts/architecture.json")
+                        relative_name = path.relative_to(folder).as_posix()
+                        if relative_name in ROOT_ALIASES:
+                            _write_entry(archive, path, relative_name)
                     elif not path.is_dir():
                         raise ValueError(f"PR artifact contains a non-file: {path.relative_to(folder)}")
         size = temporary.stat().st_size

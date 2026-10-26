@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -25,8 +26,15 @@ from paircli_architecture import (
     llm_failure_reason, record_llm_diagram, remove_stale_architecture, write_architecture,
     write_fallback_architecture,
 )
+from paircli_architecture_llm import generate_v2
+from paircli_architecture_v2 import finalize_v2, validate_v2
+from paircli_architecture_v2_draft import (
+    STATUS_V2, deterministic_v2_draft, remove_stale_architecture_v2, write_architecture_v2,
+    write_no_architecture_v2,
+)
+from paircli_skeleton import build_skeleton
 from paircli_summary import (
-    EvidenceMissingError, STATUS_OUTPUT, agent_runner, write_fallback_summary, write_summary,
+    EvidenceMissingError, STATUS_OUTPUT, agent_runner, stage_model, write_fallback_summary, write_summary,
 )
 from paircli_snapshot import captured_pr, count_files, files_without_line_data
 from paircli_tls import compatible_tls_context
@@ -875,6 +883,102 @@ def run_diagram_step(harness: str, repo_dir: Path, artifact_dir: Path, log) -> P
         return None
 
 
+def _v2_log(log, message: str) -> None:
+    try:
+        log.write(message if message.endswith("\n") else message + "\n")
+    except Exception:
+        pass
+
+
+def _v2_no_diagram(artifact_dir: Path, reason: str, log) -> None:
+    """Record tier "none" and remove any older v2 diagram; never raises."""
+    try:
+        remove_stale_architecture_v2(artifact_dir)
+        write_no_architecture_v2(artifact_dir, reason, log)
+    except Exception as error:
+        _v2_log(log, f"architecture v2: could not record the skipped diagram ({type(error).__name__})")
+
+
+def _v2_deterministic(draft, snapshot, head: str, artifact_dir: Path, reason: str, log) -> Path:
+    document, _warnings = finalize_v2(draft, head, snapshot, "deterministic")
+    path = write_architecture_v2(artifact_dir, document, log, tier="deterministic", reason=reason)
+    _v2_log(log, f"architecture v2: tier=deterministic reason={reason}")
+    return path
+
+
+def run_diagram_v2_step(harness: str, repo_dir: Path, artifact_dir: Path, log) -> Path | None:
+    """Write generated_artifacts/architecture.v2.json (schema v2); nothing here may raise or touch v1.
+
+    Tiers: the model narrates the deterministic draft (`generate_v2`), else the draft itself is
+    written, else no file. An older v2 diagram and status are removed first so a failed run never
+    leaves a diagram that describes another run. PAIRCLI_ARCHITECTURE_V2=0 skips the step.
+    """
+    try:
+        head = artifact_dir.name
+        draft = snapshot = None
+        try:
+            remove_stale_architecture_v2(artifact_dir)
+            if not (artifact_dir / "diagnostics").is_symlink():
+                (artifact_dir / "diagnostics" / STATUS_V2).unlink(missing_ok=True)
+            if os.environ.get("PAIRCLI_ARCHITECTURE_V2", "1").strip() == "0":
+                _v2_log(log, "architecture v2: disabled by PAIRCLI_ARCHITECTURE_V2=0")
+                return None
+            try:
+                snapshot = json.loads((artifact_dir / "snapshot.json").read_text(encoding="utf-8"))
+                if not isinstance(snapshot, dict):
+                    raise ValueError("snapshot.json is not an object")
+            except (OSError, ValueError) as error:
+                _v2_log(log, f"architecture v2: snapshot unreadable ({type(error).__name__}); no v2 diagram")
+                _v2_no_diagram(artifact_dir, "snapshot unreadable", log)
+                return None
+            skeleton = build_skeleton(snapshot, head)
+            draft = deterministic_v2_draft(skeleton, snapshot, head)
+            if draft is None:
+                reason = ("docs-only change" if skeleton.get("docs_only")
+                          else "no citable lines" if skeleton.get("no_citable_lines") else "nothing to draw")
+                _v2_log(log, f"architecture v2: tier=none reason={reason}")
+                _v2_no_diagram(artifact_dir, reason, log)
+                return None
+            try:
+                runner = agent_runner(harness)
+            except Exception as error:
+                _v2_log(log, f"architecture v2: no model available ({error}); using the deterministic diagram")
+                return _v2_deterministic(draft, snapshot, head, artifact_dir, "llm unavailable", log)
+
+            def generate(prompt, *, timeout, model):
+                return runner(prompt, repo_dir, timeout=timeout, model=model)
+
+            result = generate_v2(artifact_dir, snapshot, head, copy.deepcopy(draft), generate, log,
+                                 harness=harness, skeleton=skeleton,
+                                 group_model=stage_model("group"), merge_model=stage_model("merge"))
+            document, stats = result["document"], result.get("stats") or {}
+            validate_v2(document, head, snapshot)
+            tier = "llm" if document.get("generated_by") == "llm" else "deterministic"
+            if tier == "llm":
+                reason = f"llm groups ok: {stats.get('groups_llm_ok')}/{stats.get('groups_selected')}, merge {stats.get('merge')}"
+                if stats.get("degraded"):
+                    reason += f" (degraded: {stats['degraded']})"
+            else:
+                reason = "no llm output applied"
+            path = write_architecture_v2(artifact_dir, document, log, tier=tier, reason=reason, llm_calls=stats)
+            _v2_log(log, f"architecture v2: tier={tier} groups_llm_ok={stats.get('groups_llm_ok')}/"
+                         f"{stats.get('groups_selected')} merge={stats.get('merge')} "
+                         f"steps_dropped={stats.get('steps_dropped')} cache_hits={stats.get('cache_hits')}")
+            return path
+        except Exception as error:
+            _v2_log(log, f"architecture v2 failed ({type(error).__name__}: {str(error)[:200]}); trying the deterministic diagram")
+            reason = f"v2 error: {type(error).__name__}"
+            if draft is not None and snapshot is not None:
+                try:
+                    return _v2_deterministic(draft, snapshot, head, artifact_dir, reason, log)
+                except Exception as fallback_error:
+                    _v2_log(log, f"architecture v2 fallback failed ({type(fallback_error).__name__}); no v2 diagram")
+            _v2_no_diagram(artifact_dir, reason, log)
+            return None
+    except Exception:
+        return None
+
+
 def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
     """Generate CLI evidence, then have the triggering agent write summary.md."""
     home = onboarding_home()
@@ -903,6 +1007,8 @@ def scan(log: Path, pr_url: str, repo_dir: Path, harness: str) -> int:
             output.write(f"wrote {summary} (summary mode: {summary_mode(artifact_dir)})\n")
             diagram = run_diagram_step(harness, root, artifact_dir, output)
             output.write(f"architecture diagram: {'produced' if diagram else 'not produced'}\n")
+            diagram_v2 = run_diagram_v2_step(harness, root, artifact_dir, output)
+            output.write(f"architecture v2 diagram: {'produced' if diagram_v2 else 'not produced'}\n")
             archive = create_pr_archive(root, artifact_dir)
             output.write(f"packaged {archive}\n")
             artifact_id = ""
