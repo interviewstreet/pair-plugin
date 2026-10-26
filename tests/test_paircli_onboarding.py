@@ -293,8 +293,28 @@ def fault_scan(monkeypatch, tmp_path, *, evidence=True, commits=None):
     return repo, artifacts, uploads
 
 
+class Globals:
+    """Attribute access over a module's globals, so patches reach the copy `onboarding` actually runs."""
+
+    def __init__(self, namespace):
+        object.__setattr__(self, "_namespace", namespace)
+
+    def __getattr__(self, name):
+        try:
+            return self._namespace[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __setattr__(self, name, value):
+        self._namespace[name] = value
+
+    def __delattr__(self, name):
+        del self._namespace[name]
+
+
 def summary_module():
-    return sys.modules[onboarding.agent_runner.__module__]
+    # test_paircli_summary re-executes paircli_summary, so sys.modules may hold a different copy.
+    return Globals(onboarding.agent_runner.__globals__)
 
 
 def test_scan_falls_back_when_summary_generation_raises_and_removes_stale_summary(monkeypatch, tmp_path):
