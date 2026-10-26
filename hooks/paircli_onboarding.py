@@ -26,12 +26,13 @@ from paircli_architecture import (
     llm_failure_reason, record_llm_diagram, remove_stale_architecture, write_architecture,
     write_fallback_architecture,
 )
-from paircli_architecture_llm import generate_v2
+from paircli_architecture_llm import env_number, generate_v2
 from paircli_architecture_v2 import finalize_v2, validate_v2
 from paircli_architecture_v2_draft import (
     STATUS_V2, deterministic_v2_draft, remove_stale_architecture_v2, write_architecture_v2,
     write_no_architecture_v2,
 )
+from paircli_overview import deterministic_overview, finalize_overview, generate_overview
 from paircli_skeleton import build_skeleton
 from paircli_summary import (
     EvidenceMissingError, STATUS_OUTPUT, agent_runner, stage_model, write_fallback_summary, write_summary,
@@ -897,14 +898,75 @@ def _v2_no_diagram(artifact_dir: Path, reason: str, log) -> None:
     """Record tier "none" and remove any older v2 diagram; never raises."""
     try:
         remove_stale_architecture_v2(artifact_dir)
-        write_no_architecture_v2(artifact_dir, reason, log)
+        write_no_architecture_v2(artifact_dir, reason, log, overview=_v2_no_overview())
     except Exception as error:
         _v2_log(log, f"architecture v2: could not record the skipped diagram ({type(error).__name__})")
 
 
+OVERVIEW_MIN_SECONDS, OVERVIEW_MAX_SECONDS = 20.0, 120.0
+OVERVIEW_DEFAULT_CALL_TIMEOUT = 120.0
+
+
+def _v2_no_overview() -> dict:
+    return {"source": "none", "retried": False, "components": 0, "edges": 0, "steps": 0, "steps_dropped": 0}
+
+
+def _v2_overview_budget(started: float) -> float:
+    """What is left of the v2 deadline for the overview call, kept between 20 and 120 seconds."""
+    deadline = env_number("PAIRCLI_ARCH_DEADLINE", 240.0, 1.0, 3600.0)
+    remaining = deadline - (time.monotonic() - started)
+    return min(OVERVIEW_MAX_SECONDS, max(OVERVIEW_MIN_SECONDS, remaining))
+
+
+def _v2_attach_overview(document, snapshot, head: str, artifact_dir: Path, log, *, generate=None,
+                        started: float | None = None):
+    """Add the overview map to a finalized detailed `document`; returns `(document, status)` and never raises.
+
+    With `generate` the model narrates the overview (`generate_overview` falls back to the deterministic
+    one by itself); without it the deterministic overview is attached and no model is called. The
+    document is re-validated with the overview attached; if that fails, or anything raises, the
+    detailed document is returned unchanged. PAIRCLI_ARCH_OVERVIEW=0 skips the overview.
+    """
+    status = _v2_no_overview()
+    try:
+        if os.environ.get("PAIRCLI_ARCH_OVERVIEW", "1").strip() == "0":
+            _v2_log(log, "architecture v2: overview disabled by PAIRCLI_ARCH_OVERVIEW=0")
+            return document, status
+        if generate is not None:
+            budget = _v2_overview_budget(started if started is not None else time.monotonic())
+            call_timeout = env_number("PAIRCLI_ARCH_CALL_TIMEOUT", OVERVIEW_DEFAULT_CALL_TIMEOUT, 1.0, 1800.0)
+            result = generate_overview(artifact_dir, snapshot, head, document, generate, log,
+                                       call_timeout=call_timeout, model=stage_model("overview"),
+                                       deadline_seconds=budget)
+            overview, stats = result.get("overview"), result.get("stats") or {}
+        else:
+            overview, _warnings = finalize_overview(deterministic_overview(document, snapshot), document, head,
+                                                    snapshot, "deterministic")
+            stats = {"source": "deterministic"}
+        status["retried"] = bool(stats.get("retried"))
+        if not isinstance(overview, dict):
+            _v2_log(log, "architecture v2: no overview produced; keeping the detailed diagram alone")
+            return document, status
+        candidate = dict(document, overview=overview)
+        validate_v2(candidate, head, snapshot)
+        source = "llm" if overview.get("generated_by") == "llm" else "deterministic"
+        status.update(source=source, components=len(overview["components"]), edges=len(overview["edges"]),
+                      steps=len(overview["steps"]),
+                      steps_dropped=stats.get("steps_dropped") if type(stats.get("steps_dropped")) is int else 0)
+        _v2_log(log, f"architecture v2: overview source={source} components={status['components']} "
+                     f"edges={status['edges']} steps={status['steps']} steps_dropped={status['steps_dropped']}")
+        return candidate, status
+    except Exception as error:
+        _v2_log(log, f"architecture v2: overview dropped ({type(error).__name__}: {str(error)[:200]}); "
+                     "keeping the detailed diagram alone")
+        return document, _v2_no_overview()
+
+
 def _v2_deterministic(draft, snapshot, head: str, artifact_dir: Path, reason: str, log) -> Path:
     document, _warnings = finalize_v2(draft, head, snapshot, "deterministic")
-    path = write_architecture_v2(artifact_dir, document, log, tier="deterministic", reason=reason)
+    document, overview = _v2_attach_overview(document, snapshot, head, artifact_dir, log)
+    path = write_architecture_v2(artifact_dir, document, log, tier="deterministic", reason=reason,
+                                 overview=overview)
     _v2_log(log, f"architecture v2: tier=deterministic reason={reason}")
     return path
 
@@ -919,6 +981,7 @@ def run_diagram_v2_step(harness: str, repo_dir: Path, artifact_dir: Path, log) -
     try:
         head = artifact_dir.name
         draft = snapshot = None
+        started = time.monotonic()
         try:
             remove_stale_architecture_v2(artifact_dir)
             if not (artifact_dir / "diagnostics").is_symlink():
@@ -957,13 +1020,17 @@ def run_diagram_v2_step(harness: str, repo_dir: Path, artifact_dir: Path, log) -
             document, stats = result["document"], result.get("stats") or {}
             validate_v2(document, head, snapshot)
             tier = "llm" if document.get("generated_by") == "llm" else "deterministic"
+            # A diagram the model did not touch gets the deterministic overview without another model call.
+            document, overview = _v2_attach_overview(document, snapshot, head, artifact_dir, log,
+                                                     generate=generate if tier == "llm" else None, started=started)
             if tier == "llm":
                 reason = f"llm groups ok: {stats.get('groups_llm_ok')}/{stats.get('groups_selected')}, merge {stats.get('merge')}"
                 if stats.get("degraded"):
                     reason += f" (degraded: {stats['degraded']})"
             else:
                 reason = "no llm output applied"
-            path = write_architecture_v2(artifact_dir, document, log, tier=tier, reason=reason, llm_calls=stats)
+            path = write_architecture_v2(artifact_dir, document, log, tier=tier, reason=reason, llm_calls=stats,
+                                         overview=overview)
             _v2_log(log, f"architecture v2: tier={tier} groups_llm_ok={stats.get('groups_llm_ok')}/"
                          f"{stats.get('groups_selected')} merge={stats.get('merge')} "
                          f"steps_dropped={stats.get('steps_dropped')} cache_hits={stats.get('cache_hits')}")

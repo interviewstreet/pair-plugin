@@ -23,6 +23,7 @@ V2 = "generated_artifacts/architecture.v2.json"
 V1 = "generated_artifacts/architecture.json"
 GROUP_PROMPT = "You are improving the text of ONE group"
 MERGE_PROMPT = "You are connecting the groups"
+OVERVIEW_PROMPT = "drawing a one-screen map of a pull request"
 
 
 def code_snapshot():
@@ -48,11 +49,20 @@ def digest_of(prompt):
 class Agent:
     """A stand-in for the harness: records v2 calls and answers each kind of prompt."""
 
-    def __init__(self, group="patch", merge="answer"):
-        self.group, self.merge = group, merge
-        self.v2_calls, self.other_calls = [], []
+    def __init__(self, group="patch", merge="answer", overview="answer"):
+        self.group, self.merge, self.overview = group, merge, overview
+        self.v2_calls, self.other_calls, self.overview_calls = [], [], []
 
     def __call__(self, prompt, repo_dir, timeout=None, model=None):
+        if OVERVIEW_PROMPT in prompt:
+            self.overview_calls.append({"cwd": repo_dir, "timeout": timeout, "model": model})
+            if isinstance(self.overview, BaseException):
+                raise self.overview
+            if self.overview == "garbage":
+                return "this is not json"
+            if self.overview == "null":
+                return "null"
+            return self.overview_answer(prompt)
         if GROUP_PROMPT in prompt or MERGE_PROMPT in prompt:
             kind = "group" if GROUP_PROMPT in prompt else "merge"
             self.v2_calls.append({"kind": kind, "cwd": repo_dir, "timeout": timeout, "model": model})
@@ -64,6 +74,22 @@ class Agent:
             return self.answer(kind, prompt)
         self.other_calls.append(repo_dir)
         return "null"
+
+    @staticmethod
+    def overview_answer(prompt):
+        """A valid overview: one component per file row of the digest, one edge and one step."""
+        digest = json.loads(Path(re.search(r"node ids: (\S+)", prompt).group(1)).read_text())
+        rows = [row for row in digest["nodes"] if row["kind"] == "file" and row.get("evidence")]
+        components = [{"id": "c-" + row["id"], "label": "LLM " + row["label"][:30], "group": "all", "kind": "component",
+                       "description": "Changed by this pull request.", "members": [row["id"]]} for row in rows]
+        refs = {"c-" + row["id"]: next(ref for ref in row["evidence"] if ref["side"] == "new") for row in rows}
+        first, second = components[0]["id"], components[1]["id"]
+        return json.dumps({
+            "groups": [{"id": "all", "label": "Everything"}], "components": components,
+            "edges": [{"id": "o-call", "source": first, "target": second, "label": "call",
+                       "claim": "The first part calls the second.", "evidence": [refs[first]]}],
+            "steps": [{"id": "o-s1", "when": "after", "edge": "o-call", "components": [first, second],
+                       "text": "The first part now calls the second.", "evidence": [refs[first]]}]})
 
     @staticmethod
     def answer(kind, prompt):
@@ -83,7 +109,8 @@ class Agent:
 def clean_environment(monkeypatch):
     for name in ("PAIRCLI_ARCHITECTURE_V2", "PAIRCLI_ARCH_LLM_GROUPS", "PAIRCLI_ARCH_CONCURRENCY",
                  "PAIRCLI_ARCH_CALL_TIMEOUT", "PAIRCLI_ARCH_DEADLINE", "PAIRCLI_MODEL_GROUP",
-                 "PAIRCLI_MODEL_MERGE", "PAIRCLI_MODEL_SUMMARY"):
+                 "PAIRCLI_MODEL_MERGE", "PAIRCLI_MODEL_SUMMARY", "PAIRCLI_ARCH_OVERVIEW",
+                 "PAIRCLI_MODEL_OVERVIEW"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -464,3 +491,234 @@ def test_the_llm_narrates_pattern_rows_without_changing_their_members(tmp_path):
     after = {node["id"]: node["pattern"] for node in document["nodes"] if node["kind"] == "pattern"}
     assert after == before
     assert any(node["label"].startswith("LLM ") and node["kind"] == "pattern" for node in document["nodes"])
+
+
+# --- the overview layer ----------------------------------------------------------------------
+
+def assert_overview_status(artifacts, document, source, retried=False):
+    status = status_of(artifacts)["overview"]
+    overview = document["overview"]
+    assert status == {"source": source, "retried": retried, "components": len(overview["components"]),
+                      "edges": len(overview["edges"]), "steps": len(overview["steps"]),
+                      "steps_dropped": status["steps_dropped"]}
+    assert overview["generated_by"] == source
+
+
+def detailed_part(document):
+    return {key: value for key, value in document.items() if key != "overview"}
+
+
+def test_a_valid_llm_overview_is_attached_validated_and_recorded(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+    log = run_scan(tmp_path, repo)
+    document = uploaded_v2(uploads)
+    assert_valid(document)
+    assert document["generated_by"] == "llm" and document["overview"]["generated_by"] == "llm"
+    assert all(item["label"].startswith("LLM ") for item in document["overview"]["components"] if item["id"] != "other")
+    assert document["overview"]["steps"] and document["overview"]["edges"]
+    assert_overview_status(artifacts, document, "llm")
+    assert len(agent.overview_calls) == 1 and agent.overview_calls[0]["cwd"] == repo
+    assert agent.overview_calls[0]["model"] is None and 0 < agent.overview_calls[0]["timeout"] <= 120
+    assert re.search(r"architecture v2: overview source=llm components=\d+ edges=1 steps=1 steps_dropped=0", log)
+    assert list(document)[-1] == "overview"
+
+
+def test_the_overview_leaves_the_detailed_document_untouched(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+    run_scan(tmp_path, repo)
+    monkeypatch.setenv("PAIRCLI_ARCH_OVERVIEW", "0")
+    run_scan(tmp_path, repo)
+    with_overview, without = uploaded_v2(uploads), json.loads(uploads[1].read(V2))
+    assert "overview" in with_overview and "overview" not in without
+    assert detailed_part(with_overview) == without
+
+
+def test_the_overview_model_and_time_budget(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+    monkeypatch.setenv("PAIRCLI_MODEL_OVERVIEW", "overview-model")
+    seen = []
+    real = onboarding.generate_overview
+    monkeypatch.setattr(onboarding, "generate_overview",
+                        lambda *args, **kwargs: seen.append(kwargs) or real(*args, **kwargs))
+    run_scan(tmp_path, repo)
+    assert seen[0]["model"] == "overview-model" and agent.overview_calls[0]["model"] == "overview-model"
+    assert 20 <= seen[0]["deadline_seconds"] <= 120
+
+    monkeypatch.setenv("PAIRCLI_ARCH_DEADLINE", "1")
+    run_scan(tmp_path, repo)
+    assert seen[1]["deadline_seconds"] == 20
+
+    monkeypatch.setenv("PAIRCLI_ARCH_DEADLINE", "3600")
+    run_scan(tmp_path, repo)
+    assert seen[2]["deadline_seconds"] == 120
+
+
+@pytest.mark.parametrize("overview,retried", [
+    ("garbage", True),
+    (subprocess.TimeoutExpired("codex", 5), False),
+    (RuntimeError("boom"), False),
+])
+def test_a_failing_overview_call_attaches_the_deterministic_overview(monkeypatch, tmp_path, overview, retried):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path, agent=Agent(overview=overview))
+    run_scan(tmp_path, repo)
+    document = uploaded_v2(uploads)
+    assert_valid(document)
+    assert document["generated_by"] == "llm", "the detailed diagram keeps its model text"
+    assert document["overview"]["generated_by"] == "deterministic" and document["overview"]["steps"] == []
+    assert_overview_status(artifacts, document, "deterministic", retried=retried)
+    assert V1 in uploads[0].namelist()
+
+
+def test_a_null_overview_answer_attaches_the_deterministic_overview(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path, agent=Agent(overview="null"))
+    run_scan(tmp_path, repo)
+    assert_overview_status(artifacts, uploaded_v2(uploads), "deterministic")
+
+
+def test_generate_overview_raising_keeps_the_detailed_document_and_the_upload(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("overview bug")
+
+    monkeypatch.setattr(onboarding, "generate_overview", explode)
+    log = run_scan(tmp_path, repo)
+    document = uploaded_v2(uploads)
+    assert "overview" not in document and document["generated_by"] == "llm"
+    assert_valid(document)
+    assert status_of(artifacts)["tier"] == "llm"
+    assert status_of(artifacts)["overview"] == {"source": "none", "retried": False, "components": 0, "edges": 0,
+                                                "steps": 0, "steps_dropped": 0}
+    assert "overview dropped (RuntimeError: overview bug)" in log
+    assert V1 in uploads[0].namelist()
+
+
+def test_generate_overview_returning_nothing_keeps_the_detailed_document(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+    monkeypatch.setattr(onboarding, "generate_overview",
+                        lambda *a, **k: {"overview": None, "warnings": [], "stats": {"source": "none", "retried": True}})
+    run_scan(tmp_path, repo)
+    assert "overview" not in uploaded_v2(uploads)
+    assert status_of(artifacts)["overview"]["source"] == "none" and status_of(artifacts)["overview"]["retried"] is True
+
+
+def test_a_failing_final_validation_with_the_overview_drops_only_the_overview(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+    attempts = []
+
+    def reject_overview(document, head, snapshot):
+        attempts.append("overview" in document)
+        if "overview" in document:
+            raise ValueError("overview rejected late")
+        return validate_v2(document, head, snapshot)
+
+    monkeypatch.setattr(onboarding, "validate_v2", reject_overview)
+    log = run_scan(tmp_path, repo)
+    document = uploaded_v2(uploads)
+    assert "overview" not in document and document["generated_by"] == "llm" and document["steps"]
+    assert True in attempts
+    assert status_of(artifacts)["tier"] == "llm" and status_of(artifacts)["overview"]["source"] == "none"
+    assert "overview dropped (ValueError: overview rejected late)" in log
+
+
+def test_an_overview_that_really_fails_strict_validation_is_never_uploaded(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+    real = onboarding.generate_overview
+
+    def tampered(*args, **kwargs):
+        result = real(*args, **kwargs)
+        result["overview"]["components"][0]["stats"]["files"] += 5
+        return result
+
+    monkeypatch.setattr(onboarding, "generate_overview", tampered)
+    log = run_scan(tmp_path, repo)
+    document = uploaded_v2(uploads)
+    assert "overview" not in document and "stats" in log
+    assert_valid(document)
+
+
+def test_the_environment_switch_disables_only_the_overview(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+    monkeypatch.setenv("PAIRCLI_ARCH_OVERVIEW", "0")
+    log = run_scan(tmp_path, repo)
+    document = uploaded_v2(uploads)
+    assert "overview" not in document and document["generated_by"] == "llm"
+    assert agent.overview_calls == []
+    assert status_of(artifacts)["overview"]["source"] == "none"
+    assert "overview disabled by PAIRCLI_ARCH_OVERVIEW=0" in log
+    assert not list((artifacts / "diagnostics" / "architecture-llm").glob("overview-*"))
+
+
+def test_a_deterministic_detailed_document_gets_the_deterministic_overview_without_a_model_call(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path, agent=Agent(group="garbage", merge="garbage"))
+    run_scan(tmp_path, repo)
+    document = uploaded_v2(uploads)
+    assert document["generated_by"] == "deterministic"
+    assert agent.overview_calls == []
+    assert document["overview"]["generated_by"] == "deterministic"
+    assert_valid(document)
+    assert_overview_status(artifacts, document, "deterministic")
+
+
+def test_an_unavailable_harness_still_gets_the_deterministic_overview(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+    run_scan(tmp_path, repo, harness="other")
+    document = uploaded_v2(uploads)
+    assert agent.overview_calls == [] and document["overview"]["generated_by"] == "deterministic"
+    assert_valid(document)
+    assert_overview_status(artifacts, document, "deterministic")
+
+
+def test_the_error_fallback_document_also_gets_the_deterministic_overview(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("generate bug")
+
+    monkeypatch.setattr(onboarding, "generate_v2", explode)
+    run_scan(tmp_path, repo)
+    document = uploaded_v2(uploads)
+    assert document["generated_by"] == "deterministic" and document["overview"]["generated_by"] == "deterministic"
+    assert status_of(artifacts)["reason"] == "v2 error: RuntimeError"
+    assert_overview_status(artifacts, document, "deterministic")
+
+
+def test_a_broken_deterministic_overview_does_not_stop_the_deterministic_document(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("overview builder bug")
+
+    monkeypatch.setattr(onboarding, "deterministic_overview", explode)
+    run_scan(tmp_path, repo, harness="other")
+    document = uploaded_v2(uploads)
+    assert "overview" not in document and document["generated_by"] == "deterministic"
+    assert status_of(artifacts)["overview"]["source"] == "none"
+    assert V1 in uploads[0].namelist()
+
+
+def test_the_overview_step_never_raises_with_a_broken_log(monkeypatch, tmp_path):
+    class BrokenLog:
+        def write(self, _message):
+            raise OSError("closed")
+
+    document = {"head_sha": HEAD}
+    result, status = onboarding._v2_attach_overview(document, code_snapshot(), HEAD, tmp_path, BrokenLog(), generate=None)
+    assert result is document and status["source"] == "none"
+
+
+def test_docs_only_and_skipped_diagrams_have_no_overview(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path, snapshot=docs_snapshot())
+    run_scan(tmp_path, repo)
+    assert V2 not in uploads[0].namelist() and agent.overview_calls == []
+    assert status_of(artifacts)["tier"] == "none" and status_of(artifacts)["overview"]["source"] == "none"
+
+
+def test_the_zip_root_alias_carries_the_overview(monkeypatch, tmp_path):
+    repo, artifacts, uploads, agent = prepare(monkeypatch, tmp_path)
+    run_scan(tmp_path, repo)
+    nested = json.loads(uploads[0].read(f".paircli/pr-42/{HEAD}/{V2}"))
+    alias = json.loads(uploads[0].read(V2))
+    assert alias["overview"]["components"] and alias == nested
+    assert alias["overview"]["generated_by"] == "llm"
+    assert not any("overview-" in name or "diagnostics" in name for name in uploads[0].namelist())

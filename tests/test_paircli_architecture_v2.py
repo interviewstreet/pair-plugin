@@ -1064,3 +1064,115 @@ def test_pattern_members_with_hunkless_files_still_count_in_stats_and_status():
                "src/legacy/templates/t0.ts", "src/legacy/templates/t1.ts", "src/legacy/templates/gone.ts"]}}
     computed = enrich_v2({"nodes": [row]}, HEAD, snap)["nodes"][0]
     assert computed["stats"]["files"] == 3 and computed["change"] == "removed"
+
+
+# --- the optional top-level overview ---------------------------------------------------------
+
+from paircli_overview import deterministic_overview, finalize_overview  # noqa: E402
+
+
+def overview_world():
+    """A valid detailed document that carries a valid deterministic overview."""
+    document, snap = pattern_world()
+    overview, warnings = finalize_overview(deterministic_overview(document, snap), document, HEAD, snap, "deterministic")
+    assert warnings == []
+    return dict(document, overview=overview), snap
+
+
+def overview_errors(mutate):
+    document, snap = overview_world()
+    mutate(document)
+    with pytest.raises(ArchitectureError) as caught:
+        validate_v2(document, HEAD, snap)
+    return [(error["path"], error["reason"]) for error in caught.value.errors]
+
+
+def test_a_document_with_a_valid_overview_passes_and_without_one_still_passes():
+    document, snap = overview_world()
+    assert validate_v2(document, HEAD, snap) is None
+    assert document["overview"]["components"] and document["overview"]["groups"]
+    without = {key: value for key, value in document.items() if key != "overview"}
+    assert validate_v2(without, HEAD, snap) is None
+
+
+def test_enrich_and_finalize_keep_the_overview_and_put_it_after_the_detailed_keys():
+    document, snap = overview_world()
+    again, warnings = finalize_v2(document, HEAD, snap, "deterministic")
+    assert warnings == [] and list(again)[-1] == "overview" and again["overview"] == document["overview"]
+    shuffled = dict(reversed(list(document.items())))
+    assert list(enrich_v2(shuffled, HEAD, snap))[-2:] == ["gaps", "overview"]
+
+
+def test_a_tampered_computed_field_of_the_overview_fails_with_an_overview_path():
+    def tamper_stats(document):
+        document["overview"]["components"][0]["stats"]["files"] += 1
+
+    def tamper_change(document):
+        component = document["overview"]["components"][0]
+        component["change"] = "added" if component["change"] != "added" else "removed"
+
+    def tamper_layout(document):
+        document["overview"]["groups"][0]["column"] += 3
+
+    for mutate in (tamper_stats, tamper_change, tamper_layout):
+        errors = overview_errors(mutate)
+        assert errors and all(path.startswith("overview.") for path, _ in errors), errors
+
+
+def test_an_overview_that_names_a_missing_node_fails_with_an_overview_path():
+    def missing(document):
+        document["overview"]["components"][0]["members"] = ["no-such-node"]
+
+    errors = overview_errors(missing)
+    assert any(path == "overview.components[0].members[0]" for path, _ in errors), errors
+
+
+def test_an_overview_that_is_not_an_object_or_has_unknown_keys_is_rejected():
+    assert ("overview", "must be a JSON object") in overview_errors(lambda d: d.update(overview=[]))
+    assert ("overview.bogus", "unexpected key") in overview_errors(lambda d: d["overview"].update(bogus=1))
+    assert any(path == "overview.components[0].bogus" for path, _ in
+               overview_errors(lambda d: d["overview"]["components"][0].update(bogus=1)))
+
+
+def test_an_unexpected_top_level_key_is_still_rejected_beside_the_overview():
+    assert ("surprise", "unexpected key") in overview_errors(lambda d: d.update(surprise=1))
+
+
+def test_the_size_cap_applies_to_the_whole_document_including_the_overview():
+    def pad(document):
+        document["overview"]["components"][0]["description"] = "x" * MAX_BYTES
+
+    assert any(path == "$" and "exceeds" in reason for path, reason in overview_errors(pad))
+
+
+def test_validation_of_the_overview_waits_for_a_valid_detailed_graph():
+    def break_both(document):
+        document["title"] = ""
+        document["overview"]["components"][0]["stats"]["files"] += 1
+
+    errors = overview_errors(break_both)
+    assert [path for path, _ in errors] == ["title"]
+
+
+def test_normalize_strips_unknown_overview_keys_with_a_warning_and_keeps_the_rest():
+    document, snap = overview_world()
+    document["overview"]["bogus"] = 1
+    document["overview"]["components"][0]["bogus"] = 2
+    document["overview"]["components"][0]["evidence"][0]["bogus"] = 3
+    cleaned, warnings = normalize_v2(document)
+    assert "overview.bogus: removed unexpected key" in warnings
+    assert "overview.components[0].bogus: removed unexpected key" in warnings
+    assert "overview.components[0].evidence[0].bogus: removed unexpected key" in warnings
+    assert "bogus" not in cleaned["overview"] and "bogus" not in cleaned["overview"]["components"][0]
+    assert cleaned["overview"]["components"][0]["members"] == document["overview"]["components"][0]["members"]
+    assert "bogus" in document["overview"], "the input is left alone"
+    finalized, _ = finalize_v2(cleaned, HEAD, snap, "deterministic")
+    assert validate_v2(finalized, HEAD, snap) is None
+
+
+def test_normalize_never_raises_on_a_malformed_overview():
+    document, _ = overview_world()
+    for bad in (None, 5, "text", [], {"components": 7}, {"components": [1, None]}):
+        document["overview"] = bad
+        cleaned, warnings = normalize_v2(document)
+        assert isinstance(cleaned, dict) and "overview" in cleaned

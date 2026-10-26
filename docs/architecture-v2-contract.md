@@ -120,6 +120,15 @@ row) and 12 evidence refs per node; whole document at most 512 KiB. Ids match `[
 Node `kind` is one of the v1 kinds (`client`, `service`, `database`, `cache`,
 `queue`, `worker`, `storage`, `external`) plus `file`, `routine` and `pattern`.
 
+## Overview (optional, additive)
+
+The document may carry one more top-level key, `overview`: a short, curated map of 8 to 20
+components on top of the detailed graph, with its own shape, computed fields and limits. It is
+specified in [architecture-v2-overview.md](architecture-v2-overview.md) and validated by
+`paircli_overview.validate_overview`, which `validate_v2` calls (so a document that carries a
+bad overview is invalid, and the pipeline never attaches one). Consumers that do not know it
+ignore it. The 512 KiB limit covers the whole document, overview included.
+
 ## Tiers
 
 `generated_by` is `llm` for model-written structure and `deterministic` for the

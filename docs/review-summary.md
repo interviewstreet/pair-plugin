@@ -307,5 +307,34 @@ failure never touches it. The ZIP carries v2 under its normal path and as a root
   `api_removed`, lexical counts of exported names. The model may reword a pattern row but never change its
   members.
 
+## Overview layer
+
+The detailed v2 graph has one row per file or pattern. After it is finalized, the step adds an
+**overview** to the same document: a short, curated map (8 to 20 components, one-to-three-word
+runtime edges, a walkthrough of at most 10 steps) under a top-level `overview` key. It never
+replaces the detailed graph and consumers that do not know it ignore it. Shape and rules:
+`docs/architecture-v2-overview.md`. The model chooses and narrates; code computes the stats, change
+states, layout and coverage and validates every citation.
+
+- **Environment.** `PAIRCLI_ARCH_OVERVIEW=0` turns the overview off (default on); the detailed v2
+  diagram is unaffected. `PAIRCLI_MODEL_OVERVIEW` picks the model for the overview call; unset means
+  the harness default. `PAIRCLI_ARCH_CALL_TIMEOUT` and `PAIRCLI_ARCH_DEADLINE` apply as for v2.
+- **Fallback.** The overview call gets one retry that shows the model its errors. A timeout, a
+  failed call, garbage, `null` or a second rejection attaches the deterministic overview (one
+  component per detailed group, group-to-group `imports` edges, no steps). When the detailed
+  diagram itself is deterministic (no model output applied, harness missing or unsupported, or the
+  v2 step failed) the deterministic overview is attached without another model call. A step that
+  fails validation is dropped alone. If the whole document does not validate with the overview
+  attached, or anything raises, the overview is dropped and the detailed diagram is written as
+  before. Docs-only changes have no diagram and no overview. Nothing here can fail the scan.
+- **Time budget.** One call (plus the retry) within what is left of `PAIRCLI_ARCH_DEADLINE`, never
+  less than 20 s and never more than 120 s, so the overview adds at most about two minutes to the
+  worst case of the v2 step.
+- **Status.** `diagnostics/architecture-v2-status.json` gains `overview`: `{"source": "llm" |
+  "deterministic" | "none", "retried": bool, "components": n, "edges": n, "steps": n,
+  "steps_dropped": n}`. The overview call's local diagnostics are `overview-*` files in
+  `diagnostics/architecture-llm/`; the overview itself travels inside `architecture.v2.json`
+  (and so inside the ZIP, nested and as the root alias).
+
 This does not change upload paths, capture offsets, publication versioning, or the
 separate `/pair` JSON review-brief agent contract.

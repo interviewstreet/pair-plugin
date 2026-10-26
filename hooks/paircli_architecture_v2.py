@@ -31,6 +31,10 @@ MAX_WARNINGS = 100
 # order a model happened to write keys in.
 TOP_KEYS = ("schema_version", "generated_by", "head_sha", "title", "description",
             "groups", "nodes", "edges", "steps", "gaps")
+# Optional curated map on top of the detailed graph; its own module normalizes and validates it
+# (docs/architecture-v2-overview.md).
+OPTIONAL_TOP_KEYS = ("overview",)
+ALL_TOP_KEYS = TOP_KEYS + OPTIONAL_TOP_KEYS
 GROUP_KEYS = ("id", "label", "path", "column", "order")
 NODE_KEYS = ("id", "label", "group", "kind", "description", "files", "evidence", "pattern",
              "change", "state", "stats")
@@ -145,7 +149,16 @@ def normalize_v2(document):
             cleaned.append(item)
         return cleaned
 
-    cleaned = strip(copy.deepcopy(document), TOP_KEYS, "")
+    cleaned = strip(copy.deepcopy(document), ALL_TOP_KEYS, "")
+    if "overview" in cleaned:
+        # The overview module owns its own shape; lazy import because it imports this module.
+        try:
+            from paircli_overview import normalize_overview
+            cleaned["overview"], overview_warnings = normalize_overview(cleaned["overview"])
+            room = max(0, MAX_WARNINGS - len(warnings))
+            warnings.extend(overview_warnings[:room])
+        except Exception:
+            warnings.append("overview: could not be normalized")
     for key in ("groups", "nodes", "edges", "steps"):
         if key in cleaned:
             allowed = {"groups": GROUP_KEYS, "nodes": NODE_KEYS, "edges": EDGE_KEYS, "steps": STEP_KEYS}[key]
@@ -477,7 +490,7 @@ def enrich_v2(draft, head: str, snapshot, generated_by: str = "llm", notes: list
                 if isinstance(group.get("id"), str):
                     group.update(layout.get(group["id"], {}))
                 groups[position] = ordered(group, GROUP_KEYS)
-    return ordered(document, TOP_KEYS)
+    return ordered(document, ALL_TOP_KEYS)
 
 
 # --- validate ----------------------------------------------------------------------------
@@ -780,7 +793,7 @@ def validate_v2(document, head: str, snapshot) -> None:
 
     for key in TOP_KEYS:
         check(key in document, key, "missing")
-    for key in sorted(set(document) - set(TOP_KEYS), key=str):
+    for key in sorted(set(document) - set(ALL_TOP_KEYS), key=str):
         check(False, str(key)[:64], "unexpected key")
     check(is_int(document.get("schema_version")) and document["schema_version"] == SCHEMA_VERSION,
           "schema_version", f"must be the integer {SCHEMA_VERSION}")
@@ -805,8 +818,29 @@ def validate_v2(document, head: str, snapshot) -> None:
             if isinstance(name, str):
                 check(name not in seen, f"steps[{position}].id", "duplicate id")
                 seen.add(name)
+    if "overview" in document and not errors:
+        check_attached_overview(document, head, snapshot, check)
     if errors:
         raise ArchitectureError(errors)
+
+
+def check_attached_overview(document: dict, head: str, snapshot, check) -> None:
+    """Validate the optional `overview` with the overview module, which recomputes its computed fields.
+
+    Only runs once the detailed graph is valid, since the overview is checked against it. Its error
+    paths already start with `overview`; a document-level path is reported as `overview`.
+    """
+    try:
+        from paircli_overview import validate_overview
+        detailed = {key: value for key, value in document.items() if key != "overview"}
+        validate_overview(document["overview"], detailed, head, snapshot)
+    except ArchitectureError as error:
+        for item in error.errors:
+            path = item.get("path") if isinstance(item, dict) else None
+            path = "overview" if path in (None, "$") else str(path)
+            check(False, path, item.get("reason", "invalid") if isinstance(item, dict) else "invalid")
+    except Exception as error:
+        check(False, "overview", f"could not be validated ({type(error).__name__})")
 
 
 # --- drop invalid steps and the pipeline -------------------------------------------------

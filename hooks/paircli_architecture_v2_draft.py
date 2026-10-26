@@ -547,7 +547,17 @@ def _count(document, key: str) -> int:
     return len(items) if isinstance(items, list) else 0
 
 
-def record_status_v2(artifact_dir: Path, tier: str, reason: str, document, llm_calls, log) -> None:
+def _overview_status(overview) -> dict:
+    """`overview` for the status file: source, retried and counts; source "none" without an overview."""
+    keys = ("components", "edges", "steps", "steps_dropped")
+    info = overview if isinstance(overview, dict) else {}
+    source = info.get("source")
+    return {"source": source if source in ("llm", "deterministic") else "none",
+            "retried": info.get("retried") is True,
+            **{key: info[key] if type(info.get(key)) is int and info[key] >= 0 else 0 for key in keys}}
+
+
+def record_status_v2(artifact_dir: Path, tier: str, reason: str, document, llm_calls, log, overview=None) -> None:
     """Record which tier produced the v2 diagram, beside the other diagnostics (never in the ZIP)."""
     generated_by = document.get("generated_by") if isinstance(document, dict) else None
     status = {
@@ -556,6 +566,8 @@ def record_status_v2(artifact_dir: Path, tier: str, reason: str, document, llm_c
         "counts": {key: _count(document, key) for key in ("groups", "nodes", "edges", "steps")},
         "llm_calls": dict(llm_calls) if isinstance(llm_calls, dict) else {},
     }
+    if overview is not None:  # absent for the "none" tier and for callers that know nothing of the overview
+        status["overview"] = _overview_status(overview)
     try:
         save_atomic(artifact_dir / "diagnostics", STATUS_V2, json.dumps(status, indent=2, ensure_ascii=False))
     except (OSError, ValueError, TypeError) as error:
@@ -573,7 +585,7 @@ def remove_stale_architecture_v2(artifact_dir: Path) -> None:
 
 
 def write_architecture_v2(artifact_dir: Path, document: dict, log, *, tier: str, reason: str,
-                          llm_calls: dict | None = None) -> Path:
+                          llm_calls: dict | None = None, overview: dict | None = None) -> Path:
     """Atomically write a finalized, validated v2 document and its status file.
 
     Writes `generated_artifacts/architecture.v2.json`; raises ValueError for a symlinked artifact
@@ -587,18 +599,19 @@ def write_architecture_v2(artifact_dir: Path, document: dict, log, *, tier: str,
     folder = artifact_dir / "generated_artifacts"
     require(not folder.is_symlink() and not (folder / ARCHITECTURE_V2).is_symlink())
     save_atomic(folder, ARCHITECTURE_V2, content)
-    record_status_v2(artifact_dir, tier, reason, document, llm_calls, log)
+    record_status_v2(artifact_dir, tier, reason, document, llm_calls, log, overview)
     _log(log, f"wrote generated_artifacts/{ARCHITECTURE_V2} ({tier}; {_count(document, 'nodes')} nodes, "
               f"{_count(document, 'edges')} edges)\n")
     return folder / ARCHITECTURE_V2
 
 
-def write_no_architecture_v2(artifact_dir: Path, reason: str, log=None, *, llm_calls: dict | None = None) -> None:
+def write_no_architecture_v2(artifact_dir: Path, reason: str, log=None, *, llm_calls: dict | None = None,
+                             overview: dict | None = None) -> None:
     """The "none" tier: remove any older v2 diagram and record why there is no new one."""
     remove_stale_architecture_v2(artifact_dir)
     if log is None:
         log = _NullLog()
-    record_status_v2(artifact_dir, "none", reason, None, llm_calls, log)
+    record_status_v2(artifact_dir, "none", reason, None, llm_calls, log, overview)
     _log(log, f"architecture v2 skipped: {reason}\n")
 
 
