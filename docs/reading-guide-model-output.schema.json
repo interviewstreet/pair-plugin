@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pair.sh/schemas/reading-guide/model-output-v1.json",
+  "title": "Pair reading guide model output v1",
+  "description": "What the categorisation model returns for one batch. Internal: code checks it, applies rule floors and receipts, assigns ranks and counts, and writes generated_artifacts/reading_guide.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["files"],
+  "properties": {
+    "files": {
+      "description": "Every path in files.json exactly once. Order inside each bucket is the rank.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "bucket", "reason", "primary_tag", "tags", "states", "skip_kind", "identifier_map", "focus"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "bucket": { "enum": ["review", "skim", "skip"] },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 240 },
+          "primary_tag": { "anyOf": [{ "$ref": "#/$defs/risk_tag" }, { "type": "null" }] },
+          "tags": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "$ref": "#/$defs/risk_tag" } },
+          "states": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["uncertain", "overflow"] } },
+          "skip_kind": { "anyOf": [{ "enum": ["lockfile", "generated", "rename", "formatting", "docs", "mechanical"] }, { "type": "null" }] },
+          "identifier_map": {
+            "description": "Only for skip_kind mechanical: old identifier or path to new.",
+            "anyOf": [
+              {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["old", "new"],
+                  "properties": { "old": { "type": "string", "minLength": 1 }, "new": { "type": "string", "minLength": 1 } }
+                }
+              },
+              { "type": "null" }
+            ]
+          },
+          "focus": {
+            "type": "array",
+            "maxItems": 3,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["side", "start", "end"],
+              "properties": {
+                "side": { "enum": ["new", "old"] },
+                "start": { "type": "integer", "minimum": 1 },
+                "end": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "risk_tag": {
+      "enum": [
+        "auth", "secrets", "money", "data", "migration", "api-contract", "contract", "concurrency",
+        "process", "exec", "delete", "network",
+        "ci", "ci-agent", "instruction-surface", "gate-config", "review-policy",
+        "dependency", "test-weakened", "removed-check", "swallows-error", "hidden-content",
+        "unrequested", "binary"
+      ]
+    }
+  }
+}

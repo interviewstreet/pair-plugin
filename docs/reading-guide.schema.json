@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pair.sh/schemas/reading-guide/v1.json",
+  "title": "Pair reading guide v1",
+  "description": "Every changed file of one PR head, sorted into review, skim or skip. Stored in the evidence ZIP at generated_artifacts/reading_guide.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "head_sha", "status", "counts", "files"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "status": {
+      "description": "partial: at least one file carries the not-categorised state (the model ran out of time or omitted it).",
+      "enum": ["complete", "partial"]
+    },
+    "counts": {
+      "description": "Computed by code from files; always matches.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["review", "skim", "skip", "total"],
+      "properties": {
+        "review": { "type": "integer", "minimum": 0 },
+        "skim": { "type": "integer", "minimum": 0 },
+        "skip": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "files": {
+      "description": "Exactly one entry per changed file, sorted by bucket (review, skim, skip) and then by rank.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/file" }
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path", "old_path", "status", "additions", "deletions", "bucket", "rank", "reason",
+        "primary_tag", "tags", "states", "skip_kind", "focus", "source", "rule_id", "pinned", "authorship"
+      ],
+      "properties": {
+        "path": { "description": "New path; the old path for a deleted file.", "type": "string", "minLength": 1, "maxLength": 1024 },
+        "old_path": { "description": "Set only for renames.", "type": ["string", "null"], "minLength": 1, "maxLength": 1024 },
+        "status": { "enum": ["added", "modified", "deleted", "renamed"] },
+        "additions": { "type": "integer", "minimum": 0 },
+        "deletions": { "type": "integer", "minimum": 0 },
+        "bucket": { "enum": ["review", "skim", "skip"] },
+        "rank": { "description": "1-based order inside the bucket, contiguous, 1 = look first.", "type": "integer", "minimum": 1 },
+        "reason": { "description": "One plain sentence, at most 25 words. No links or line numbers.", "type": "string", "minLength": 1, "maxLength": 240 },
+        "primary_tag": { "description": "The main concern. Always set for review files.", "anyOf": [{ "$ref": "#/$defs/risk_tag" }, { "type": "null" }] },
+        "tags": { "description": "Risk tags, primary first.", "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "$ref": "#/$defs/risk_tag" } },
+        "states": { "description": "How the result was produced; see the state_tag descriptions.", "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/state_tag" } },
+        "skip_kind": { "description": "Set exactly when bucket is skip.", "anyOf": [{ "$ref": "#/$defs/skip_kind" }, { "type": "null" }] },
+        "focus": { "description": "Changed lines that carry the concern, most important first.", "type": "array", "maxItems": 3, "items": { "$ref": "#/$defs/range" } },
+        "source": { "description": "rule: the final bucket equals the code rule result. model: the model raised it or decided it.", "enum": ["rule", "model"] },
+        "rule_id": { "description": "The code rule that set a floor, pin or receipt, e.g. pin:ci or receipt:lockfile.", "type": ["string", "null"], "pattern": "^(pin|floor|receipt):[a-z0-9-]+$" },
+        "pinned": { "description": "A code rule pins this file to review; the model cannot move it.", "type": "boolean" },
+        "authorship": { "description": "Who wrote the changed lines, from captured sessions. Never moves a bucket.", "enum": ["agent", "human", "mixed", "unknown"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "bucket": { "const": "skip" } } },
+          "then": { "properties": { "skip_kind": { "$ref": "#/$defs/skip_kind" }, "focus": { "maxItems": 0 }, "pinned": { "const": false } } },
+          "else": { "properties": { "skip_kind": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "bucket": { "const": "review" } } },
+          "then": { "properties": { "primary_tag": { "$ref": "#/$defs/risk_tag" } } }
+        },
+        {
+          "if": { "properties": { "bucket": { "const": "skim" } } },
+          "then": { "properties": { "focus": { "maxItems": 2 } } }
+        },
+        {
+          "if": { "properties": { "pinned": { "const": true } } },
+          "then": { "properties": { "bucket": { "const": "review" }, "rule_id": { "type": "string", "pattern": "^pin:" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "renamed" } } },
+          "then": { "properties": { "old_path": { "type": "string" } } },
+          "else": { "properties": { "old_path": { "type": "null" } } }
+        }
+      ]
+    },
+    "range": {
+      "description": "Inclusive line range inside one hunk with at least one changed line. new = head side, old = base side (removed lines).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["side", "start", "end"],
+      "properties": {
+        "side": { "enum": ["new", "old"] },
+        "start": { "type": "integer", "minimum": 1 },
+        "end": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "skip_kind": {
+      "oneOf": [
+        { "const": "lockfile", "description": "Lockfile that matches its manifest change or a captured install." },
+        { "const": "generated", "description": "Generated path with no captured agent edit." },
+        { "const": "rename", "description": "Renamed with no content change." },
+        { "const": "formatting", "description": "Whitespace-only change where whitespace has no meaning." },
+        { "const": "docs", "description": "Ordinary docs (not agent instructions) with no changed command or setting, including changesets." },
+        { "const": "mechanical", "description": "Moved code or an identifier rename that code verified line by line." }
+      ]
+    },
+    "risk_tag": {
+      "enum": [
+        "auth", "secrets", "money", "data", "migration", "api-contract", "contract", "concurrency",
+        "process", "exec", "delete", "network",
+        "ci", "ci-agent", "instruction-surface", "gate-config", "review-policy",
+        "dependency", "test-weakened", "removed-check", "swallows-error", "hidden-content",
+        "unrequested", "binary"
+      ]
+    },
+    "state_tag": {
+      "oneOf": [
+        { "const": "uncertain", "description": "The model could not tell what a change does; placed in skim, never skip. Show in UI." },
+        { "const": "overflow", "description": "Qualified for review but the review budget was full; placed at the top of skim. Show in UI." },
+        { "const": "not-categorised", "description": "Not judged in this run; placed in skim or its rule floor. Show in UI." },
+        { "const": "not-inspected", "description": "No readable hunks (binary, truncated or hunkless). Show in UI." },
+        { "const": "open-errors", "description": "Editor or type errors were still open for this file at capture time." },
+        { "const": "scope-unknown", "description": "Changed lines could not be traced to a captured request, so scope was not judged." },
+        { "const": "clamped", "description": "The model answered below the rule floor; code raised it." },
+        { "const": "reason-replaced", "description": "The model's reason failed checks; code wrote a template reason." },
+        { "const": "range-dropped", "description": "A focus range outside the real changed lines was removed." }
+      ]
+    }
+  }
+}
