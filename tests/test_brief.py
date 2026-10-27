@@ -1,5 +1,4 @@
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -162,22 +161,6 @@ def test_hook_save(prepared, monkeypatch, capsys):
     other.parent.mkdir(parents=True)
     assert hook(other, "[]") == (0, capsys.readouterr()) and other.exists()
     assert hook(d / "out" / "ask.json", "[]")[0] == 0 and (d / "out" / "ask.json").exists()
-
-
-def test_save_on_write_filter(prepared):
-    import subprocess
-
-    out, _ = prepared
-    script = Path(__file__).resolve().parent.parent / "hooks" / "save_on_write.sh"
-    run = lambda ev: subprocess.run([str(script)], input=ev, text=True, capture_output=True, timeout=60)
-    t = time.perf_counter()
-    skip = run(_write_event("/Users/x/project/app.py"))
-    assert skip.returncode == 0 and skip.stdout == "" and time.perf_counter() - t < 0.5
-    Path(out["outputs"]["side_effects"]).write_text(json.dumps([{"text": "Kills by pid.",
-                                                                  "refs": ["hunk:app/cleanup.py:1"]}]))
-    saved = run(_write_event(out["outputs"]["side_effects"]))
-    assert saved.returncode == 0, saved.stderr
-    assert '"kept": 1' in json.loads(saved.stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_save_errors(prepared):

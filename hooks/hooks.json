@@ -6,31 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/hook_session_start.py\"",
+            "command": "python3 \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/bootstrap.py\"",
             "timeout": 5,
             "statusMessage": "Preparing Pair CLI"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/hook_pr_created.py\"",
-            "timeout": 5
-          }
-        ]
-      },
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/save_on_write.sh\"",
-            "timeout": 30
           }
         ]
       }
