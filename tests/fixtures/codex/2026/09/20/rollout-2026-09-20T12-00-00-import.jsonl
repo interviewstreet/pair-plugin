@@ -1,3 +1,0 @@
-{"timestamp":"2026-09-20T12:00:00Z","type":"session_meta","payload":{"id":"cdx-import","cwd":"__REPO__","git":{"branch":"feature/login-flow"}}}
-{"timestamp":"2026-09-20T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-1"}}
-{"timestamp":"2026-09-20T12:00:02Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"external-import-turn-1","item":{"type":"UserMessage","id":"um1","content":[{"type":"text","text":"Add a login flow with a session cookie."}]}}}
