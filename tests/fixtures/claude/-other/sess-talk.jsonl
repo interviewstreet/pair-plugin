@@ -1,2 +1,0 @@
-{"type":"user","message":{"role":"user","content":"can you summarize the review comments on acme/demo#7?"},"uuid":"k1","timestamp":"2026-09-20T10:30:00Z","sessionId":"sess-talk","cwd":"/nonexistent/elsewhere","gitBranch":"main"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"There are two comments about the cookie name."}]},"uuid":"k2","timestamp":"2026-09-20T10:30:10Z","sessionId":"sess-talk","cwd":"/nonexistent/elsewhere","gitBranch":"main"}
