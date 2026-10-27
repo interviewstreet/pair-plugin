@@ -1,7 +1,7 @@
 {
   "name": "pair",
-  "version": "0.2.0+codex.20261020",
-  "description": "Review pull requests with context from the coding-agent sessions that built them.",
+  "version": "0.3.0+codex.20261027",
+  "description": "Installs Pair CLI, which publishes PR evidence from the coding-agent sessions that built it for server-side AI review.",
   "author": {
     "name": "five-sh"
   },
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Pair",
     "shortDescription": "Bring PR context into your coding-agent workflow.",
-    "longDescription": "Installs Pair CLI, generates PR evidence, and publishes it for Pair review workspaces.",
+    "longDescription": "Installs Pair CLI, which publishes redacted PR evidence and agent-session context to Pair, where an AI review is generated server-side.",
     "developerName": "five-sh",
     "category": "Developer Tools",
     "capabilities": [
