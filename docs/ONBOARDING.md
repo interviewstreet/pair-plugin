@@ -22,9 +22,43 @@ Installing alone does not run it; start a new session.
    Setup is idempotent: it checks for a newer `paircli`, installs the PR hook
    for that harness, and starts device login if you have no valid credential.
    Login can wait for you to approve in the browser; it never blocks the session.
-3. The session shows a one-line status, for example
-   `Pair CLI 0.3.0: logged in, hook installed`, or `Pair setup started` while
-   the first install is still running.
+3. The session shows a one-line status that says what to do next:
+
+   | Status | Meaning |
+   | --- | --- |
+   | `Pair CLI 0.3.0: logged in, hook installed` | Ready. Nothing to do. |
+   | `Pair setup started: installing the Pair CLI, then approve the login in your browser; ...` | First session: the install is running in the background. When it finishes, setup opens `https://pair.sh/app/device?user_code=...` in your browser. |
+   | `Pair CLI 0.3.0: login pending, hook installed. To finish, approve the login in your browser; the device code and URL are in ~/.paircli/logs/setup-*.log` | Approve the login on pair.sh. If no tab opened, open the URL from that log (the newest `setup-*.log`) and check the code matches. |
+
+   The status is read when the session starts, so it can say `login pending`
+   while you are mid-approval. Start a new session, or run
+   `~/.paircli/bin/paircli status`, to see the current state.
+
+## Tools the hook checks
+
+The hook looks for the tools Pair needs and puts a one-line reason in the
+status instead of failing silently in a log:
+
+- `python3` runs the hook itself, so it is not checked. If it is missing the
+  hook cannot run at all, and no status appears.
+- `curl` downloads `paircli`. It is only checked until the binary is installed.
+  Without it the status reads `Pair setup did not start: curl not found, ...`
+  and nothing is started. Install curl and start a new session.
+- `gh` (the GitHub CLI, signed in with `gh auth login`) is what `paircli` uses
+  to read and comment on PRs. Without it setup still runs and the status ends
+  with `Note: gh not found; ...`. The hook checks that `gh` is on `PATH`, not
+  that you are signed in.
+
+The hook always exits 0 and finishes well inside its 5 second timeout: the
+checks are lookups on `PATH`, and the install and login run in a detached
+process.
+
+## Publishing needs GitHub authorization
+
+After you sign in on pair.sh, publishing also needs a GitHub identity on your
+Pair account and the Pair GitHub App authorized for the repository. Pair asks
+for that on the PR's page, `https://pair.sh/<owner>/<repo>/pull/<n>`. If
+`paircli publish` is refused for lack of it, it prints that link.
 
 ## How PRs are published
 
@@ -64,8 +98,9 @@ it is ready; `paircli publish --wait` waits for it and notifies you.
 
 - `paircli status` (or `--json`) shows the version, server, login, installed
   hooks, setup state and your recent publications.
-- Logs are under `~/.paircli/logs/`: `bootstrap-<timestamp>.log` for install
-  and setup, and one log per publish.
+- Logs are under `~/.paircli/logs/`: `bootstrap-<timestamp>.log` for the
+  install, `setup-<timestamp>.log` for setup (including the login's device code
+  and URL), and one log per publish.
 - State is under `~/.paircli/state/`: per-PR publication records, the revision
   journal and the session capture cursors.
 - If setup failed, fix the reported cause and run `paircli setup` again, or
