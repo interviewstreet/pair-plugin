@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from pathlib import Path
 PLUGIN_VERSION = "0.3.0"
 MANIFEST_URL = "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
 MAX_BINARY_BYTES = 100 * 1024 * 1024
+SETUP_LOG_GLOB = "~/.paircli/logs/setup-*.log"
+LOGIN_HELP = f"approve the login in your browser; the device code and URL are in {SETUP_LOG_GLOB}"
 
 
 def detect_harness(environ=os.environ) -> str:
@@ -113,18 +116,35 @@ def start_child(harness: str, home: Path) -> Path:
     return log
 
 
+def preflight(installed: bool, which=None) -> tuple:
+    """Return (blocker, note): one-line reasons for tools this machine lacks, or None.
+
+    python3 is not checked: it is running this hook. curl only matters until the binary is installed, and
+    without it setup cannot start (blocker). gh is only needed to publish, so its absence is a note.
+    """
+    which = which or shutil.which
+    blocker = None if installed or which("curl") else (
+        "curl not found, so the Pair CLI cannot be downloaded; install curl and start a new session")
+    note = None if which("gh") else "gh not found; install the GitHub CLI and run `gh auth login` so Pair can publish PRs"
+    return blocker, note
+
+
 def status_line(binary: Path, harness: str) -> str:
     if not is_installed(binary):
-        return "Pair setup started"
+        return f"Pair setup started: installing the Pair CLI, then {LOGIN_HELP}"
     try:
         out = subprocess.run([str(binary), "status", "--json"], capture_output=True, text=True, timeout=3)
         status = json.loads(out.stdout)
-        login = "logged in" if status.get("logged_in") else "login pending"
+        logged_in = bool(status.get("logged_in"))
         hook = "installed" if (status.get("hooks") or {}).get(harness) else "pending"
         version = f" {status['cli_version']}" if status.get("cli_version") else ""
-        return f"Pair CLI{version}: {login}, hook {hook}"
+        line = f"Pair CLI{version}: {'logged in' if logged_in else 'login pending'}, hook {hook}"
+        if not logged_in:
+            log = (status.get("setup") or {}).get("log")
+            line += f". To finish, approve the login in your browser; the device code and URL are in {log or SETUP_LOG_GLOB}"
+        return line
     except Exception:
-        return "Pair setup started"
+        return f"Pair setup started; if it asks for a login, {LOGIN_HELP}"
 
 
 def hook_output(message: str) -> str:
@@ -143,8 +163,15 @@ def main(argv=None, home: Path = None) -> int:
         return 0
     try:
         harness = detect_harness()
-        start_child(harness, home)
-        message = status_line(home / ".paircli" / "bin" / "paircli", harness)
+        binary = home / ".paircli" / "bin" / "paircli"
+        blocker, note = preflight(is_installed(binary))
+        if blocker:
+            message = f"Pair setup did not start: {blocker}"
+        else:
+            start_child(harness, home)
+            message = status_line(binary, harness)
+        if note:
+            message += f". Note: {note}"
     except Exception as error:
         message = f"Pair setup could not start: {error}"
     print(hook_output(message))

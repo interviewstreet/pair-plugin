@@ -123,17 +123,65 @@ def test_hook_output_shape():
                    "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "Pair setup started"}}
 
 
-def test_status_line_before_install_and_from_status_json(tmp_path):
-    binary = tmp_path / "paircli"
-    assert bootstrap.status_line(binary, "codex") == "Pair setup started"
+def fake_cli(path, status):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\ncat <<'EOF'\n" + (status if isinstance(status, str) else json.dumps(status)) + "\nEOF\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_status_line_before_install_says_what_happens_next(tmp_path):
+    line = bootstrap.status_line(tmp_path / "paircli", "codex")
+    assert line.startswith("Pair setup started: installing the Pair CLI")
+    assert "approve the login in your browser" in line and "~/.paircli/logs/setup-*.log" in line
+
+
+def test_status_line_from_status_json(tmp_path):
     status = {"cli_version": "0.3.0", "logged_in": True, "hooks": {"codex": True, "claude-code": False}}
-    binary.write_text("#!/bin/sh\ncat <<'EOF'\n" + json.dumps(status) + "\nEOF\n")
-    binary.chmod(0o755)
+    binary = fake_cli(tmp_path / "paircli", status)
     assert bootstrap.status_line(binary, "codex") == "Pair CLI 0.3.0: logged in, hook installed"
     assert bootstrap.status_line(binary, "claude-code") == "Pair CLI 0.3.0: logged in, hook pending"
 
 
+def test_status_line_while_login_is_pending_says_to_approve_in_the_browser(tmp_path):
+    status = {"cli_version": "0.3.0", "logged_in": False, "hooks": {"codex": True}}
+    line = bootstrap.status_line(fake_cli(tmp_path / "paircli", status), "codex")
+    assert line.startswith("Pair CLI 0.3.0: login pending, hook installed. ")
+    assert "approve the login in your browser" in line
+    assert line.endswith("device code and URL are in ~/.paircli/logs/setup-*.log")
+
+
+def test_status_line_names_the_setup_log_the_cli_reports(tmp_path):
+    log = "/home/me/.paircli/logs/setup-20261027-093000.log"
+    status = {"logged_in": False, "hooks": {}, "setup": {"state": "running", "log": log}}
+    assert bootstrap.status_line(fake_cli(tmp_path / "paircli", status), "codex").endswith(f"are in {log}")
+
+
+def test_status_line_when_status_is_unreadable_still_says_what_to_do(tmp_path):
+    line = bootstrap.status_line(fake_cli(tmp_path / "paircli", "not json"), "codex")
+    assert line.startswith("Pair setup started; if it asks for a login, approve the login in your browser")
+    assert "~/.paircli/logs/setup-*.log" in line
+
+
+def test_preflight_reports_missing_tools_in_one_line_each():
+    have = lambda *names: lambda name: f"/usr/bin/{name}" if name in names else None
+    assert bootstrap.preflight(False, have("curl", "gh")) == (None, None)
+    blocker, note = bootstrap.preflight(False, have())
+    assert blocker.startswith("curl not found") and "\n" not in blocker
+    assert note.startswith("gh not found") and "gh auth login" in note and "\n" not in note
+    assert bootstrap.preflight(False, have("curl")) == (None, note)
+
+
+def test_preflight_does_not_need_curl_once_the_cli_is_installed():
+    assert bootstrap.preflight(True, lambda name: None)[0] is None
+
+
+def only_tools(monkeypatch, *names):
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: f"/usr/bin/{name}" if name in names else None)
+
+
 def test_main_prints_one_json_object_and_starts_detached_child(tmp_path, monkeypatch, capsys):
+    only_tools(monkeypatch, "curl", "gh")
     started = []
 
     class FakePopen:
@@ -144,14 +192,43 @@ def test_main_prints_one_json_object_and_starts_detached_child(tmp_path, monkeyp
     monkeypatch.delenv("PLUGIN_ROOT", raising=False)
     assert bootstrap.main([], home=tmp_path) == 0
     lines = capsys.readouterr().out.strip().splitlines()
-    assert len(lines) == 1 and json.loads(lines[0])["systemMessage"] == "Pair setup started"
+    assert len(lines) == 1 and json.loads(lines[0])["systemMessage"].startswith("Pair setup started: installing")
     [(command, kwargs)] = started
     assert command[-2:] == ["run", "claude-code"] and kwargs["start_new_session"] is True
     [log] = (tmp_path / ".paircli" / "logs").glob("bootstrap-*.log")
     assert log.exists()
 
 
+def test_main_without_curl_says_why_and_starts_nothing(tmp_path, monkeypatch, capsys):
+    only_tools(monkeypatch, "gh")
+    monkeypatch.setattr(bootstrap, "start_child", lambda *a: pytest.fail("started a child that cannot install"))
+    assert bootstrap.main([], home=tmp_path) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["systemMessage"].startswith("Pair setup did not start: curl not found")
+
+
+def test_main_without_gh_adds_a_note_but_still_sets_up(tmp_path, monkeypatch, capsys):
+    only_tools(monkeypatch, "curl")
+    started = []
+    monkeypatch.setattr(bootstrap, "start_child", lambda *a: started.append(a))
+    assert bootstrap.main([], home=tmp_path) == 0
+    message = json.loads(capsys.readouterr().out)["systemMessage"]
+    assert message.startswith("Pair setup started") and ". Note: gh not found; install the GitHub CLI" in message
+    assert len(started) == 1 and "\n" not in message
+
+
+def test_main_with_the_cli_installed_does_not_need_curl(tmp_path, monkeypatch, capsys):
+    only_tools(monkeypatch, "gh")
+    fake_cli(tmp_path / ".paircli" / "bin" / "paircli", {"cli_version": "0.3.0", "logged_in": True, "hooks": {"claude-code": True}})
+    monkeypatch.delenv("PLUGIN_ROOT", raising=False)
+    monkeypatch.setattr(bootstrap, "start_child", lambda *a: None)
+    assert bootstrap.main([], home=tmp_path) == 0
+    assert json.loads(capsys.readouterr().out)["systemMessage"] == "Pair CLI 0.3.0: logged in, hook installed"
+
+
 def test_main_never_raises(tmp_path, monkeypatch, capsys):
+    only_tools(monkeypatch, "curl", "gh")
     def boom(*args, **kwargs):
         raise OSError("no fork")
 
