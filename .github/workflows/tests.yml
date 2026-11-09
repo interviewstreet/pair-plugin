@@ -1,0 +1,26 @@
+name: Bootstrap tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install declared test dependency
+        run: python -m pip install 'pytest>=8'
+      - name: Test bootstrap and migration
+        run: python -m pytest tests -q
