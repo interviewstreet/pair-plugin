@@ -1,8 +1,0 @@
-{
-  "install": "set -eu; test -d ../pair-be/.git || git clone --branch kousik-sh/pair-review --single-branch https://github.com/interviewstreet/pair-be.git ../pair-be; test -d ../pair-fe/.git || git clone --branch kousik-sh/expose-review --single-branch https://github.com/interviewstreet/pair-fe.git ../pair-fe",
-  "start": "sudo service docker start || true",
-  "repositoryDependencies": [
-    "github.com/interviewstreet/pair-be",
-    "github.com/interviewstreet/pair-fe"
-  ]
-}

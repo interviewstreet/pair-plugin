@@ -3,6 +3,10 @@
   "version": "0.3.0",
   "description": "Installs Pair CLI, which publishes PR evidence from the coding-agent sessions that built it for server-side AI review.",
   "author": {
-    "name": "five-sh"
-  }
+    "name": "HackerRank",
+    "url": "https://www.hackerrank.com"
+  },
+  "homepage": "https://pair.sh",
+  "repository": "https://github.com/interviewstreet/pair-plugin",
+  "keywords": ["pull-request", "code-review", "agent-sessions", "pair"]
 }

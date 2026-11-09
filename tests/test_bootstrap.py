@@ -256,3 +256,20 @@ def test_child_runs_setup_with_harness_and_plugin_version(tmp_path, monkeypatch)
     monkeypatch.setattr(bootstrap.subprocess, "run", lambda command, **kwargs: seen.append(command) or Done())
     bootstrap.run_child("codex", tmp_path)
     assert seen == [[str(binary), "setup", "--harness", "codex", "--plugin-version", "0.3.0"]]
+
+
+ROOT = HOOKS_DIR.parent
+
+
+def test_plugin_versions_agree():
+    claude = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())["version"]
+    codex = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())["version"]
+    pyproject = next(line for line in (ROOT / "pyproject.toml").read_text().splitlines() if line.startswith("version"))
+    assert claude == codex == bootstrap.PLUGIN_VERSION
+    assert pyproject.split('"')[1] == claude
+
+
+def test_hook_command_uses_only_claude_plugin_root():
+    # The Claude directory validator rejects any other variable in a hook command; Codex sets this one too.
+    command = json.loads((ROOT / "hooks" / "hooks.json").read_text())["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert command == 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/bootstrap.py"'
