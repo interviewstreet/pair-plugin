@@ -17,7 +17,7 @@ SPEC.loader.exec_module(bootstrap)
 
 BINARY = b"#!/bin/sh\necho paircli\n"
 DIGEST = hashlib.sha256(BINARY).hexdigest()
-URL = "https://github.com/rutvikchandla3/paircli/releases/download/v0.3.0/paircli-darwin-arm64"
+URL = "https://github.com/interviewstreet/paircli/releases/download/v0.3.0/paircli-darwin-arm64"
 
 
 def manifest(**overrides):
@@ -127,6 +127,7 @@ def fake_cli(path, status):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/sh\ncat <<'EOF'\n" + (status if isinstance(status, str) else json.dumps(status)) + "\nEOF\n")
     path.chmod(0o755)
+    bootstrap.record_release_source(path)
     return path
 
 
@@ -248,6 +249,7 @@ def test_child_runs_setup_with_harness_and_plugin_version(tmp_path, monkeypatch)
     binary.parent.mkdir(parents=True)
     binary.write_text("#!/bin/sh\n")
     binary.chmod(0o755)
+    bootstrap.record_release_source(binary)
     seen = []
 
     class Done:
@@ -255,4 +257,86 @@ def test_child_runs_setup_with_harness_and_plugin_version(tmp_path, monkeypatch)
 
     monkeypatch.setattr(bootstrap.subprocess, "run", lambda command, **kwargs: seen.append(command) or Done())
     bootstrap.run_child("codex", tmp_path)
-    assert seen == [[str(binary), "setup", "--harness", "codex", "--plugin-version", "0.3.0"]]
+    assert seen == [[str(binary), "setup", "--harness", "codex", "--plugin-version", "0.3.1"]]
+
+
+def test_bootstrap_uses_organization_manifest():
+    assert bootstrap.MANIFEST_URL == "https://github.com/interviewstreet/paircli/releases/latest/download/latest.json"
+
+
+def test_plugin_versions_match_bootstrap():
+    root = HOOKS_DIR.parent
+    assert json.loads((root / ".claude-plugin/plugin.json").read_text())["version"] == bootstrap.PLUGIN_VERSION
+    assert json.loads((root / ".codex-plugin/plugin.json").read_text())["version"].split("+", 1)[0] == bootstrap.PLUGIN_VERSION
+    assert f'version = "{bootstrap.PLUGIN_VERSION}"' in (root / "pyproject.toml").read_text()
+
+
+def test_child_migrates_existing_cli_before_setup(tmp_path, monkeypatch):
+    binary = tmp_path / ".paircli" / "bin" / "paircli"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"old personal-source CLI")
+    binary.chmod(0o755)
+    credentials = tmp_path / ".paircli" / "credentials.json"
+    credentials.write_text("preserve existing credentials")
+    calls = []
+
+    install_binary = bootstrap.install_binary
+
+    def verified_install(target, key):
+        calls.append("install")
+        install_binary(target, key, fetch=fake_fetch())
+
+    class Done:
+        returncode = 0
+
+    def setup(command, **kwargs):
+        assert binary.read_bytes() == BINARY
+        assert bootstrap.uses_organization_release(binary)
+        calls.append("setup")
+        return Done()
+
+    monkeypatch.setattr(bootstrap, "platform_key", lambda: "darwin-arm64")
+    monkeypatch.setattr(bootstrap, "install_binary", verified_install)
+    monkeypatch.setattr(bootstrap.subprocess, "run", setup)
+    assert bootstrap.run_child("codex", tmp_path) == 0
+    assert bootstrap.run_child("codex", tmp_path) == 0
+    assert calls == ["install", "setup", "setup"]
+    assert credentials.read_text() == "preserve existing credentials"
+
+
+def test_failed_migration_preserves_old_cli_and_does_not_execute_it(tmp_path, monkeypatch):
+    binary = tmp_path / ".paircli" / "bin" / "paircli"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"old")
+    binary.chmod(0o755)
+    install_binary = bootstrap.install_binary
+    monkeypatch.setattr(bootstrap, "platform_key", lambda: "darwin-arm64")
+    monkeypatch.setattr(bootstrap, "install_binary", lambda target, key: install_binary(target, key, fetch=fake_fetch(binary=b"tampered")))
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda *args, **kwargs: pytest.fail("unverified CLI executed"))
+    with pytest.raises(RuntimeError, match="sha256"):
+        bootstrap.run_child("codex", tmp_path)
+    assert binary.read_bytes() == b"old"
+    assert not binary.with_name("release-source.json").exists()
+
+
+@pytest.mark.parametrize("marker", ["invalid JSON", "[]", '{"manifest_url":"https://example.com/old.json"}'])
+def test_invalid_source_marker_requires_migration(tmp_path, marker):
+    binary = fake_cli(tmp_path / "paircli", {})
+    binary.with_name("release-source.json").write_text(marker)
+    assert not bootstrap.uses_organization_release(binary)
+
+
+def test_status_does_not_run_old_cli_during_migration(tmp_path, monkeypatch):
+    binary = fake_cli(tmp_path / "paircli", {})
+    binary.with_name("release-source.json").unlink()
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda *args, **kwargs: pytest.fail("old CLI executed"))
+    assert "switching to the organization-owned CLI" in bootstrap.status_line(binary, "codex")
+
+
+def test_unmigrated_install_requires_curl(tmp_path, monkeypatch, capsys):
+    only_tools(monkeypatch, "gh")
+    binary = fake_cli(tmp_path / ".paircli" / "bin" / "paircli", {})
+    binary.with_name("release-source.json").unlink()
+    monkeypatch.setattr(bootstrap, "start_child", lambda *args: pytest.fail("migration without curl"))
+    assert bootstrap.main([], home=tmp_path) == 0
+    assert "curl not found" in json.loads(capsys.readouterr().out)["systemMessage"]

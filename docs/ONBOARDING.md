@@ -11,14 +11,20 @@ installed (or updated), the plugin's `SessionStart` hook runs
 `hooks/bootstrap.py`. Codex asks you to review and trust the hook first.
 Installing alone does not run it; start a new session.
 
-1. If `~/.paircli/bin/paircli` is missing, a detached background process
+1. If `~/.paircli/bin/paircli` is missing or has not yet been migrated to the
+   organization-owned release source, a detached background process
    downloads the release manifest
-   `https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json`
+   `https://github.com/interviewstreet/paircli/releases/latest/download/latest.json`
    with `curl`, picks the binary for your OS and CPU, checks its SHA-256 and a
    100 MiB size cap, and installs it atomically. Only https downloads are
    accepted, using your system trust store.
+   After successful installation it records the source in
+   `~/.paircli/bin/release-source.json`. This is a migration marker, not a
+   signature. A failed install preserves the previous binary without executing
+   it from this setup attempt; credentials, hook paths and publication state are
+   not replaced. Later sessions do not reinstall an already migrated CLI.
 2. The same process runs
-   `paircli setup --harness <claude-code|codex> --plugin-version 0.3.0`.
+   `paircli setup --harness <claude-code|codex> --plugin-version 0.3.1`.
    Setup is idempotent: it checks for a newer `paircli`, installs the PR hook
    for that harness, and starts device login if you have no valid credential.
    Login can wait for you to approve in the browser; it never blocks the session.
@@ -41,7 +47,8 @@ status instead of failing silently in a log:
 
 - `python3` runs the hook itself, so it is not checked. If it is missing the
   hook cannot run at all, and no status appears.
-- `curl` downloads `paircli`. It is only checked until the binary is installed.
+- `curl` downloads `paircli`. It is checked until the binary is installed and
+  migrated to the organization release source.
   Without it the status reads `Pair setup did not start: curl not found, ...`
   and nothing is started. Install curl and start a new session.
 - `gh` (the GitHub CLI, signed in with `gh auth login`) is what `paircli` uses

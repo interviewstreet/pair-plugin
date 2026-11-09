@@ -17,8 +17,8 @@ import tempfile
 import time
 from pathlib import Path
 
-PLUGIN_VERSION = "0.3.0"
-MANIFEST_URL = "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
+PLUGIN_VERSION = "0.3.1"
+MANIFEST_URL = "https://github.com/interviewstreet/paircli/releases/latest/download/latest.json"
 MAX_BINARY_BYTES = 100 * 1024 * 1024
 SETUP_LOG_GLOB = "~/.paircli/logs/setup-*.log"
 LOGIN_HELP = f"approve the login in your browser; the device code and URL are in {SETUP_LOG_GLOB}"
@@ -99,10 +99,35 @@ def is_installed(binary: Path) -> bool:
     return binary.is_file() and os.access(binary, os.X_OK)
 
 
+def uses_organization_release(binary: Path) -> bool:
+    """Identify installations already refreshed from the organization release source."""
+    if not is_installed(binary):
+        return False
+    try:
+        marker = binary.with_name("release-source.json")
+        return json.loads(marker.read_text()).get("manifest_url") == MANIFEST_URL
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def record_release_source(binary: Path) -> None:
+    """Record successful migration atomically; this marker is not a signature."""
+    fd, name = tempfile.mkstemp(dir=str(binary.parent), prefix=".release-source-")
+    staged = Path(name)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump({"manifest_url": MANIFEST_URL}, stream)
+        os.replace(staged, binary.with_name("release-source.json"))
+    finally:
+        if staged.exists():
+            staged.unlink()
+
+
 def run_child(harness: str, home: Path) -> int:
     binary = home / ".paircli" / "bin" / "paircli"
-    if not is_installed(binary):
+    if not uses_organization_release(binary):
         install_binary(binary, platform_key())
+        record_release_source(binary)
     return subprocess.run([str(binary), "setup", "--harness", harness, "--plugin-version", PLUGIN_VERSION]).returncode
 
 
@@ -132,6 +157,8 @@ def preflight(installed: bool, which=None) -> tuple:
 def status_line(binary: Path, harness: str) -> str:
     if not is_installed(binary):
         return f"Pair setup started: installing the Pair CLI, then {LOGIN_HELP}"
+    if not uses_organization_release(binary):
+        return f"Pair setup started: switching to the organization-owned CLI release, then {LOGIN_HELP}"
     try:
         out = subprocess.run([str(binary), "status", "--json"], capture_output=True, text=True, timeout=3)
         status = json.loads(out.stdout)
@@ -164,7 +191,7 @@ def main(argv=None, home: Path = None) -> int:
     try:
         harness = detect_harness()
         binary = home / ".paircli" / "bin" / "paircli"
-        blocker, note = preflight(is_installed(binary))
+        blocker, note = preflight(uses_organization_release(binary))
         if blocker:
             message = f"Pair setup did not start: {blocker}"
         else:
