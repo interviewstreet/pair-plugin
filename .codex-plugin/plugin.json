@@ -20,7 +20,12 @@
     "defaultPrompt": [
       "Set up Pair for my pull-request workflow."
     ],
-    "websiteURL": "https://pair.sh"
+    "websiteURL": "https://pair.sh",
+    "logo": "./assets/icon.png",
+    "composerIcon": "./assets/icon.png",
+    "supportURL": "https://pair.sh/support",
+    "privacyPolicyURL": "https://pair.sh/privacy",
+    "termsOfServiceURL": "https://pair.sh/terms"
   },
   "homepage": "https://pair.sh",
   "repository": "https://github.com/interviewstreet/pair-plugin",

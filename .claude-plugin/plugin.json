@@ -14,5 +14,9 @@
     "agent-sessions",
     "pair"
   ],
-  "license": "SEE LICENSE IN LICENSE"
+  "license": "SEE LICENSE IN LICENSE",
+  "icon": "./assets/icon.png",
+  "privacyPolicyUrl": "https://pair.sh/privacy",
+  "termsOfServiceUrl": "https://pair.sh/terms",
+  "supportUrl": "https://pair.sh/support"
 }

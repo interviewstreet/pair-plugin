@@ -273,3 +273,15 @@ def test_hook_command_uses_only_claude_plugin_root():
     # The Claude directory validator rejects any other variable in a hook command; Codex sets this one too.
     command = json.loads((ROOT / "hooks" / "hooks.json").read_text())["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     assert command == 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/bootstrap.py"'
+
+
+def test_manifest_icons_exist_and_are_square_png():
+    claude = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+    codex = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())["interface"]
+    for ref in {claude["icon"], codex["logo"], codex["composerIcon"]}:
+        assert ref.startswith("./")
+        data = (ROOT / ref).read_bytes()
+        assert data[:8] == b"\x89PNG\r\n\x1a\n"
+        width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+        assert width == height and 512 <= width <= 2048
+        assert len(data) < 2 * 1024 * 1024
