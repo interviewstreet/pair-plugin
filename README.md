@@ -9,6 +9,10 @@ server-side.
 
 Claude Code: `/plugin install pair --marketplace interviewstreet/pair-plugin`
 
+Codex (manual install, not yet in the public directory): `codex plugin marketplace add interviewstreet/pair-plugin`,
+then restart the app and install Pair from the marketplace in the Plugins Directory. Codex asks you to review
+and trust the session-start hook before it runs.
+
 ## What it does
 
 - At session start, `hooks/bootstrap.py` installs `~/.paircli/bin/paircli` if it is missing and runs `paircli setup`.

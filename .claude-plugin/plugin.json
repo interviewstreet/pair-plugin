@@ -8,5 +8,11 @@
   },
   "homepage": "https://pair.sh",
   "repository": "https://github.com/interviewstreet/pair-plugin",
-  "keywords": ["pull-request", "code-review", "agent-sessions", "pair"]
+  "keywords": [
+    "pull-request",
+    "code-review",
+    "agent-sessions",
+    "pair"
+  ],
+  "license": "SEE LICENSE IN LICENSE"
 }
