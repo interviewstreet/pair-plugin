@@ -1,14 +1,14 @@
 {
-  "name": "pair-local",
+  "name": "pair",
   "interface": {
-    "displayName": "Pair Local"
+    "displayName": "Pair"
   },
   "plugins": [
     {
       "name": "pair",
       "source": {
         "source": "local",
-        "path": "."
+        "path": "./"
       },
       "policy": {
         "installation": "AVAILABLE",

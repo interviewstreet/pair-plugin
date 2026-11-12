@@ -1,11 +1,13 @@
 {
-  "name": "pair-local",
-  "owner": {"name": "five-sh"},
+  "name": "pair",
+  "owner": {"name": "HackerRank"},
+  "description": "Pair publishes PR evidence from the coding-agent sessions that built it for AI review.",
   "plugins": [
     {
       "name": "pair",
       "source": "./",
-      "description": "Installs Pair CLI, which publishes PR evidence from the coding-agent sessions that built it for server-side AI review."
+      "description": "Installs Pair CLI, which publishes PR evidence from the coding-agent sessions that built it for server-side AI review.",
+      "category": "development"
     }
   ]
 }

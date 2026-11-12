@@ -364,3 +364,41 @@ def test_legacy_cli_needs_curl_to_migrate(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(bootstrap, "start_child", lambda *args: pytest.fail("migration cannot download"))
     assert bootstrap.main([], home=tmp_path) == 0
     assert "curl not found" in json.loads(capsys.readouterr().out)["systemMessage"]
+
+
+ROOT = HOOKS_DIR.parent
+
+
+def test_plugin_versions_agree():
+    claude = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())["version"]
+    codex = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())["version"]
+    pyproject = next(line for line in (ROOT / "pyproject.toml").read_text().splitlines() if line.startswith("version"))
+    assert claude == codex == bootstrap.PLUGIN_VERSION
+    assert pyproject.split('"')[1] == claude
+
+
+def test_hook_command_uses_only_claude_plugin_root():
+    # The Claude directory validator rejects any other variable in a hook command; Codex sets this one too.
+    command = json.loads((ROOT / "hooks" / "hooks.json").read_text())["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert command == 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/bootstrap.py"'
+
+
+def test_manifest_icons_exist_and_are_square_png():
+    claude = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+    codex = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())["interface"]
+    for ref in {claude["icon"], codex["logo"], codex["composerIcon"]}:
+        assert ref.startswith("./")
+        data = (ROOT / ref).read_bytes()
+        assert data[:8] == b"\x89PNG\r\n\x1a\n"
+        width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+        assert width == height and 512 <= width <= 2048
+        assert len(data) < 2 * 1024 * 1024
+
+
+def test_marketplaces_keep_main_layout_and_root_plugin_sources():
+    claude = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text())
+    codex = json.loads((ROOT / ".agents/plugins/marketplace.json").read_text())
+    assert claude["owner"]["name"] == "HackerRank"
+    assert claude["plugins"][0]["source"] == "./"
+    assert codex["plugins"][0]["source"] == {"source": "local", "path": "./"}
+    assert codex["plugins"][0]["category"] == "Productivity"
