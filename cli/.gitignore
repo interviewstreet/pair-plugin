@@ -1,0 +1,18 @@
+# Go build output
+/paircli
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# paircli local state (event logs, scan output)
+.paircli/
+/.paircli.local.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# graphify knowledge graph (generated; rebuild with `graphify update .`)
+graphify-out/
