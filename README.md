@@ -20,11 +20,14 @@ and trust the session-start hook before it runs.
 
 ## What it runs, fetches and sends
 
-- **Downloads:** the release manifest and the `paircli` binary for your OS and CPU from the
-  Pair CLI GitHub releases, over https with `curl`. The binary's SHA-256 is checked against the
-  manifest before it is installed in `~/.paircli/bin`.
-- **Runs:** `paircli setup`, which installs a PR hook for your agent and starts a device login in
-  your browser. Nothing is uploaded until you approve that login on pair.sh.
+- **Downloads:** the release manifest
+  (`https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json`) and the `paircli`
+  binary it names, for your OS and CPU, over https with `curl`. The binary's SHA-256 is checked against
+  the manifest before it is installed in `~/.paircli/bin`. This download happens only when the binary is missing.
+- **Runs:** at session start the hook starts one detached background process. It installs the binary if
+  needed and runs `paircli setup`, which installs a PR hook for your agent (a change to your agent's
+  hook configuration) and starts a device login in your browser. The hook itself finishes in
+  seconds and never blocks your session. Nothing is uploaded until you approve that login on pair.sh.
 - **Uploads:** after login, when your agent creates a PR or pushes to a PR branch, `paircli`
   uploads the PR scan and the new part of the agent session transcripts, with secrets redacted on
   your machine, to pair.sh. Transcripts can contain your prompts and the agent's output.

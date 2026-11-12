@@ -255,7 +255,7 @@ def test_child_runs_setup_with_harness_and_plugin_version(tmp_path, monkeypatch)
 
     monkeypatch.setattr(bootstrap.subprocess, "run", lambda command, **kwargs: seen.append(command) or Done())
     bootstrap.run_child("codex", tmp_path)
-    assert seen == [[str(binary), "setup", "--harness", "codex", "--plugin-version", "0.3.0"]]
+    assert seen == [[str(binary), "setup", "--harness", "codex", "--plugin-version", bootstrap.PLUGIN_VERSION]]
 
 
 ROOT = HOOKS_DIR.parent
