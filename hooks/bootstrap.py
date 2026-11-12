@@ -17,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
 MANIFEST_URL = "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
 MAX_BINARY_BYTES = 100 * 1024 * 1024
 SETUP_LOG_GLOB = "~/.paircli/logs/setup-*.log"

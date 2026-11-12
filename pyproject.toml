@@ -1,6 +1,6 @@
 [project]
 name = "pair-plugin"
-version = "0.3.0"
+version = "0.3.1"
 description = "Claude Code and Codex plugin that installs Pair CLI"
 requires-python = ">=3.12"
 dependencies = []

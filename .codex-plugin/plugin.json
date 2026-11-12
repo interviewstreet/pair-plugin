@@ -1,16 +1,17 @@
 {
   "name": "pair",
-  "version": "0.3.0+codex.20261027",
+  "version": "0.3.1",
   "description": "Installs Pair CLI, which publishes PR evidence from the coding-agent sessions that built it for server-side AI review.",
   "author": {
-    "name": "five-sh"
+    "name": "HackerRank",
+    "url": "https://www.hackerrank.com"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Pair",
     "shortDescription": "Bring PR context into your coding-agent workflow.",
     "longDescription": "Installs Pair CLI, which publishes redacted PR evidence and agent-session context to Pair, where an AI review is generated server-side.",
-    "developerName": "five-sh",
+    "developerName": "HackerRank",
     "category": "Developer Tools",
     "capabilities": [
       "Developer workflow",
@@ -18,6 +19,21 @@
     ],
     "defaultPrompt": [
       "Set up Pair for my pull-request workflow."
-    ]
-  }
+    ],
+    "websiteURL": "https://pair.sh",
+    "logo": "./assets/icon.png",
+    "composerIcon": "./assets/icon.png",
+    "supportURL": "https://pair.sh/support",
+    "privacyPolicyURL": "https://pair.sh/privacy",
+    "termsOfServiceURL": "https://pair.sh/terms"
+  },
+  "homepage": "https://pair.sh",
+  "repository": "https://github.com/interviewstreet/pair-plugin",
+  "keywords": [
+    "pull-request",
+    "code-review",
+    "agent-sessions",
+    "pair"
+  ],
+  "license": "SEE LICENSE IN LICENSE"
 }

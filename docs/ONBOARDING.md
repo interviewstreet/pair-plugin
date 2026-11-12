@@ -18,7 +18,7 @@ Installing alone does not run it; start a new session.
    100 MiB size cap, and installs it atomically. Only https downloads are
    accepted, using your system trust store.
 2. The same process runs
-   `paircli setup --harness <claude-code|codex> --plugin-version 0.3.0`.
+   `paircli setup --harness <claude-code|codex> --plugin-version 0.3.1`.
    Setup is idempotent: it checks for a newer `paircli`, installs the PR hook
    for that harness, and starts device login if you have no valid credential.
    Login can wait for you to approve in the browser; it never blocks the session.

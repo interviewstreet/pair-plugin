@@ -1,11 +1,290 @@
-# Pair plugin
+<p align="center">
+  <img src="assets/icon.png" alt="Pair" width="96" height="96">
+</p>
 
-Claude Code and Codex plugin that installs [Pair CLI](https://github.com/rutvikchandla3/paircli).
-Pair CLI publishes a pull request's evidence, including redacted transcripts of the agent
-sessions that built it, to [pair.sh](https://pair.sh), where an AI review is generated
+<h1 align="center">Pair</h1>
+
+<p align="center">
+  Publish a pull request together with the agent sessions that built it, and get an AI review of how it was made.
+  <br>
+  For <a href="https://claude.com/product/claude-code">Claude Code</a> and <a href="https://developers.openai.com/codex">Codex</a>.
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#custom-marketplaces">Custom marketplaces</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#what-it-runs-fetches-and-sends">Privacy</a> ·
+  <a href="#troubleshooting">Troubleshooting</a>
+</p>
+
+---
+
+A diff shows what changed. It doesn't show how the change came to be. Pair captures that
+missing context: it publishes a pull request's evidence, including **redacted transcripts of the
+coding-agent sessions that built it**, to [pair.sh](https://pair.sh), where an AI review is generated
 server-side.
 
-- `hooks/bootstrap.py` runs at session start: installs `~/.paircli/bin/paircli` if missing and runs `paircli setup`.
-- `/pair owner/repo#N` runs `paircli publish` and replies with the pair.sh link.
+This repository is the plugin. It is deliberately thin: it installs the Pair CLI (`paircli`) on your
+machine and gets out of the way. Scanning, redaction, publishing and PR detection all live in the CLI.
 
-See [docs/ONBOARDING.md](docs/ONBOARDING.md) for setup, what is uploaded, and how to uninstall.
+## Install
+
+### Claude Code
+
+```text
+/plugin install pair --marketplace interviewstreet/pair-plugin
+```
+
+Or from your shell:
+
+```sh
+claude plugin marketplace add interviewstreet/pair-plugin
+claude plugin install pair@pair
+```
+
+Then start a new session. The plugin's session-start hook sets everything up.
+
+### Codex
+
+```sh
+codex plugin marketplace add interviewstreet/pair-plugin
+codex plugin add pair@pair
+```
+
+Start a new session and review the hook when Codex asks. Codex skips plugin hooks until you trust them.
+Pair is installed from this repository rather than from Codex's public directory.
+
+### What happens on first run
+
+The first session after install shows a one-line status, and setup finishes in the background:
+
+1. Pair CLI is downloaded to `~/.paircli/bin/paircli` (only if it's missing).
+2. `paircli setup` installs the PR hook for your agent and opens a **device login** in your browser.
+3. Approve the login on pair.sh. Nothing is uploaded before you do.
+
+| Status line | Meaning |
+| --- | --- |
+| `Pair setup started: installing the Pair CLI, then approve the login in your browser; …` | First session. Setup is running in the background. |
+| `Pair CLI <version>: login pending, hook installed. To finish, approve the login in your browser; …` | Approve the login on pair.sh. The device code and URL are in `~/.paircli/logs/setup-*.log`. |
+| `Pair CLI <version>: logged in, hook installed` | Ready. Nothing to do. |
+
+## Custom marketplaces
+
+Install Pair from your own marketplace to pin a version, mirror it, or roll it out to a team.
+
+### Claude Code
+
+Add Pair as an entry in your marketplace's `.claude-plugin/marketplace.json`:
+
+```json
+{
+  "name": "acme-tools",
+  "owner": { "name": "Acme" },
+  "plugins": [
+    {
+      "name": "pair",
+      "source": {
+        "source": "github",
+        "repo": "interviewstreet/pair-plugin",
+        "ref": "main"
+      }
+    }
+  ]
+}
+```
+
+Pin to an exact commit by adding `"sha": "<40-character commit sha>"`. Users then install it with:
+
+```sh
+claude plugin marketplace add your-org/your-marketplace
+claude plugin install pair@acme-tools
+```
+
+To give every teammate the marketplace and the plugin without a manual step, commit this to the project's
+`.claude/settings.json`:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "acme-tools": {
+      "source": { "source": "github", "repo": "your-org/your-marketplace" }
+    }
+  },
+  "enabledPlugins": { "pair@acme-tools": true }
+}
+```
+
+### Codex
+
+Add Pair to your marketplace's `.agents/plugins/marketplace.json`:
+
+```json
+{
+  "name": "acme-tools",
+  "interface": { "displayName": "Acme Tools" },
+  "plugins": [
+    {
+      "name": "pair",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/interviewstreet/pair-plugin.git",
+        "ref": "main"
+      },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}
+```
+
+Users then run:
+
+```sh
+codex plugin marketplace add your-org/your-marketplace
+codex plugin add pair@acme-tools
+```
+
+Git-backed entries can use `ref` or `sha` to pin a version.
+
+### From a local checkout
+
+```sh
+git clone https://github.com/interviewstreet/pair-plugin.git
+claude --plugin-dir ./pair-plugin                       # Claude Code, for one session
+claude plugin marketplace add ./pair-plugin             # Claude Code, installed
+codex plugin marketplace add ./pair-plugin              # Codex
+```
+
+## Usage
+
+Most of the time you don't do anything. After setup, when your agent runs a successful `gh pr create`,
+or a `git push` on a branch that has an open PR, the Pair hook publishes the PR in the background and
+prints the review link:
+
+```text
+https://pair.sh/<owner>/<repo>/pull/<n>
+```
+
+To publish by hand, use the `/pair` skill with a PR reference, URL or number:
+
+```text
+/pair owner/repo#123
+/pair https://github.com/owner/repo/pull/123
+/pair 123
+```
+
+The AI review is generated on the server after the upload, so the page fills in a few minutes later.
+
+> **Publishing needs GitHub access.** After you sign in on pair.sh, the Pair GitHub App must be authorized
+> for the repository. Pair asks for that on the PR's page; if `paircli publish` is refused for lack of it,
+> it prints the link.
+
+## What it runs, fetches and sends
+
+Nothing here is hidden. This is everything the plugin does:
+
+- **Downloads.** The release manifest
+  (`https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json`) and the `paircli`
+  binary it names, for your OS and CPU, over https with `curl`. The binary's SHA-256 is checked against the
+  manifest before it is installed in `~/.paircli/bin`. This happens only when the binary is missing.
+- **Runs.** At session start the hook starts one detached background process. It installs the binary if
+  needed and runs `paircli setup`, which installs a PR hook for your agent (a change to your agent's hook
+  configuration) and starts a device login in your browser. The hook itself finishes in seconds and never
+  blocks your session. Nothing is uploaded until you approve that login on pair.sh.
+- **Uploads.** After login, when your agent creates a PR or pushes to a PR branch, `paircli` uploads the PR
+  scan and the new part of the agent session transcripts to pair.sh. Transcripts can contain your prompts and
+  the agent's output. Secrets are redacted **on your machine** before anything is written to the upload.
+  Redaction is best effort; don't rely on it for secrets you wouldn't want Pair to hold.
+
+[docs/ONBOARDING.md](docs/ONBOARDING.md) lists exactly which files are uploaded and which token formats are redacted.
+
+## Requirements
+
+- macOS or Linux on arm64 or amd64. Windows is not supported.
+- `python3` runs the session-start hook. `curl` downloads the CLI; it's only needed until the CLI is installed.
+- [`gh`](https://cli.github.com), signed in with `gh auth login`, is what Pair uses to read and comment on PRs.
+  Without it, setup still runs, and the status line tells you what's missing.
+
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| No status line appears | Start a **new** session. The hook runs at session start, not at install. In Codex, make sure you trusted the hook. |
+| `Pair setup did not start: curl not found` | Install `curl`, then start a new session. |
+| `Note: gh not found` | Install the GitHub CLI and run `gh auth login`. |
+| `login pending` and no browser tab opened | Open the URL from the newest `~/.paircli/logs/setup-*.log` and check the device code matches. |
+| Check current state | `~/.paircli/bin/paircli status` (add `--json` for scripts). |
+| Setup failed | Fix the reported cause and run `~/.paircli/bin/paircli setup`, or start a new session. |
+
+Logs live in `~/.paircli/logs/`. More detail is in [docs/ONBOARDING.md](docs/ONBOARDING.md).
+
+## Update
+
+```sh
+claude plugin marketplace update pair && claude plugin update pair@pair   # Claude Code
+codex plugin marketplace upgrade                                          # Codex
+```
+
+The CLI also checks for a newer `paircli` each time setup runs.
+
+## Uninstall
+
+Remove the CLI pieces first, because the binary is needed for the first two commands:
+
+```sh
+~/.paircli/bin/paircli hook uninstall   # remove the PR hooks from every harness
+~/.paircli/bin/paircli logout           # delete the stored credential
+rm -rf ~/.paircli                       # binary, logs and state
+```
+
+Then remove the plugin:
+
+```sh
+claude plugin uninstall pair@pair       # Claude Code
+codex plugin remove pair@pair           # Codex
+```
+
+## How it works
+
+```text
+ session starts
+      │
+      ▼
+ hooks/bootstrap.py ──► prints one status line, then returns (never blocks)
+      │ detached background process
+      ▼
+ ~/.paircli/bin/paircli  ◄── downloaded and SHA-256 checked, only if missing
+      │ setup (idempotent): self-update · install PR hook · device login
+      ▼
+ you run `gh pr create` / `git push`  ──►  paircli publish  ──►  pair.sh review
+```
+
+## Repository layout
+
+```text
+.claude-plugin/        Claude Code plugin manifest and marketplace
+.codex-plugin/         Codex plugin manifest
+.agents/plugins/       Codex marketplace
+hooks/                 SessionStart hook: bootstrap.py and hooks.json
+skills/pair/           the /pair skill
+assets/                plugin icon
+docs/ONBOARDING.md     setup, upload contents and uninstall in detail
+tests/                 hook tests
+```
+
+## Development
+
+```sh
+python3 -m pytest                                    # hook tests
+claude plugin validate . --profile directory         # manifest and directory checks
+claude --plugin-dir .                                # try the plugin from this checkout
+```
+
+The plugin version lives in four places that must agree: `.claude-plugin/plugin.json`,
+`.codex-plugin/plugin.json`, `PLUGIN_VERSION` in `hooks/bootstrap.py`, and `pyproject.toml`.
+A test enforces it.
+
+## License
+
+Copyright © 2026 HackerRank. All rights reserved. See [LICENSE](LICENSE).
