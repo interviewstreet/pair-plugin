@@ -17,11 +17,11 @@ SPEC.loader.exec_module(bootstrap)
 
 BINARY = b"#!/bin/sh\necho paircli\n"
 DIGEST = hashlib.sha256(BINARY).hexdigest()
-URL = "https://github.com/rutvikchandla3/paircli/releases/download/v0.3.0/paircli-darwin-arm64"
+URL = "https://github.com/interviewstreet/pair-plugin/releases/download/v0.3.0/paircli-darwin-arm64"
 
 
 def manifest(**overrides):
-    document = {"version": "0.3.0", "artifacts": {"darwin-arm64": {"url": URL, "sha256": DIGEST}}}
+    document = {"schema": "paircli-release/v1", "version": "0.3.0", "artifacts": {"darwin-arm64": {"url": URL, "sha256": DIGEST}}}
     document.update(overrides)
     return document
 
@@ -127,6 +127,7 @@ def fake_cli(path, status):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/sh\ncat <<'EOF'\n" + (status if isinstance(status, str) else json.dumps(status)) + "\nEOF\n")
     path.chmod(0o755)
+    bootstrap.record_release_source(path)
     return path
 
 
@@ -248,6 +249,7 @@ def test_child_runs_setup_with_harness_and_plugin_version(tmp_path, monkeypatch)
     binary.parent.mkdir(parents=True)
     binary.write_text("#!/bin/sh\n")
     binary.chmod(0o755)
+    bootstrap.record_release_source(binary)
     seen = []
 
     class Done:
@@ -256,6 +258,112 @@ def test_child_runs_setup_with_harness_and_plugin_version(tmp_path, monkeypatch)
     monkeypatch.setattr(bootstrap.subprocess, "run", lambda command, **kwargs: seen.append(command) or Done())
     bootstrap.run_child("codex", tmp_path)
     assert seen == [[str(binary), "setup", "--harness", "codex", "--plugin-version", bootstrap.PLUGIN_VERSION]]
+
+
+@pytest.mark.parametrize("release", [None, [], {}, manifest(schema="unknown"), manifest(version="not-a-version"),
+                                    manifest(revoked=["0.3.0"]), manifest(revoked="0.3.0")])
+def test_select_artifact_rejects_invalid_or_revoked_manifest(release):
+    with pytest.raises(RuntimeError):
+        bootstrap.select_artifact(release, "darwin-arm64")
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/rutvikchandla3/paircli/releases/download/v0.3.0/paircli-darwin-arm64",
+    "https://github.com/interviewstreet/paircli/releases/download/v0.3.0/paircli-darwin-arm64",
+    URL.replace("v0.3.0", "v0.2.0"), URL.replace("darwin-arm64", "linux-amd64"),
+    "https://example.com/paircli", URL + "?redirect=elsewhere",
+])
+def test_select_artifact_rejects_other_repositories_releases_and_platforms(url):
+    release = manifest(artifacts={"darwin-arm64": {"url": url, "sha256": DIGEST}})
+    with pytest.raises(RuntimeError, match="this plugin's release and platform"):
+        bootstrap.select_artifact(release, "darwin-arm64")
+
+
+@pytest.mark.parametrize("old_source", [None,
+    "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json",
+    "https://github.com/interviewstreet/paircli/releases/latest/download/latest.json",
+])
+def test_child_migrates_existing_cli_without_touching_credentials(tmp_path, monkeypatch, old_source):
+    binary = fake_cli(tmp_path / ".paircli/bin/paircli", {})
+    marker = binary.with_name("release-source.json")
+    if old_source:
+        marker.write_text(json.dumps({"manifest_url": old_source}))
+    else:
+        marker.unlink()
+    credential = tmp_path / ".paircli/credential.json"
+    credential.write_text("keep this credential")
+    installed, commands = [], []
+
+    def install(target, key):
+        installed.append((target, key))
+        target.write_bytes(BINARY)
+        target.chmod(0o755)
+
+    monkeypatch.setattr(bootstrap, "install_binary", install)
+    monkeypatch.setattr(bootstrap, "platform_key", lambda: "darwin-arm64")
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda command: commands.append(command) or type("Done", (), {"returncode": 0})())
+    assert bootstrap.run_child("codex", tmp_path) == 0
+    assert installed == [(binary, "darwin-arm64")]
+    assert commands == [[str(binary), "setup", "--harness", "codex", "--plugin-version", bootstrap.PLUGIN_VERSION]]
+    assert bootstrap.uses_plugin_release(binary)
+    assert credential.read_text() == "keep this credential"
+    assert bootstrap.run_child("codex", tmp_path) == 0
+    assert len(installed) == 1
+
+
+def test_child_does_not_run_or_mark_legacy_cli_after_failed_migration(tmp_path, monkeypatch):
+    binary = fake_cli(tmp_path / ".paircli/bin/paircli", {})
+    marker = binary.with_name("release-source.json")
+    marker.unlink()
+    original = binary.read_bytes()
+
+    def fail(*args):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(bootstrap, "install_binary", fail)
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda *args: pytest.fail("executed old updater"))
+    with pytest.raises(RuntimeError, match="download failed"):
+        bootstrap.run_child("codex", tmp_path)
+    assert binary.read_bytes() == original
+    assert not marker.exists()
+
+
+def test_child_starts_only_one_installer(tmp_path, monkeypatch):
+    binary = tmp_path / ".paircli/bin/paircli"
+    binary.parent.mkdir(parents=True)
+    with binary.with_name(".bootstrap.lock").open("a") as lock:
+        bootstrap.fcntl.flock(lock, bootstrap.fcntl.LOCK_EX | bootstrap.fcntl.LOCK_NB)
+        monkeypatch.setattr(bootstrap, "install_binary", lambda *args: pytest.fail("started concurrent installer"))
+        monkeypatch.setattr(bootstrap.subprocess, "run", lambda *args: pytest.fail("started concurrent setup"))
+        assert bootstrap.run_child("codex", tmp_path) == 0
+
+
+def test_child_on_unsupported_system_still_does_not_fail_session(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(bootstrap, "fcntl", None)
+    assert bootstrap.main(["run", "codex"], home=tmp_path) == 0
+    assert "supports only macOS and Linux" in capsys.readouterr().out
+
+
+def test_marker_is_not_accepted_without_an_executable(tmp_path):
+    binary = tmp_path / "paircli"
+    bootstrap.record_release_source(binary)
+    assert not bootstrap.uses_plugin_release(binary)
+
+
+@pytest.mark.parametrize("contents", ["not json", "[]", "null", '{"manifest_url":"old"}'])
+def test_invalid_markers_require_migration(tmp_path, contents):
+    binary = fake_cli(tmp_path / "paircli", {})
+    binary.with_name("release-source.json").write_text(contents)
+    assert not bootstrap.uses_plugin_release(binary)
+
+
+def test_legacy_cli_needs_curl_to_migrate(tmp_path, monkeypatch, capsys):
+    only_tools(monkeypatch, "gh")
+    binary = fake_cli(tmp_path / ".paircli/bin/paircli", {})
+    binary.with_name("release-source.json").unlink()
+    monkeypatch.setattr(bootstrap, "start_child", lambda *args: pytest.fail("migration cannot download"))
+    assert bootstrap.main([], home=tmp_path) == 0
+    assert "curl not found" in json.loads(capsys.readouterr().out)["systemMessage"]
 
 
 ROOT = HOOKS_DIR.parent
@@ -285,3 +393,12 @@ def test_manifest_icons_exist_and_are_square_png():
         width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
         assert width == height and 512 <= width <= 2048
         assert len(data) < 2 * 1024 * 1024
+
+
+def test_marketplaces_keep_main_layout_and_root_plugin_sources():
+    claude = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text())
+    codex = json.loads((ROOT / ".agents/plugins/marketplace.json").read_text())
+    assert claude["owner"]["name"] == "HackerRank"
+    assert claude["plugins"][0]["source"] == "./"
+    assert codex["plugins"][0]["source"] == {"source": "local", "path": "./"}
+    assert codex["plugins"][0]["category"] == "Productivity"

@@ -1,0 +1,60 @@
+// Package judge is the grounded LLM pass: it builds a compact fact bundle from
+// the engine context and the deterministic signals, runs four small LLM jobs
+// over it (claims, story, scope, caveats), and returns validated
+// model.Judgments in which every item cites ids that appear in the bundle.
+// Anything uncited, citing an unknown id, or using an invalid enum is dropped.
+package judge
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/interviewstreet/pair-plugin/cli/internal/config"
+	"github.com/interviewstreet/pair-plugin/cli/internal/engine"
+	"github.com/interviewstreet/pair-plugin/cli/internal/llm"
+	"github.com/interviewstreet/pair-plugin/cli/internal/model"
+)
+
+// Run builds the fact bundle from ec and signals, runs the four judge jobs in
+// order, and returns their validated judgments.
+//
+// A nil provider means the LLM pass is disabled: Run returns (nil, nil). A
+// provider error on one job is recorded in Judgments.Errors and the remaining
+// jobs still run; Run returns an error only when every job failed.
+func Run(ctx context.Context, p llm.Provider, ec *engine.Context, signals []model.Signal, cfg *config.Config) (*model.Judgments, error) {
+	j, _, err := RunFull(ctx, p, ec, signals, cfg)
+	return j, err
+}
+
+// RunFull is Run plus the accounting. Stats says which jobs produced nothing
+// usable, and per item kind how many items a job offered versus how many
+// survived validation, so a caller can tell "nothing was found" apart from
+// "nothing could be checked".
+//
+// It is the provider-driven half of the pass. A caller that runs the prompts
+// elsewhere uses BuildPrompts and Set.Apply instead, and gets the same Stats.
+func RunFull(ctx context.Context, p llm.Provider, ec *engine.Context, signals []model.Signal, cfg *config.Config) (*model.Judgments, *Stats, error) {
+	if p == nil {
+		return nil, nil, nil
+	}
+	set, err := BuildPrompts(ec, signals, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	results := make([]JobResult, len(set.Prompts))
+	for i, jp := range set.Prompts {
+		results[i] = fetch(ctx, p, jp)
+	}
+	stats := set.Apply(results)
+
+	if stats.Failed() == len(set.Prompts) {
+		// Carry the per-job reasons: this error is what a caller records on the
+		// report, and "4 jobs failed" on its own does not say why (a provider
+		// that is not authenticated, say, or an unreachable gateway).
+		return nil, nil, fmt.Errorf("judge: all %d jobs failed: %s",
+			len(set.Prompts), strings.Join(set.Judgments().Errors, "; "))
+	}
+	return set.Judgments(), stats, nil
+}

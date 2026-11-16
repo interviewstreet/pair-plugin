@@ -1,6 +1,6 @@
 {
   "name": "pair",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Installs Pair CLI, which publishes PR evidence from the coding-agent sessions that built it for server-side AI review.",
   "author": {
     "name": "HackerRank",

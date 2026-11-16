@@ -1,6 +1,6 @@
 # Pair CLI onboarding
 
-The Pair plugin is a thin installer. It puts Pair CLI (`paircli`) on your
+The Pair plugin owns Pair CLI's source under `cli/` and remains a thin installer at runtime. It puts Pair CLI (`paircli`) on your
 machine and gets out of the way; everything else (scanning, redaction,
 publishing, PR detection) is done by `paircli`.
 
@@ -11,14 +11,17 @@ installed (or updated), the plugin's `SessionStart` hook runs
 `hooks/bootstrap.py`. Codex asks you to review and trust the hook first.
 Installing alone does not run it; start a new session.
 
-1. If `~/.paircli/bin/paircli` is missing, a detached background process
+1. If `~/.paircli/bin/paircli` is missing or has not migrated to this plugin's release source, a detached background process
    downloads the release manifest
-   `https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json`
+   `https://github.com/interviewstreet/pair-plugin/releases/latest/download/latest.json`
    with `curl`, picks the binary for your OS and CPU, checks its SHA-256 and a
    100 MiB size cap, and installs it atomically. Only https downloads are
-   accepted, using your system trust store.
+   accepted, using your system trust store. A migration marker records the source
+   only after a successful install; it is not a signature. Existing credentials,
+   capture cursors and publication state are retained. A failed download leaves
+   the current binary intact. Concurrent startup installers are serialized.
 2. The same process runs
-   `paircli setup --harness <claude-code|codex> --plugin-version 0.3.1`.
+   `paircli setup --harness <claude-code|codex> --plugin-version 0.4.0`.
    Setup is idempotent: it checks for a newer `paircli`, installs the PR hook
    for that harness, and starts device login if you have no valid credential.
    Login can wait for you to approve in the browser; it never blocks the session.
@@ -41,7 +44,8 @@ status instead of failing silently in a log:
 
 - `python3` runs the hook itself, so it is not checked. If it is missing the
   hook cannot run at all, and no status appears.
-- `curl` downloads `paircli`. It is only checked until the binary is installed.
+- `curl` downloads `paircli`. It is checked until the binary is installed and
+  migrated to this repository's releases.
   Without it the status reads `Pair setup did not start: curl not found, ...`
   and nothing is started. Install curl and start a new session.
 - `gh` (the GitHub CLI, signed in with `gh auth login`) is what `paircli` uses

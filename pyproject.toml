@@ -1,6 +1,6 @@
 [project]
 name = "pair-plugin"
-version = "0.3.1"
+version = "0.4.0"
 description = "Claude Code and Codex plugin that installs Pair CLI"
 requires-python = ">=3.12"
 dependencies = []
@@ -10,3 +10,4 @@ dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+norecursedirs = ["cli", ".git", ".venv"]

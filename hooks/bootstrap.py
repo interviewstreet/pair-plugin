@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -17,8 +18,13 @@ import tempfile
 import time
 from pathlib import Path
 
-PLUGIN_VERSION = "0.3.1"
-MANIFEST_URL = "https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json"
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+PLUGIN_VERSION = "0.4.0"
+MANIFEST_URL = "https://github.com/interviewstreet/pair-plugin/releases/latest/download/latest.json"
 MAX_BINARY_BYTES = 100 * 1024 * 1024
 SETUP_LOG_GLOB = "~/.paircli/logs/setup-*.log"
 LOGIN_HELP = f"approve the login in your browser; the device code and URL are in {SETUP_LOG_GLOB}"
@@ -48,6 +54,16 @@ def version_at_least(actual: str, required: str) -> bool:
 
 def select_artifact(manifest: dict, key: str) -> tuple:
     """Return (url, sha256) for one platform, after checking plugin compatibility."""
+    if not isinstance(manifest, dict) or manifest.get("schema") != "paircli-release/v1":
+        raise RuntimeError("paircli release has an unsupported manifest schema")
+    version = manifest.get("version")
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-.][0-9A-Za-z.]+)?", version):
+        raise RuntimeError("paircli release has an invalid version")
+    revoked = manifest.get("revoked", [])
+    if not isinstance(revoked, list) or any(not isinstance(item, str) for item in revoked):
+        raise RuntimeError("paircli release has an invalid revoked list")
+    if version in revoked:
+        raise RuntimeError(f"paircli release {version} is revoked")
     required = manifest.get("min_plugin_version")
     if required is not None and not (isinstance(required, str) and version_at_least(PLUGIN_VERSION, required)):
         raise RuntimeError(f"paircli release requires Pair plugin {required} or newer")
@@ -58,6 +74,9 @@ def select_artifact(manifest: dict, key: str) -> tuple:
     url, digest = artifact.get("url"), str(artifact.get("sha256", "")).lower()
     if not isinstance(url, str) or not url.startswith("https://"):
         raise RuntimeError(f"paircli binary URL for {key} must use https")
+    expected = f"https://github.com/interviewstreet/pair-plugin/releases/download/v{version}/paircli-{key}"
+    if url != expected:
+        raise RuntimeError(f"paircli binary URL for {key} must reference this plugin's release and platform")
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise RuntimeError(f"paircli release has an invalid sha256 for {key}")
     return url, digest
@@ -99,10 +118,43 @@ def is_installed(binary: Path) -> bool:
     return binary.is_file() and os.access(binary, os.X_OK)
 
 
-def run_child(harness: str, home: Path) -> int:
-    binary = home / ".paircli" / "bin" / "paircli"
+def uses_plugin_release(binary: Path) -> bool:
+    """Check the migration marker, not executable authenticity or a signature."""
     if not is_installed(binary):
-        install_binary(binary, platform_key())
+        return False
+    try:
+        marker = json.loads(binary.with_name("release-source.json").read_text())
+        return isinstance(marker, dict) and marker.get("manifest_url") == MANIFEST_URL
+    except (OSError, ValueError):
+        return False
+
+
+def record_release_source(binary: Path) -> None:
+    """Record the new source only after a verified install, using an atomic rename."""
+    descriptor, name = tempfile.mkstemp(dir=str(binary.parent), prefix=".release-source-")
+    staged = Path(name)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump({"manifest_url": MANIFEST_URL}, stream)
+        os.replace(staged, binary.with_name("release-source.json"))
+    finally:
+        if staged.exists():
+            staged.unlink()
+
+
+def run_child(harness: str, home: Path) -> int:
+    if fcntl is None:
+        raise RuntimeError("Pair CLI bootstrap supports only macOS and Linux")
+    binary = home / ".paircli" / "bin" / "paircli"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    with binary.with_name(".bootstrap.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        if not uses_plugin_release(binary):
+            install_binary(binary, platform_key())
+            record_release_source(binary)
     return subprocess.run([str(binary), "setup", "--harness", harness, "--plugin-version", PLUGIN_VERSION]).returncode
 
 
@@ -132,6 +184,8 @@ def preflight(installed: bool, which=None) -> tuple:
 def status_line(binary: Path, harness: str) -> str:
     if not is_installed(binary):
         return f"Pair setup started: installing the Pair CLI, then {LOGIN_HELP}"
+    if not uses_plugin_release(binary):
+        return f"Pair setup started: switching to this plugin's CLI release, then {LOGIN_HELP}"
     try:
         out = subprocess.run([str(binary), "status", "--json"], capture_output=True, text=True, timeout=3)
         status = json.loads(out.stdout)
@@ -164,7 +218,7 @@ def main(argv=None, home: Path = None) -> int:
     try:
         harness = detect_harness()
         binary = home / ".paircli" / "bin" / "paircli"
-        blocker, note = preflight(is_installed(binary))
+        blocker, note = preflight(uses_plugin_release(binary))
         if blocker:
             message = f"Pair setup did not start: {blocker}"
         else:

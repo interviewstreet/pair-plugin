@@ -25,8 +25,22 @@ missing context: it publishes a pull request's evidence, including **redacted tr
 coding-agent sessions that built it**, to [pair.sh](https://pair.sh), where an AI review is generated
 server-side.
 
-This repository is the plugin. It is deliberately thin: it installs the Pair CLI (`paircli`) on your
-machine and gets out of the way. Scanning, redaction, publishing and PR detection all live in the CLI.
+This repository contains the plugin and [Pair CLI source](cli/). The plugin is deliberately thin at
+runtime: it installs the Pair CLI (`paircli`) on your machine and gets out of the way. Scanning,
+redaction, publishing and PR detection all live in the CLI.
+
+## One repository, same runtime
+
+- `hooks/`, `skills/` and the plugin manifests integrate with the agent harness.
+- `cli/` owns the Go command, scanning, redaction, publishing, hooks, updater,
+  notification helper and their tests. Its module is `github.com/interviewstreet/pair-plugin/cli`.
+- `.github/workflows/` tests both parts and builds CLI releases from `cli/`.
+
+Users still download a precompiled platform binary on first setup. Existing
+installations migrate once to this repository's release source; later CLI
+updates use the same source. Users do not need Go or a source build. Creating a
+PR or pushing a commit continues to run the installed CLI, not recompile it or
+download it on every push. Session-start setup checks for updates as before.
 
 ## Install
 
@@ -59,7 +73,7 @@ Pair is installed from this repository rather than from Codex's public directory
 
 The first session after install shows a one-line status, and setup finishes in the background:
 
-1. Pair CLI is downloaded to `~/.paircli/bin/paircli` (only if it's missing).
+1. Pair CLI is downloaded to `~/.paircli/bin/paircli` if it's missing or needs the one-time migration to this repository's release source.
 2. `paircli setup` installs the PR hook for your agent and opens a **device login** in your browser.
 3. Approve the login on pair.sh. Nothing is uploaded before you do.
 
@@ -185,9 +199,10 @@ The AI review is generated on the server after the upload, so the page fills in 
 Nothing here is hidden. This is everything the plugin does:
 
 - **Downloads.** The release manifest
-  (`https://github.com/rutvikchandla3/paircli/releases/latest/download/latest.json`) and the `paircli`
+  (`https://github.com/interviewstreet/pair-plugin/releases/latest/download/latest.json`) and the `paircli`
   binary it names, for your OS and CPU, over https with `curl`. The binary's SHA-256 is checked against the
-  manifest before it is installed in `~/.paircli/bin`. This happens only when the binary is missing.
+  manifest before it is installed in `~/.paircli/bin`. This happens when the binary is missing or needs
+  the one-time release-source migration. Subsequent CLI updates use the same repository's releases.
 - **Runs.** At session start the hook starts one detached background process. It installs the binary if
   needed and runs `paircli setup`, which installs a PR hook for your agent (a change to your agent's hook
   configuration) and starts a device login in your browser. The hook itself finishes in seconds and never
@@ -254,7 +269,7 @@ codex plugin remove pair@pair           # Codex
  hooks/bootstrap.py ──► prints one status line, then returns (never blocks)
       │ detached background process
       ▼
- ~/.paircli/bin/paircli  ◄── downloaded and SHA-256 checked, only if missing
+ ~/.paircli/bin/paircli  ◄── downloaded and SHA-256 checked if missing or migrating
       │ setup (idempotent): self-update · install PR hook · device login
       ▼
  you run `gh pr create` / `git push`  ──►  paircli publish  ──►  pair.sh review
@@ -267,6 +282,7 @@ codex plugin remove pair@pair           # Codex
 .codex-plugin/         Codex plugin manifest
 .agents/plugins/       Codex marketplace
 hooks/                 SessionStart hook: bootstrap.py and hooks.json
+cli/                   Pair CLI Go source, runtime, tests and release scripts
 skills/pair/           the /pair skill
 assets/                plugin icon
 docs/ONBOARDING.md     setup, upload contents and uninstall in detail
@@ -276,10 +292,28 @@ tests/                 hook tests
 ## Development
 
 ```sh
-python3 -m pytest                                    # hook tests
-claude plugin validate . --profile directory         # manifest and directory checks
-claude --plugin-dir .                                # try the plugin from this checkout
+uv sync --group dev
+uv run pytest
+claude plugin validate . --profile directory
+claude --plugin-dir .
+cd cli
+go test ./...
+go test -race ./internal/notify ./cmd/paircli
+go vet ./...
+go build ./cmd/paircli
 ```
+
+## Releases
+
+`v*` tags in this repository are CLI releases. The root release workflow tests
+the plugin and CLI, builds macOS/Linux binaries for arm64/amd64, verifies their
+checksums and download URLs, attests them, and publishes `latest.json`,
+`SHA256SUMS` and the four binaries to this repository's GitHub Release.
+CLI versions are independent of the plugin manifest version.
+
+See [the migration and rollout checklist](docs/CLI_MIGRATION.md) before enabling
+this plugin version. Anonymous installs require public release assets. A source
+move alone does not make a private repository's binaries publicly downloadable.
 
 The plugin version lives in four places that must agree: `.claude-plugin/plugin.json`,
 `.codex-plugin/plugin.json`, `PLUGIN_VERSION` in `hooks/bootstrap.py`, and `pyproject.toml`.

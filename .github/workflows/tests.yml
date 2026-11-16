@@ -1,0 +1,64 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "pytest>=8"
+      - run: python -m pytest
+
+  cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go-version: "1.22.x"
+          - os: macos-latest
+            go-version: "1.27.x"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Test
+        run: go test ./...
+      - name: Race-check notification and setup paths
+        run: go test -race ./internal/notify ./cmd/paircli
+      - name: Vet
+        run: go vet ./...
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+
+  release-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: bash cli/scripts/build-release-artifacts.sh 0.5.0-ci
+      - run: python3 scripts/check-release-artifacts.py cli/dist/paircli/latest.json
+      - name: Test real binaries in isolated homes
+        run: |
+          python -m pip install "pytest>=8"
+          PAIRCLI_TEST_RELEASE_DIR=cli/dist/paircli python -m pytest tests/test_release_binary.py -q

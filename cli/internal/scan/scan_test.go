@@ -1,0 +1,590 @@
+package scan
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/interviewstreet/pair-plugin/cli/internal/config"
+	"github.com/interviewstreet/pair-plugin/cli/internal/engine"
+	"github.com/interviewstreet/pair-plugin/cli/internal/model"
+	"github.com/interviewstreet/pair-plugin/cli/internal/snapshot"
+)
+
+// scanRunner is a pr.Runner that serves canned gh output and records calls.
+type scanRunner struct {
+	responses map[string][]byte
+	errs      map[string]error
+	calls     []string
+}
+
+func newScanRunner() *scanRunner {
+	return &scanRunner{responses: map[string][]byte{}, errs: map[string]error{}}
+}
+
+func (r *scanRunner) Run(args ...string) ([]byte, error) {
+	key := strings.Join(args, " ")
+	r.calls = append(r.calls, key)
+	if err, ok := r.errs[key]; ok {
+		return nil, err
+	}
+	if out, ok := r.responses[key]; ok {
+		return out, nil
+	}
+	return nil, errUnexpectedCall(key)
+}
+
+type errUnexpectedCall string
+
+func (e errUnexpectedCall) Error() string { return "scanRunner: unexpected gh call: " + string(e) }
+
+func (r *scanRunner) called(substr string) bool {
+	for _, c := range r.calls {
+		if strings.Contains(c, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// scanGHView is the `gh pr view --json` payload the minimal scenario serves.
+const scanGHView = `{
+  "number": 7,
+  "url": "https://github.com/acme/shop/pull/7",
+  "title": "Add retry with backoff",
+  "body": "Adds retries to the webhook sender.",
+  "headRefName": "feat/retry",
+  "baseRefName": "main",
+  "createdAt": "2026-09-27T13:50:00Z",
+  "commits": [
+    {"oid": "aaaaaaa1", "messageHeadline": "Add retry", "messageBody": "", "committedDate": "2026-09-27T14:05:00Z"}
+  ]
+}`
+
+// scanDiff is the combined PR diff, whose single added line the transcript
+// edit below reproduces verbatim.
+const scanDiff = `diff --git a/src/webhooks/retry.ts b/src/webhooks/retry.ts
+index 1111111..2222222 100644
+--- a/src/webhooks/retry.ts
++++ b/src/webhooks/retry.ts
+@@ -10,1 +10,2 @@
+ function send() {
++return sendWithRetry(url, body)
+`
+
+const scanPRArg = "pr view 7 -R acme/shop --json number,url,title,body,headRefName,headRefOid,baseRefName,createdAt,commits"
+
+// scanDiffArg is the gh argument list for the combined PR diff.
+const scanDiffArg = "pr diff 7 -R acme/shop"
+
+// scanGitRepo writes the minimal .git metadata internal/gitinfo reads (HEAD
+// plus an origin remote) into dir.
+func scanGitRepo(t *testing.T, dir, remote string) {
+	t.Helper()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scanWrite(t, filepath.Join(gitDir, "HEAD"), "ref: refs/heads/feat/retry\n")
+	scanWrite(t, filepath.Join(gitDir, "config"),
+		"[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = "+remote+"\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n")
+}
+
+// scanTranscript writes one synthetic Claude Code transcript for a session
+// whose cwd is repoRoot, edits src/webhooks/retry.ts, and asks Discover to
+// see it inside the scan window.
+func scanTranscript(t *testing.T, projects, repoRoot string) {
+	t.Helper()
+	dir := filepath.Join(projects, "-tmp-shop")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(repoRoot, "src", "webhooks", "retry.ts")
+	lines := []string{
+		`{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-09-27T14:00:00.000Z","cwd":"` + repoRoot + `","gitBranch":"feat/retry","version":"2.1.283","promptSource":"typed","message":{"role":"user","content":"Add retry with backoff to the webhook sender."}}`,
+		`{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"2026-09-27T14:00:30.000Z","message":{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"I'll add the retry call."},{"type":"tool_use","id":"toolu_01A","name":"Write","input":{"file_path":"` + file + `","content":"return sendWithRetry(url, body)\n"}}]}}`,
+		`{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"2026-09-27T14:00:31.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01A","content":"File created"}]},"toolUseResult":{"type":"create","filePath":"` + file + `"}}`,
+	}
+	path := filepath.Join(dir, "s1.jsonl")
+	scanWrite(t, path, strings.Join(lines, "\n")+"\n")
+	// Pin the mtime inside the scan window so the test does not depend on
+	// when it runs.
+	stamp := time.Date(2026, 9, 27, 14, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func scanWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// scanConfig points every harness root at its own temp dir so the test never
+// reads the developer's real session stores.
+func scanConfig(t *testing.T, projects string) *config.Config {
+	t.Helper()
+	cfg := config.Default()
+	cfg.Roots.ClaudeCode = projects
+	cfg.Roots.Codex = t.TempDir()
+	cfg.Roots.Pi = t.TempDir()
+	cfg.Roots.HookLog = t.TempDir()
+	return cfg
+}
+
+// TestRun_Minimal scans one synthetic Claude Code session against a fake gh
+// and checks the output folder, the AUTH-2 signal and the alert count.
+func TestRun_Minimal(t *testing.T) {
+	repoRoot := t.TempDir()
+	scanGitRepo(t, repoRoot, "git@github.com:acme/shop.git")
+
+	projects := t.TempDir()
+	scanTranscript(t, projects, repoRoot)
+
+	r := newScanRunner()
+	r.responses[scanPRArg] = []byte(scanGHView)
+	r.responses[scanDiffArg] = []byte(scanDiff)
+
+	outDir := filepath.Join(t.TempDir(), "pr-7")
+	now := time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)
+	res, err := Run(context.Background(), Options{
+		Repo:            "acme/shop",
+		Number:          7,
+		CWD:             repoRoot,
+		OutDir:          outDir,
+		Runner:          r,
+		Config:          scanConfig(t, projects),
+		NoHooks:         true,
+		NoCommitPatches: true,
+		Now:             now,
+		Version:         "0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if res.OutDir != outDir {
+		t.Errorf("OutDir = %q, want %q", res.OutDir, outDir)
+	}
+	for _, name := range []string{"signals.json", "report.md", "comment.md", "authorship.json"} {
+		if _, err := os.Stat(filepath.Join(outDir, name)); err != nil {
+			t.Errorf("output file %s: %v", name, err)
+		}
+	}
+	sessFiles, err := os.ReadDir(filepath.Join(outDir, "sessions"))
+	if err != nil {
+		t.Fatalf("reading sessions dir: %v", err)
+	}
+	if len(sessFiles) != 1 {
+		t.Errorf("session files = %d, want 1 (%v)", len(sessFiles), sessFiles)
+	}
+
+	if res.Report == nil {
+		t.Fatal("nil report")
+	}
+	if got := res.Report.Coverage.Sessions; got != 1 {
+		t.Errorf("coverage sessions = %d, want 1", got)
+	}
+	if got := res.Report.Coverage.LinesExplained; got != 1 {
+		t.Errorf("lines explained = %d, want 1", got)
+	}
+	if got := res.Report.PR.Repo; got != "acme/shop" {
+		t.Errorf("report repo = %q", got)
+	}
+
+	auth2 := scanFindSignal(res.Report.Signals, "AUTH-2")
+	if auth2 == nil {
+		t.Fatalf("AUTH-2 missing from %d signals", len(res.Report.Signals))
+	}
+	if auth2.State == model.StateUnknown {
+		t.Errorf("AUTH-2 state = unknown (%s)", auth2.Summary)
+	}
+	// All 30 catalog entries. The 3 inferred ones (DEC-3, CON-1, CON-3) have
+	// no LLM pass here, so they stay unknown and the report lists them under
+	// "Not available".
+	if len(res.Report.Signals) != 30 {
+		t.Errorf("signals = %d, want 30", len(res.Report.Signals))
+	}
+	for _, id := range []string{"DEC-3", "CON-1", "CON-3"} {
+		s := scanFindSignal(res.Report.Signals, id)
+		if s == nil {
+			t.Errorf("%s missing from the report", id)
+			continue
+		}
+		if s.State != model.StateUnknown {
+			t.Errorf("%s state = %s, want unknown with the LLM pass off", id, s.State)
+		}
+		if !strings.Contains(s.Summary, "LLM pass is off") {
+			t.Errorf("%s summary = %q, want the --llm hint", id, s.Summary)
+		}
+	}
+
+	alerts := 0
+	for _, s := range res.Report.Signals {
+		if s.State == model.StateAlert {
+			alerts++
+		}
+	}
+	if alerts != res.Alerts {
+		t.Errorf("Alerts = %d, want %d (state alert count)", res.Alerts, alerts)
+	}
+
+	// The report must be reachable from the written file, too.
+	raw, err := os.ReadFile(filepath.Join(outDir, "signals.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var written model.Report
+	if err := json.Unmarshal(raw, &written); err != nil {
+		t.Fatalf("signals.json: %v", err)
+	}
+	if len(written.Signals) != len(res.Report.Signals) {
+		t.Errorf("signals.json has %d signals, want %d", len(written.Signals), len(res.Report.Signals))
+	}
+}
+
+func TestRun_DefaultOutDirIncludesHeadCommit(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repoRoot := t.TempDir()
+	scanGitRepo(t, repoRoot, "git@github.com:acme/shop.git")
+
+	projects := t.TempDir()
+	scanTranscript(t, projects, repoRoot)
+	r := newScanRunner()
+	r.responses[scanPRArg] = []byte(scanGHView)
+	r.responses[scanDiffArg] = []byte(scanDiff)
+
+	res, err := Run(context.Background(), Options{
+		Repo:            "acme/shop",
+		Number:          7,
+		CWD:             repoRoot,
+		Runner:          r,
+		Config:          scanConfig(t, projects),
+		NoHooks:         true,
+		NoCommitPatches: true,
+		Now:             time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC),
+		Version:         "0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The default is a home directory, never the repository being scanned.
+	want := filepath.Join(home, ".paircli", "scans", "acme__shop", "pr-7", "aaaaaaa1")
+	if res.OutDir != want {
+		t.Fatalf("OutDir = %q, want %q", res.OutDir, want)
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, ".paircli")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the scan wrote into the repository: %v", err)
+	}
+	// 0700, like ~/.paircli/state: on a publish these hold redacted copies of
+	// the user's own source files.
+	info, err := os.Stat(res.OutDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Errorf("scan folder mode = %o, want 700", got)
+	}
+}
+
+// TestRun_OutDirUsesHeadRefOid checks that the output folder is named after
+// headRefOid, not the last entry of the (capped) commit list.
+func TestRun_OutDirUsesHeadRefOid(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repoRoot := t.TempDir()
+	scanGitRepo(t, repoRoot, "git@github.com:acme/shop.git")
+
+	projects := t.TempDir()
+	scanTranscript(t, projects, repoRoot)
+	head := strings.Repeat("e", 40)
+	r := newScanRunner()
+	r.responses[scanPRArg] = []byte(strings.Replace(scanGHView, `"headRefName": "feat/retry",`,
+		`"headRefName": "feat/retry", "headRefOid": "`+strings.ToUpper(head)+`",`, 1))
+	r.responses["api -H Accept: application/vnd.github.diff repos/acme/shop/compare/main..."+head] = []byte(scanDiff)
+
+	res, err := Run(context.Background(), Options{
+		Repo:            "acme/shop",
+		Number:          7,
+		CWD:             repoRoot,
+		Runner:          r,
+		Config:          scanConfig(t, projects),
+		NoHooks:         true,
+		NoCommitPatches: true,
+		Now:             time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC),
+		Version:         "0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if want := filepath.Join(home, ".paircli", "scans", "acme__shop", "pr-7", head); res.OutDir != want {
+		t.Fatalf("OutDir = %q, want %q", res.OutDir, want)
+	}
+	if res.Head != head {
+		t.Errorf("Head = %q, want %q", res.Head, head)
+	}
+}
+
+// scanFindSignal returns the signal with id, or nil.
+func scanFindSignal(sigs []model.Signal, id string) *model.Signal {
+	for i := range sigs {
+		if sigs[i].ID == id {
+			return &sigs[i]
+		}
+	}
+	return nil
+}
+
+// TestPostComment_CreateAndUpdate checks that posting creates a comment when
+// no marker comment exists and updates the existing one when it does.
+func TestPostComment_CreateAndUpdate(t *testing.T) {
+	dir := t.TempDir()
+	body := filepath.Join(dir, "comment.md")
+	scanWrite(t, body, CommentMarker+"\n# paircli\n")
+
+	t.Run("create", func(t *testing.T) {
+		r := newScanRunner()
+		r.responses["api repos/acme/shop/issues/7/comments --paginate"] = []byte("[]")
+		r.responses["pr comment 7 -R acme/shop --body-file "+body] = []byte("https://github.com/acme/shop/pull/7#issuecomment-1\n")
+
+		if err := postComment(r, "acme/shop", 7, body); err != nil {
+			t.Fatalf("postComment: %v", err)
+		}
+		if !r.called("pr comment 7 -R acme/shop") {
+			t.Errorf("expected a new comment, calls = %v", r.calls)
+		}
+		if r.called("-X PATCH") {
+			t.Errorf("did not expect a PATCH, calls = %v", r.calls)
+		}
+	})
+
+	t.Run("update", func(t *testing.T) {
+		r := newScanRunner()
+		r.responses["api repos/acme/shop/issues/7/comments --paginate"] = []byte(
+			`[{"id":11,"body":"unrelated\n"},{"id":999,"body":"` + CommentMarker + `\n# old"}]`)
+		r.responses["api -X PATCH repos/acme/shop/issues/comments/999 -F body=@"+body] = []byte("{}")
+
+		if err := postComment(r, "acme/shop", 7, body); err != nil {
+			t.Fatalf("postComment: %v", err)
+		}
+		if !r.called("api -X PATCH repos/acme/shop/issues/comments/999") {
+			t.Errorf("expected a PATCH of comment 999, calls = %v", r.calls)
+		}
+		if r.called("pr comment") {
+			t.Errorf("did not expect a new comment, calls = %v", r.calls)
+		}
+	})
+
+	t.Run("paginated update", func(t *testing.T) {
+		// gh api --paginate concatenates one JSON array per page.
+		r := newScanRunner()
+		r.responses["api repos/acme/shop/issues/7/comments --paginate"] = []byte(
+			`[{"id":11,"body":"unrelated"}]` + `[{"id":999,"body":"` + CommentMarker + `\n# old"}]`)
+		r.responses["api -X PATCH repos/acme/shop/issues/comments/999 -F body=@"+body] = []byte("{}")
+
+		if err := postComment(r, "acme/shop", 7, body); err != nil {
+			t.Fatalf("postComment: %v", err)
+		}
+		if !r.called("comments/999") {
+			t.Errorf("expected a PATCH of comment 999, calls = %v", r.calls)
+		}
+	})
+
+	t.Run("missing body file", func(t *testing.T) {
+		r := newScanRunner()
+		if err := postComment(r, "acme/shop", 7, filepath.Join(dir, "nope.md")); err == nil {
+			t.Fatal("expected an error for a missing comment body")
+		}
+	})
+}
+
+// TestRun_SnapshotOnFreshOutDir is a regression test. The snapshot is written
+// early in the pipeline, before anything else creates the output folder, so a
+// scan into a folder that does not exist yet must still succeed. Both the
+// snapshot's own tests and the e2e run happened to use folders that already
+// existed, which is how this slipped through.
+func TestRun_SnapshotOnFreshOutDir(t *testing.T) {
+	repoRoot := t.TempDir()
+	scanGitRepo(t, repoRoot, "git@github.com:acme/shop.git")
+
+	projects := t.TempDir()
+	scanTranscript(t, projects, repoRoot)
+
+	r := newScanRunner()
+	r.responses[scanPRArg] = []byte(scanGHView)
+	r.responses[scanDiffArg] = []byte(scanDiff)
+
+	// Neither this folder nor its parent exists yet.
+	outDir := filepath.Join(t.TempDir(), "nested", "pr-7")
+	res, err := Run(context.Background(), Options{
+		Repo:            "acme/shop",
+		Number:          7,
+		CWD:             repoRoot,
+		OutDir:          outDir,
+		Runner:          r,
+		Config:          scanConfig(t, projects),
+		NoHooks:         true,
+		NoCommitPatches: true,
+		Snapshot:        true,
+		Now:             time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC),
+		Version:         "0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("Run with --snapshot into a folder that does not exist yet: %v", err)
+	}
+
+	snap, err := snapshot.Read(filepath.Join(res.OutDir, snapshot.FileName))
+	if err != nil {
+		t.Fatalf("reading the snapshot: %v", err)
+	}
+	if got, want := snap.Tool, "paircli 0.0.0-test"; got != want {
+		t.Errorf("snapshot tool = %q, want %q", got, want)
+	}
+	if len(snap.Sessions) != 1 {
+		t.Errorf("snapshot sessions = %d, want 1", len(snap.Sessions))
+	}
+
+	// The snapshot must reproduce the signals the scan itself reported.
+	ec, err := snap.Context()
+	if err != nil {
+		t.Fatalf("Context: %v", err)
+	}
+	replayed, err := json.Marshal(engine.Run(ec))
+	if err != nil {
+		t.Fatalf("marshalling replayed signals: %v", err)
+	}
+	reported, err := json.Marshal(res.Report.Signals)
+	if err != nil {
+		t.Fatalf("marshalling reported signals: %v", err)
+	}
+	if string(replayed) != string(reported) {
+		t.Error("the snapshot does not reproduce the scan's own signals")
+	}
+}
+
+// scanContentsArg is the gh call the content pass makes for one file.
+func scanContentsArg(rev, path string) string {
+	return "api repos/acme/shop/contents/" + path + "?ref=" + rev
+}
+
+// scanContentsBody is a `gh api contents` reply carrying body inline.
+func scanContentsBody(body string) []byte {
+	enc := base64.StdEncoding.EncodeToString([]byte(body))
+	return []byte(`{"size":` + strconv.Itoa(len(body)) + `,"sha":"ccccccc3","encoding":"base64","content":"` + enc + `"}`)
+}
+
+// scanRunOptions is the fixture every scan test in this file starts from.
+func scanRunOptions(t *testing.T, repoRoot string, r *scanRunner) Options {
+	t.Helper()
+	return Options{
+		Repo:            "acme/shop",
+		Number:          7,
+		CWD:             repoRoot,
+		Runner:          r,
+		Config:          scanConfig(t, t.TempDir()),
+		NoHooks:         true,
+		NoCommitPatches: true,
+		Now:             time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC),
+		Version:         "0.0.0-test",
+	}
+}
+
+func TestRun_WritesChangedFileContents(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repoRoot := t.TempDir()
+	scanGitRepo(t, repoRoot, "git@github.com:acme/shop.git")
+	projects := t.TempDir()
+	scanTranscript(t, projects, repoRoot)
+
+	r := newScanRunner()
+	r.responses[scanPRArg] = []byte(scanGHView)
+	r.responses[scanDiffArg] = []byte(scanDiff)
+	// The checkout holds no objects, so the content comes from the API.
+	base := strings.Repeat("b", 40)
+	r.responses["api repos/acme/shop/compare/main...aaaaaaa1"] = []byte(`{"merge_base_commit":{"sha":"` + base + `"}}`)
+	r.responses[scanContentsArg("aaaaaaa1", "src/webhooks/retry.ts")] = scanContentsBody("function send() {\nreturn sendWithRetry(url, body)\n}\n")
+	r.responses[scanContentsArg(base, "src/webhooks/retry.ts")] = scanContentsBody("function send() {\n}\n")
+
+	o := scanRunOptions(t, repoRoot, r)
+	o.Config = scanConfig(t, projects)
+	o.ChangedFileContents = true
+	res, err := Run(context.Background(), o)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if res.ChangedFiles == nil {
+		t.Fatal("the scan reports no changed-file summary")
+	}
+	if res.ChangedFiles.Files != 1 || res.ChangedFiles.SidesWritten != 2 {
+		t.Errorf("totals = %+v, want one file and both sides", res.ChangedFiles)
+	}
+	manifest := filepath.Join(res.OutDir, "changed-files", "manifest.json")
+	raw, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatalf("no manifest at %s: %v", manifest, err)
+	}
+	for _, want := range []string{
+		`"path": "src/webhooks/retry.ts"`,
+		`"status": "modified"`,
+		`"file": "new/src/webhooks/retry.ts"`,
+		`"file": "old/src/webhooks/retry.ts"`,
+		`"source": "api"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("manifest lacks %s:\n%s", want, raw)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(res.OutDir, "changed-files", "new", "src", "webhooks", "retry.ts")); err != nil {
+		t.Errorf("the new side was not written: %v", err)
+	}
+}
+
+func TestRun_WithoutTheOptionRemovesAnEarlierSubtree(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repoRoot := t.TempDir()
+	scanGitRepo(t, repoRoot, "git@github.com:acme/shop.git")
+	projects := t.TempDir()
+	scanTranscript(t, projects, repoRoot)
+
+	r := newScanRunner()
+	r.responses[scanPRArg] = []byte(scanGHView)
+	r.responses[scanDiffArg] = []byte(scanDiff)
+
+	o := scanRunOptions(t, repoRoot, r)
+	o.Config = scanConfig(t, projects)
+	o.OutDir = filepath.Join(t.TempDir(), "scan")
+	// An earlier run with the option on left content in this folder. The key is
+	// flipped now, so the next bundle must not pick it up.
+	stale := filepath.Join(o.OutDir, "changed-files", "new", "stale.go")
+	if err := os.MkdirAll(filepath.Dir(stale), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte("an earlier run\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Run(context.Background(), o)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ChangedFiles != nil {
+		t.Errorf("ChangedFiles = %+v, want nil", res.ChangedFiles)
+	}
+	if _, err := os.Stat(filepath.Join(res.OutDir, "changed-files")); !os.IsNotExist(err) {
+		t.Errorf("the earlier run's content survived: %v", err)
+	}
+}

@@ -1,0 +1,567 @@
+// Package redact is the single seam for scrubbing secrets from text before it
+// leaves the machine: every rendered report string, every uploaded scan file
+// and every captured raw-session byte range goes through it.
+//
+// A Redactor applies a fixed set of pattern rules (RulesVersion names that
+// set) plus the exact values of this process's own secret-looking environment
+// variables and the tokens in ~/.npmrc. A match becomes [REDACTED:<kind>], and
+// the number of matches per kind is kept so the bundle can say what was
+// removed. Redaction is idempotent: redacting redacted text changes nothing.
+//
+// The rules favour precision over recall for generic assignments (a value
+// must look like a secret, not a path, URL, boolean, placeholder or code
+// expression), because a false positive silently damages evidence. Provider
+// token formats are matched exactly.
+package redact
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+)
+
+// RulesVersion identifies the rule set. It is written into bundle.json and
+// bumped whenever a rule changes what is redacted.
+const RulesVersion = "2"
+
+// Redaction kinds, as they appear in [REDACTED:<kind>] and in the counts.
+const (
+	KindPrivateKey       = "private_key"
+	KindGitHubToken      = "github_token"
+	KindAPIKey           = "api_key"
+	KindAWSAccessKey     = "aws_access_key"
+	KindAWSSecret        = "aws_secret"
+	KindSlackToken       = "slack_token"
+	KindJWT              = "jwt"
+	KindBearer           = "bearer"
+	KindSecretAssignment = "secret_assignment"
+	KindEnvSecret        = "env_secret"
+	KindNPMToken         = "npm_token"
+	KindURLCredentials   = "url_credentials"
+)
+
+// minEnvValue is the shortest environment value worth redacting by exact
+// match: shorter values collide with ordinary text.
+const minEnvValue = 12
+
+// sep is what joins a name to its value, tolerating a JSON-escaped quote
+// after the name and before the value (`\"password\": \"x\"`). A backslash
+// belongs to the separator only when the quote it escapes follows it: any
+// other backslash starts a JSON escape (`\u0026`, `\t`) that the value must
+// not be cut out of, or the replacement would leave `\[REDACTED:...]` behind
+// and the file would no longer parse.
+const sep = `(?:\\?["'])?\s*(?::=|=>|[:=])\s*(?:\\?["'])?`
+
+// lead is the boundary in front of a token: a word boundary, or one of the
+// things that put a word character right before a token in text that still
+// holds an escape, where no word boundary does:
+//
+//   - a JSON-escaped newline, tab or carriage return: in a raw transcript line
+//     a token that starts a line follows the two characters `\n`;
+//   - a JSON-escaped <, > or &, `\u003c` `\u003e` `\u0026`: encoding/json
+//     writes them so, in a raw line and in JSON nested inside a JSON string,
+//     which stays escaped after one decode;
+//   - an ANSI colour code, `\u001b[0m` escaped or ESC[0m itself: terminal
+//     output in a tool result ends on an `m` right before what it printed.
+//
+// lead is never part of the replaced group, so an escape stays whole.
+const lead = `(?:\\[nrt]|\\u00(?:3[cCeE]|26)|\\u001[bB]\[[0-9;]*m|\x1b\[[0-9;]*m|\b)`
+
+// rule is one pattern. The submatch group is replaced (0 = the whole match);
+// keep, when set, decides whether a match is really a secret. hints are
+// lowercase substrings, at least one of which must occur (case-insensitively)
+// for the rule to run at all, which keeps large inputs fast.
+//
+// multiline marks a rule written to match across lines, which is what
+// FileBytes runs whole-buffer. Every other rule runs line by line even there,
+// because a rule whose separator can absorb a newline would otherwise pair a
+// name on one line with a "value" on a later one and destroy an innocent line:
+// `secrets:` under a `*-secret:` key is exactly that, and `Bytes` leaves it
+// alone.
+type rule struct {
+	kind      string
+	re        *regexp.Regexp
+	group     int
+	hints     []string
+	keep      func(value, rest string) bool
+	multiline bool
+}
+
+var rules = []rule{
+	{
+		kind:      KindPrivateKey,
+		re:        regexp.MustCompile(`-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----`),
+		hints:     []string{"private key"},
+		multiline: true,
+	},
+	{
+		kind:  KindGitHubToken,
+		re:    regexp.MustCompile(lead + `((?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{22,}))`),
+		group: 1,
+		hints: []string{"ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"},
+	},
+	{
+		kind:  KindAPIKey,
+		re:    regexp.MustCompile(lead + `(sk-[A-Za-z0-9_-]{20,})`),
+		group: 1,
+		hints: []string{"sk-"},
+		keep:  func(v, _ string) bool { return hasDigitOrUpper(v) },
+	},
+	{
+		kind:  KindAWSAccessKey,
+		re:    regexp.MustCompile(lead + `((?:AKIA|ASIA)[0-9A-Z]{16})\b`),
+		group: 1,
+		hints: []string{"akia", "asia"},
+	},
+	{
+		kind:  KindAWSSecret,
+		re:    regexp.MustCompile(`(?i)` + lead + `aws_?secret_?(?:access_?)?key` + sep + `([A-Za-z0-9/+=]{40})`),
+		group: 1,
+		hints: []string{"secret"},
+	},
+	{
+		kind:  KindSlackToken,
+		re:    regexp.MustCompile(lead + `((?:xox[abposr]|xapp)-[A-Za-z0-9-]{10,})`),
+		group: 1,
+		hints: []string{"xox", "xapp-"},
+	},
+	{
+		kind:  KindJWT,
+		re:    regexp.MustCompile(lead + `(eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*)`),
+		group: 1,
+		hints: []string{"eyj"},
+	},
+	{
+		kind:  KindBearer,
+		re:    regexp.MustCompile(`(?i)` + lead + `authorization` + sep + `\s*(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})`),
+		group: 1,
+		hints: []string{"authorization"},
+		keep:  func(v, _ string) bool { return !isPlaceholder(v) },
+	},
+	{
+		// scheme://user:password@host: the password of a connection string or
+		// a credentialed remote. Provider tokens in that position are caught
+		// by their own rules first, which leaves a placeholder behind.
+		kind:  KindURLCredentials,
+		re:    regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@"'\\]*:([^\s/@"'\\]{3,})@`),
+		group: 1,
+		hints: []string{"://"},
+		keep:  func(v, _ string) bool { return !isPlaceholder(v) },
+	},
+	{
+		kind: KindSecretAssignment,
+		re: regexp.MustCompile(`(?i)[A-Za-z0-9_.-]*(?:api[_-]?key|token|secret|password|passwd)[A-Za-z0-9_.-]*` +
+			sep + `([^\s"'` + "`" + `\\<>,;()\[\]{}&]{8,})`),
+		group: 1,
+		hints: []string{"api_key", "api-key", "apikey", "token", "secret", "password", "passwd"},
+		keep:  keepAssigned,
+	},
+}
+
+var (
+	allLetters = regexp.MustCompile(`^[A-Za-z_-]+$`)
+	allDigits  = regexp.MustCompile(`^[0-9]+$`)
+	dotted     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$`)
+	upperSnake = regexp.MustCompile(`^[A-Z][A-Z_]*$`)
+	repeated   = regexp.MustCompile(`^(?:x+|\*+|\.+|-+|_+|0+)$`)
+	winPath    = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
+)
+
+// keepAssigned decides whether the value of a `secret_name = value` match is a
+// secret rather than a path, URL, boolean, placeholder, number, plain word or
+// code expression.
+func keepAssigned(value, rest string) bool {
+	if isPlaceholder(value) || isPathOrURL(value) || isBooleanish(value) {
+		return false
+	}
+	if rest != "" && (rest[0] == '(' || rest[0] == '[') && !strings.HasPrefix(rest, "[REDACTED:") {
+		return false // a call or an index: code, not a literal
+	}
+	return !allLetters.MatchString(value) && !allDigits.MatchString(value) && !dotted.MatchString(value)
+}
+
+// isPlaceholder reports whether v is a stand-in someone wrote instead of a
+// secret.
+func isPlaceholder(v string) bool {
+	lower := strings.ToLower(v)
+	switch {
+	case strings.Contains(lower, "redacted"):
+		return true
+	case strings.HasPrefix(v, "$") || strings.HasPrefix(v, "%") || strings.HasPrefix(v, "<") ||
+		strings.HasPrefix(v, "{") || strings.HasPrefix(v, "*"):
+		return true
+	case repeated.MatchString(lower), upperSnake.MatchString(v):
+		return true
+	}
+	for _, word := range []string{"your", "example", "placeholder", "changeme", "dummy", "xxxx"} {
+		if strings.Contains(lower, word) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPathOrURL(v string) bool {
+	return strings.Contains(v, "://") || strings.HasPrefix(v, "/") || strings.HasPrefix(v, "./") ||
+		strings.HasPrefix(v, "../") || strings.HasPrefix(v, "~") || winPath.MatchString(v)
+}
+
+func isBooleanish(v string) bool {
+	switch strings.ToLower(v) {
+	case "true", "false", "yes", "no", "on", "off", "null", "none", "nil", "undefined", "enabled", "disabled":
+		return true
+	}
+	return false
+}
+
+func hasDigitOrUpper(v string) bool {
+	return strings.ContainsAny(v, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+}
+
+// envKeywords are the name fragments that mark an environment variable as
+// holding a secret. AUTHOR is blanked first so GIT_AUTHOR_NAME is not one.
+var envKeywords = []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "AUTH", "CREDENTIAL", "COOKIE"}
+
+// literal is one exact value to redact, with the JSON-escaped spelling it
+// takes inside a raw transcript line when that differs.
+type literal struct {
+	kind  string
+	value string
+}
+
+// Redactor applies the rules and counts what it removed. It is safe for
+// concurrent use.
+type Redactor struct {
+	literals []literal
+
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+// New returns a Redactor for this process: its secret-looking environment
+// variables and the tokens in ~/.npmrc are redacted by exact value.
+func New() *Redactor {
+	var npmrc string
+	if home, err := os.UserHomeDir(); err == nil {
+		if data, err := os.ReadFile(filepath.Join(home, ".npmrc")); err == nil {
+			npmrc = string(data)
+		}
+	}
+	return NewWith(os.Environ(), npmrc)
+}
+
+var npmToken = regexp.MustCompile(`(?m)_authToken\s*=\s*"?([^\s"]+)`)
+
+// NewWith is New with the environment ("NAME=value" entries) and the content
+// of an .npmrc given explicitly.
+func NewWith(environ []string, npmrc string) *Redactor {
+	r := &Redactor{counts: map[string]int{}}
+	seen := map[string]bool{}
+	add := func(kind, value string) {
+		if len(value) < minEnvValue || seen[value] {
+			return
+		}
+		seen[value] = true
+		r.literals = append(r.literals, literal{kind, value})
+		if escaped := jsonEscape(value); escaped != value {
+			r.literals = append(r.literals, literal{kind, escaped})
+		}
+	}
+	for _, entry := range environ {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok || !secretName(name) || isPathOrURL(value) || isBooleanish(value) || winPath.MatchString(value) {
+			continue
+		}
+		add(KindEnvSecret, value)
+	}
+	for _, m := range npmToken.FindAllStringSubmatch(npmrc, -1) {
+		if !strings.HasPrefix(m[1], "${") {
+			add(KindNPMToken, m[1])
+		}
+	}
+	sort.SliceStable(r.literals, func(i, j int) bool { return len(r.literals[i].value) > len(r.literals[j].value) })
+	return r
+}
+
+func secretName(name string) bool {
+	upper := strings.ReplaceAll(strings.ToUpper(name), "AUTHOR", "")
+	for _, k := range envKeywords {
+		if strings.Contains(upper, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// jsonEscape returns v as it is spelled inside a JSON string.
+func jsonEscape(v string) string {
+	b, err := json.Marshal(v)
+	if err != nil || len(b) < 2 {
+		return v
+	}
+	return string(b[1 : len(b)-1])
+}
+
+var (
+	defaultOnce sync.Once
+	defaultR    *Redactor
+)
+
+// Default is the process-wide Redactor that Text uses. Its counts cover every
+// Text call since the last ResetCounts.
+func Default() *Redactor {
+	defaultOnce.Do(func() { defaultR = New() })
+	return defaultR
+}
+
+// Text returns s with secrets removed, using the process-wide Redactor. Every
+// renderer and every Evidence excerpt calls it.
+func Text(s string) string { return Default().Text(s) }
+
+// Text returns s with secrets removed.
+func (r *Redactor) Text(s string) string { return r.scrub(s) }
+
+// FileBytes returns b with secrets removed, for a whole file rather than a
+// transcript.
+//
+// Bytes splits on "\n" so that no rule can ever join two lines of a JSONL
+// transcript, which is right for a transcript and fatal for a source file: the
+// private_key rule is written to span lines, so through Bytes it never matches,
+// and a whole PEM block in a changed file would ship verbatim.
+//
+// So the rules that are meant to span lines run over the whole buffer, and
+// every other rule still runs line by line, exactly as Bytes runs it. Apart
+// from a multi-line rule's own matches, the output is what Bytes would produce:
+// a rule whose separator can absorb a newline must not be allowed to reach
+// across one and redact a line that holds no secret.
+//
+// Line structure is preserved, which is what a caller that indexes the result
+// by line number needs — a diff hunk's old_start and new_start are indices into
+// the file at its revision. A match is replaced by the marker plus the newlines
+// it swallowed, so every line after a match keeps its number, at the cost of
+// the marker standing where the match began and the lines it covered being left
+// empty.
+//
+// What is preserved exactly is the number of newlines. The one case where that
+// does not settle the line count is a match that runs to the end of a file with
+// no trailing newline: the marker re-emits the newlines the match held, so the
+// result ends with one where the input did not, and counting the last line the
+// usual way gives one fewer. Nothing after the match is shifted, so a caller
+// that indexes by line is unaffected; one that wants the file's own line count
+// should take it from the input.
+func (r *Redactor) FileBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	return []byte(r.scrubFile(string(b), true))
+}
+
+// scrub runs every rule and then the exact literals over s, line by line.
+func (r *Redactor) scrub(s string) string {
+	if s == "" {
+		return s
+	}
+	lower := strings.ToLower(s)
+	for i := range rules {
+		s, lower = r.apply(&rules[i], s, lower, false)
+	}
+	return r.scrubLiterals(awsTail(s), false)
+}
+
+// awsSecretTail is the rest of a value aws_secret cut at 40 characters.
+var awsSecretTail = regexp.MustCompile(`\[REDACTED:aws_secret\][A-Za-z0-9/+=]+`)
+
+// awsTail removes what follows an aws_secret marker in the value it came from.
+// The rule takes exactly 40 characters, so that a token glued to the secret
+// (`/eyJ...`, `+xoxb-...`) is still there for its own rule to find; whatever of
+// a longer value is left once every rule has run goes here. It counts nothing:
+// it finishes a match the rule already counted.
+func awsTail(s string) string {
+	if !strings.Contains(s, "[REDACTED:aws_secret]") {
+		return s
+	}
+	return awsSecretTail.ReplaceAllLiteralString(s, marker(KindAWSSecret))
+}
+
+// scrubFile is scrub for a whole file: a rule marked multiline runs over the
+// whole buffer, and every other rule runs line by line. keepLines makes a match
+// keep the newlines it swallowed, which FileBytes needs and a JSON string does
+// not.
+func (r *Redactor) scrubFile(s string, keepLines bool) string {
+	if s == "" {
+		return s
+	}
+	lower := strings.ToLower(s)
+	for i := range rules {
+		ru := &rules[i]
+		if !hasAny(lower, ru.hints) {
+			continue // no line has a hint either
+		}
+		var out string
+		if ru.multiline {
+			out, _ = r.apply(ru, s, lower, keepLines)
+		} else {
+			out = r.applyPerLine(ru, s)
+		}
+		if out != s {
+			s, lower = out, strings.ToLower(out)
+		}
+	}
+	return r.scrubLiterals(awsTail(s), keepLines)
+}
+
+// applyPerLine runs one rule over s one line at a time, the way Bytes does, so
+// that a rule which is not written to span lines cannot.
+func (r *Redactor) applyPerLine(ru *rule, s string) string {
+	if !strings.Contains(s, "\n") {
+		out, _ := r.apply(ru, s, strings.ToLower(s), false)
+		return out
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	for len(s) > 0 {
+		line, rest := s, ""
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			line, rest = s[:i+1], s[i+1:]
+		}
+		scrubbed, _ := r.apply(ru, line, strings.ToLower(line), false)
+		out.WriteString(scrubbed)
+		s = rest
+	}
+	return out.String()
+}
+
+// scrubLiterals replaces the exact values this process knows are secret.
+// keepLines matters only for a value that itself holds a newline: an
+// environment variable can, and redacting it whole is strictly more than the
+// line-by-line pass manages, never less. It cannot redact an innocent line,
+// because it only ever matches the value itself.
+func (r *Redactor) scrubLiterals(s string, keepLines bool) string {
+	for _, l := range r.literals {
+		if n := strings.Count(s, l.value); n > 0 {
+			s = strings.ReplaceAll(s, l.value, replacement(l.kind, l.value, keepLines))
+			r.add(l.kind, n)
+		}
+	}
+	return s
+}
+
+// replacement is what a match becomes: the marker, plus the newlines it
+// swallowed when the caller is keeping the line count.
+func replacement(kind, matched string, keepLines bool) string {
+	out := marker(kind)
+	if keepLines {
+		out += strings.Repeat("\n", strings.Count(matched, "\n"))
+	}
+	return out
+}
+
+// Bytes returns b with secrets removed. It works line by line so a rule can
+// never join two lines of a JSONL transcript, and the result has the same
+// number of lines as the input.
+func (r *Redactor) Bytes(b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	var out bytes.Buffer
+	out.Grow(len(b))
+	for len(b) > 0 {
+		line := b
+		rest := []byte(nil)
+		if i := bytes.IndexByte(b, '\n'); i >= 0 {
+			line, rest = b[:i+1], b[i+1:]
+		}
+		out.WriteString(r.Text(string(line)))
+		b = rest
+	}
+	return out.Bytes()
+}
+
+// apply runs one rule over s and returns the new text and its lowercase form.
+func (r *Redactor) apply(ru *rule, s, lower string, keepLines bool) (string, string) {
+	if !hasAny(lower, ru.hints) {
+		return s, lower
+	}
+	matches := ru.re.FindAllStringSubmatchIndex(s, -1)
+	if len(matches) == 0 {
+		return s, lower
+	}
+	var out strings.Builder
+	last, n := 0, 0
+	for _, m := range matches {
+		start, end := m[2*ru.group], m[2*ru.group+1]
+		if start < 0 || start < last {
+			continue
+		}
+		if ru.keep != nil && !ru.keep(s[start:end], s[end:]) {
+			continue
+		}
+		out.WriteString(s[last:start])
+		// The replaced span is the submatch group, not the whole match: a rule
+		// may match a prefix it does not replace (a "password =" before the
+		// value), and with keepLines the newlines that matter are the ones
+		// inside the span actually being replaced.
+		out.WriteString(replacement(ru.kind, s[start:end], keepLines))
+		last = end
+		n++
+	}
+	if n == 0 {
+		return s, lower
+	}
+	out.WriteString(s[last:])
+	r.add(ru.kind, n)
+	s = out.String()
+	return s, strings.ToLower(s)
+}
+
+func hasAny(lower string, hints []string) bool {
+	for _, h := range hints {
+		if strings.Contains(lower, h) {
+			return true
+		}
+	}
+	return false
+}
+
+func marker(kind string) string { return "[REDACTED:" + kind + "]" }
+
+func (r *Redactor) add(kind string, n int) {
+	r.mu.Lock()
+	r.counts[kind] += n
+	r.mu.Unlock()
+}
+
+// Counts returns how many matches each kind has had so far.
+func (r *Redactor) Counts() map[string]int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]int, len(r.counts))
+	for k, v := range r.counts {
+		out[k] = v
+	}
+	return out
+}
+
+// ResetCounts zeroes the counters.
+func (r *Redactor) ResetCounts() {
+	r.mu.Lock()
+	r.counts = map[string]int{}
+	r.mu.Unlock()
+}
+
+// Merge adds the counts of b into a copy of a.
+func Merge(a, b map[string]int) map[string]int {
+	out := make(map[string]int, len(a)+len(b))
+	for k, v := range a {
+		out[k] += v
+	}
+	for k, v := range b {
+		out[k] += v
+	}
+	return out
+}

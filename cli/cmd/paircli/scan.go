@@ -1,0 +1,136 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/interviewstreet/pair-plugin/cli/internal/config"
+	"github.com/interviewstreet/pair-plugin/cli/internal/llm"
+	"github.com/interviewstreet/pair-plugin/cli/internal/pr"
+	"github.com/interviewstreet/pair-plugin/cli/internal/scan"
+)
+
+// scanArgs is a parsed `paircli scan` invocation.
+type scanArgs struct {
+	PRArg           string
+	Out             string
+	Post            bool
+	IncludePrompts  bool
+	LLM             string
+	Model           string
+	NoHooks         bool
+	NoCommitPatches bool
+	NoAgentTrace    bool
+	Snapshot        bool
+	NoFileContents  bool
+	WindowBefore    time.Duration
+	WindowAfter     time.Duration
+	JSON            bool
+}
+
+// parseScanArgs parses `scan <pr-number-or-url> [flags]`: the positional PR
+// argument comes first and the flags after it, so the flag package never has
+// to decide what an interspersed positional means.
+func parseScanArgs(args []string) (scanArgs, error) {
+	var a scanArgs
+	if len(args) < 1 {
+		return a, fmt.Errorf("usage: paircli scan <pr-number-or-url> [flags]")
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return a, fmt.Errorf("usage: paircli scan <pr-number-or-url> [flags] (the PR argument comes first)")
+	}
+	a.PRArg = args[0]
+
+	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	fs.SetOutput(io.Discard) // runScan reports parse errors itself
+	fs.StringVar(&a.Out, "out", "", "output folder")
+	fs.BoolVar(&a.Post, "post", false, "create or update the PR comment")
+	fs.BoolVar(&a.IncludePrompts, "include-prompts", false, "let comment.md carry prompt text")
+	fs.StringVar(&a.LLM, "llm", "", "LLM provider: none | anthropic | claude-cli | pi | http")
+	fs.StringVar(&a.Model, "model", "", "LLM model")
+	fs.BoolVar(&a.NoHooks, "no-hooks", false, "ignore hook-log records")
+	fs.BoolVar(&a.NoCommitPatches, "no-commit-patches", false, "skip per-commit patches")
+	fs.BoolVar(&a.NoAgentTrace, "no-agent-trace", false, "skip agent-trace.json")
+	fs.BoolVar(&a.Snapshot, "snapshot", false, "also write snapshot.json, a full replay record")
+	fs.BoolVar(&a.NoFileContents, "no-file-contents", false, "do not write the changed files' contents")
+	fs.DurationVar(&a.WindowBefore, "window-before", 0, "session search window before the first commit")
+	fs.DurationVar(&a.WindowAfter, "window-after", 0, "session search window after the last commit")
+	fs.BoolVar(&a.JSON, "json", false, "print signals.json to stdout")
+	if err := fs.Parse(args[1:]); err != nil {
+		return a, err
+	}
+	if fs.NArg() > 0 {
+		return a, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	return a, nil
+}
+
+// runScan implements `paircli scan`: it resolves the PR and repo, applies the
+// flag overrides to the repo configuration, and runs the pipeline.
+func runScan(args []string) error {
+	a, err := parseScanArgs(args)
+	if err != nil {
+		return err
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	repo, number, err := pr.ResolveArg(cwd, a.PRArg)
+	if err != nil {
+		return err
+	}
+	root := scan.RepoRoot(cwd, repo)
+	// A diagnostic about where the working directory's scan output went, so it
+	// goes to stderr and never into the JSON a --json run prints.
+	printLegacyScanNote(os.Stderr, cwd, root)
+
+	cfg, err := config.Load(root)
+	if err != nil {
+		return err
+	}
+	if a.WindowBefore != 0 {
+		cfg.WindowBefore = config.Duration{Duration: a.WindowBefore}
+	}
+	if a.WindowAfter != 0 {
+		cfg.WindowAfter = config.Duration{Duration: a.WindowAfter}
+	}
+	if a.LLM != "" {
+		cfg.LLM.Provider = a.LLM
+	}
+	if a.Model != "" {
+		cfg.LLM.Model = a.Model
+	}
+	provider, err := llm.New(cfg.LLM)
+	if err != nil {
+		return err
+	}
+
+	res, err := scan.Run(context.Background(), scan.Options{
+		Repo:                repo,
+		Number:              number,
+		CWD:                 cwd,
+		OutDir:              a.Out,
+		Runner:              pr.GH{},
+		Config:              cfg,
+		NoHooks:             a.NoHooks,
+		NoCommitPatches:     a.NoCommitPatches,
+		NoAgentTrace:        a.NoAgentTrace,
+		Snapshot:            a.Snapshot,
+		ChangedFileContents: cfg.ChangedFileContents() && !a.NoFileContents,
+		Post:                a.Post,
+		IncludePrompts:      a.IncludePrompts,
+		LLM:                 provider,
+		Version:             version,
+	})
+	if err != nil {
+		return err
+	}
+	return printResult(res, a.JSON)
+}
