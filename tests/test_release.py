@@ -7,6 +7,7 @@ import tomllib
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = ROOT / "plugins/pair"
 SPEC = importlib.util.spec_from_file_location("release_check", ROOT / "scripts/check-release-artifacts.py")
 release_check = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release_check)
@@ -61,8 +62,8 @@ def test_check_release_requires_all_four_platforms(tmp_path):
 
 def test_plugin_versions_match_bootstrap():
     version = release_check.bootstrap.PLUGIN_VERSION
-    assert json.loads((ROOT / ".claude-plugin/plugin.json").read_text())["version"] == version
-    assert json.loads((ROOT / ".codex-plugin/plugin.json").read_text())["version"].split("+", 1)[0] == version
+    assert json.loads((PLUGIN_ROOT / ".claude-plugin/plugin.json").read_text())["version"] == version
+    assert json.loads((PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text())["version"].split("+", 1)[0] == version
     assert tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"] == version
 
 

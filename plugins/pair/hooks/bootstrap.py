@@ -23,7 +23,7 @@ try:
 except ImportError:
     fcntl = None
 
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.4.1"
 MANIFEST_URL = "https://github.com/interviewstreet/pair-plugin/releases/latest/download/latest.json"
 MAX_BINARY_BYTES = 100 * 1024 * 1024
 SETUP_LOG_GLOB = "~/.paircli/logs/setup-*.log"

@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("pair_bootstrap", ROOT / "hooks/bootstrap.py")
+SPEC = importlib.util.spec_from_file_location("pair_bootstrap", ROOT / "plugins/pair/hooks/bootstrap.py")
 bootstrap = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bootstrap)
 PLATFORMS = ("darwin-arm64", "darwin-amd64", "linux-arm64", "linux-amd64")

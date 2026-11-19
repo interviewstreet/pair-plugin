@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("binary_bootstrap", ROOT / "hooks/bootstrap.py")
+SPEC = importlib.util.spec_from_file_location("binary_bootstrap", ROOT / "plugins/pair/hooks/bootstrap.py")
 bootstrap = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bootstrap)
 

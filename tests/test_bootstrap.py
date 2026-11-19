@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-HOOKS_DIR = Path(__file__).resolve().parent.parent / "hooks"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+HOOKS_DIR = REPO_ROOT / "plugins/pair/hooks"
 SPEC = importlib.util.spec_from_file_location("bootstrap", HOOKS_DIR / "bootstrap.py")
 assert SPEC and SPEC.loader
 bootstrap = importlib.util.module_from_spec(SPEC)
@@ -372,7 +373,7 @@ ROOT = HOOKS_DIR.parent
 def test_plugin_versions_agree():
     claude = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())["version"]
     codex = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())["version"]
-    pyproject = next(line for line in (ROOT / "pyproject.toml").read_text().splitlines() if line.startswith("version"))
+    pyproject = next(line for line in (REPO_ROOT / "pyproject.toml").read_text().splitlines() if line.startswith("version"))
     assert claude == codex == bootstrap.PLUGIN_VERSION
     assert pyproject.split('"')[1] == claude
 
@@ -395,10 +396,12 @@ def test_manifest_icons_exist_and_are_square_png():
         assert len(data) < 2 * 1024 * 1024
 
 
-def test_marketplaces_keep_main_layout_and_root_plugin_sources():
-    claude = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text())
-    codex = json.loads((ROOT / ".agents/plugins/marketplace.json").read_text())
+def test_marketplaces_select_only_the_installable_plugin():
+    claude = json.loads((REPO_ROOT / ".claude-plugin/marketplace.json").read_text())
+    codex = json.loads((REPO_ROOT / ".agents/plugins/marketplace.json").read_text())
     assert claude["owner"]["name"] == "HackerRank"
-    assert claude["plugins"][0]["source"] == "./"
-    assert codex["plugins"][0]["source"] == {"source": "local", "path": "./"}
+    assert claude["name"] == codex["name"] == "pair"
+    assert claude["plugins"][0]["name"] == codex["plugins"][0]["name"] == "pair"
+    assert claude["plugins"][0]["source"] == "./plugins/pair"
+    assert codex["plugins"][0]["source"] == {"source": "local", "path": "./plugins/pair"}
     assert codex["plugins"][0]["category"] == "Productivity"

@@ -8,7 +8,7 @@ publishing, PR detection) is done by `paircli`.
 
 When the first Claude Code or Codex session opens after the plugin is
 installed (or updated), the plugin's `SessionStart` hook runs
-`hooks/bootstrap.py`. Codex asks you to review and trust the hook first.
+`plugins/pair/hooks/bootstrap.py` in this repository (`hooks/bootstrap.py` inside the installed plugin). Codex asks you to review and trust the hook first.
 Installing alone does not run it; start a new session.
 
 1. If `~/.paircli/bin/paircli` is missing or has not migrated to this plugin's release source, a detached background process
@@ -21,7 +21,7 @@ Installing alone does not run it; start a new session.
    capture cursors and publication state are retained. A failed download leaves
    the current binary intact. Concurrent startup installers are serialized.
 2. The same process runs
-   `paircli setup --harness <claude-code|codex> --plugin-version 0.4.0`.
+   `paircli setup --harness <claude-code|codex> --plugin-version 0.4.1`.
    Setup is idempotent: it checks for a newer `paircli`, installs the PR hook
    for that harness, and starts device login if you have no valid credential.
    Login can wait for you to approve in the browser; it never blocks the session.
