@@ -99,8 +99,9 @@ Add Pair as an entry in your marketplace's `.claude-plugin/marketplace.json`:
     {
       "name": "pair",
       "source": {
-        "source": "github",
-        "repo": "interviewstreet/pair-plugin",
+        "source": "git-subdir",
+        "url": "https://github.com/interviewstreet/pair-plugin.git",
+        "path": "plugins/pair",
         "ref": "main"
       }
     }
@@ -141,8 +142,9 @@ Add Pair to your marketplace's `.agents/plugins/marketplace.json`:
     {
       "name": "pair",
       "source": {
-        "source": "url",
+        "source": "git-subdir",
         "url": "https://github.com/interviewstreet/pair-plugin.git",
+        "path": "./plugins/pair",
         "ref": "main"
       },
       "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
@@ -165,7 +167,7 @@ Git-backed entries can use `ref` or `sha` to pin a version.
 
 ```sh
 git clone https://github.com/interviewstreet/pair-plugin.git
-claude --plugin-dir ./pair-plugin                       # Claude Code, for one session
+claude --plugin-dir ./pair-plugin/plugins/pair          # Claude Code, for one session
 claude plugin marketplace add ./pair-plugin             # Claude Code, installed
 codex plugin marketplace add ./pair-plugin              # Codex
 ```
@@ -278,13 +280,10 @@ codex plugin remove pair@pair           # Codex
 ## Repository layout
 
 ```text
-.claude-plugin/        Claude Code plugin manifest and marketplace
-.codex-plugin/         Codex plugin manifest
+.claude-plugin/        Claude Code marketplace
 .agents/plugins/       Codex marketplace
-hooks/                 SessionStart hook: bootstrap.py and hooks.json
+plugins/pair/          installable plugin: manifests, startup hook, skill, icon and docs
 cli/                   Pair CLI Go source, runtime, tests and release scripts
-skills/pair/           the /pair skill
-assets/                plugin icon
 docs/ONBOARDING.md     setup, upload contents and uninstall in detail
 tests/                 hook tests
 ```
@@ -294,8 +293,9 @@ tests/                 hook tests
 ```sh
 uv sync --group dev
 uv run pytest
-claude plugin validate . --profile directory
-claude --plugin-dir .
+claude plugin validate .
+claude plugin validate ./plugins/pair --profile directory
+claude --plugin-dir ./plugins/pair
 cd cli
 go test ./...
 go test -race ./internal/notify ./cmd/paircli
@@ -315,9 +315,13 @@ See [the migration and rollout checklist](docs/CLI_MIGRATION.md) before enabling
 this plugin version. Anonymous installs require public release assets. A source
 move alone does not make a private repository's binaries publicly downloadable.
 
-The plugin version lives in four places that must agree: `.claude-plugin/plugin.json`,
-`.codex-plugin/plugin.json`, `PLUGIN_VERSION` in `hooks/bootstrap.py`, and `pyproject.toml`.
+The plugin version lives in four places that must agree: `plugins/pair/.claude-plugin/plugin.json`,
+`plugins/pair/.codex-plugin/plugin.json`, `PLUGIN_VERSION` in `plugins/pair/hooks/bootstrap.py`, and `pyproject.toml`.
 A test enforces it.
+
+For Anthropic Directory submission, select the plugin subfolder `plugins/pair`, not the repository root. This keeps CLI source, test fixtures and development-only assets out of the installed plugin while retaining them in this repository for review and releases. See [the submission checklist](docs/DIRECTORY_SUBMISSION.md) for the organization and policy checks this layout cannot resolve.
+
+Directory submission is not currently ready: session-evidence extraction needs an authoritative eligibility determination under policy 1.G, local hooks face the reported organization restriction, and the public legal/support URLs require owner attention. These packaging changes do not establish approval or change the existing capture workflow. Report security issues through [the published contact](SECURITY.md), not by posting private logs in issues.
 
 ## License
 
