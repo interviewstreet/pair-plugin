@@ -77,6 +77,10 @@ type publishArgs struct {
 	// ExpectHead is the commit a push sent, which the hook passes so the run
 	// waits for GitHub to show it as the PR head; "" scans whatever it shows.
 	ExpectHead string
+
+	// IfOpen publishes only while the PR is open, which the hook passes: a PR
+	// merged or closed by the time the run starts is left alone, quietly.
+	IfOpen bool
 }
 
 // parsePublishArgs parses `publish <pr-number-or-url> [flags]`: the PR
@@ -101,6 +105,7 @@ func parsePublishArgs(args []string) (publishArgs, error) {
 	fs.BoolVar(&a.JSON, "json", false, "print the result as JSON on stdout")
 	fs.BoolVar(&a.NoFileContents, "no-file-contents", false, "do not upload the changed files' contents")
 	fs.StringVar(&a.ExpectHead, "expect-head", "", "wait up to 30s for the PR head to be this pushed commit")
+	fs.BoolVar(&a.IfOpen, "if-open", false, "do nothing, successfully, unless the PR is open")
 	if err := fs.Parse(args[1:]); err != nil {
 		return a, err
 	}
@@ -240,6 +245,15 @@ func publishRun(ctx context.Context, env publishEnv, a publishArgs) error {
 		return fmt.Errorf("publish: %q is not owner/repo", slug)
 	}
 	key := state.Key(owner, repo, number)
+
+	// Before any side effect: no lock, login, record or notification. A state
+	// gh cannot report publishes as before; the hook found the PR open.
+	if a.IfOpen {
+		if st, err := pr.State(env.runner, slug, number); err == nil && st != "OPEN" {
+			fmt.Fprintf(env.stdout, "paircli publish: %s#%d is %s; not publishing it (--if-open)\n", slug, number, strings.ToLower(st))
+			return nil
+		}
+	}
 
 	lock, err := acquirePRLock(env, a, key, owner, repo, number, dir)
 	if lock == nil || err != nil {

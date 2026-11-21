@@ -133,10 +133,11 @@ func StartPublish(pr PR, dir, head string) error {
 }
 
 // PublishArgs is the arguments (after the binary) of the detached publish: the
-// PR, its repository directory, --wait with the default timeout and, after a
-// push, --expect-head with the pushed commit.
+// PR, its repository directory, --wait with the default timeout, --if-open so
+// a PR merged or closed by the time the publish starts is left alone and,
+// after a push, --expect-head with the pushed commit.
 func PublishArgs(pr PR, dir, head string) []string {
-	args := []string{"publish", pr.URL(), "--repo-dir", dir, "--wait"}
+	args := []string{"publish", pr.URL(), "--repo-dir", dir, "--wait", "--if-open"}
 	if head != "" {
 		args = append(args, "--expect-head", head)
 	}

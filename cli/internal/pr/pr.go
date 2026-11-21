@@ -346,3 +346,17 @@ func HeadSHA(r Runner, repo string, number int) (string, error) {
 	}
 	return sha, nil
 }
+
+// State returns the PR's state as GitHub names it (OPEN, CLOSED or MERGED)
+// with one cheap `gh` call.
+func State(r Runner, repo string, number int) (string, error) {
+	out, err := r.Run("pr", "view", strconv.Itoa(number), "-R", repo, "--json", "state", "--jq", ".state")
+	if err != nil {
+		return "", fmt.Errorf("pr: gh pr view: %w", err)
+	}
+	st := strings.TrimSpace(string(out))
+	if st == "" {
+		return "", errors.New("pr: GitHub returned no state")
+	}
+	return st, nil
+}

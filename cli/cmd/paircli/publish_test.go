@@ -69,6 +69,7 @@ type pubGH struct {
 	mu    sync.Mutex
 	calls []string
 	head  string // the PR's current head; "" = pubHead
+	state string // the PR's state; "" = OPEN, "error" = gh fails
 }
 
 func (g *pubGH) currentHead() string {
@@ -97,6 +98,14 @@ func (g *pubGH) Run(args ...string) ([]byte, error) {
 		return []byte(strings.Replace(pubPRView, pubHead, g.currentHead(), 1)), nil
 	case key == "pr view 7 -R acme/shop --json headRefOid --jq .headRefOid":
 		return []byte(g.currentHead() + "\n"), nil
+	case key == "pr view 7 -R acme/shop --json state --jq .state":
+		switch g.state {
+		case "":
+			return []byte("OPEN\n"), nil
+		case "error":
+			return nil, errors.New("gh: could not reach GitHub")
+		}
+		return []byte(g.state + "\n"), nil
 	case strings.HasPrefix(key, pubDiffPrefix):
 		return []byte(pubDiff), nil
 	case key == "api repos/acme/shop/commits/aaaaaaa1":
@@ -1320,12 +1329,70 @@ func TestPublishLoserMarkerCarriesTheExpectedHead(t *testing.T) {
 	}
 }
 
+// --if-open, which the hooks pass, leaves a merged or closed PR alone before
+// any side effect: no login, upload, notification or record change. A state gh
+// cannot report publishes as before, and so does a publish without the flag.
+func TestPublishIfOpen(t *testing.T) {
+	tests := []struct {
+		name        string
+		state       string
+		flags       []string
+		wantPublish bool
+	}{
+		{name: "open", state: "OPEN", flags: []string{"--if-open"}, wantPublish: true},
+		{name: "merged", state: "MERGED", flags: []string{"--if-open"}},
+		{name: "closed", state: "CLOSED", flags: []string{"--if-open"}},
+		{name: "state unknown", state: "error", flags: []string{"--if-open"}, wantPublish: true},
+		{name: "merged, by hand", state: "MERGED", wantPublish: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newPubHarness(t)
+			h.gh.state = tc.state
+			if err := state.WritePublication(state.Publication{RunID: "earlier", PRURL: "https://github.com/acme/shop/pull/7",
+				Owner: "acme", Repo: "shop", Number: 7, State: state.StateReady, HeadSHA: pubHead}); err != nil {
+				t.Fatal(err)
+			}
+			before := h.record()
+			if err := h.run(append([]string{"--no-comment", "--wait"}, tc.flags...)...); err != nil {
+				t.Fatalf("publish: %v\nstdout:\n%s", err, h.stdout)
+			}
+			if published := len(h.api.heads) > 0; published != tc.wantPublish {
+				t.Fatalf("published heads = %v, want a publish: %v\nstdout:\n%s", h.api.heads, tc.wantPublish, h.stdout)
+			}
+			if len(tc.flags) == 0 && h.gh.called("pr view 7 -R acme/shop --json state") {
+				t.Error("a publish without --if-open asked for the PR state")
+			}
+			if tc.wantPublish {
+				return
+			}
+			if len(h.notices) != 0 || h.credentialCalls != 0 {
+				t.Errorf("notices = %q, credential calls = %d, want none", h.notices, h.credentialCalls)
+			}
+			if got := h.record(); got != before {
+				t.Errorf("record = %+v, want it untouched: %+v", got, before)
+			}
+			if want := "acme/shop#7 is " + strings.ToLower(tc.state) + "; not publishing it"; !strings.Contains(h.stdout.String(), want) {
+				t.Errorf("stdout = %q, want %q", h.stdout, want)
+			}
+		})
+	}
+}
+
 func TestParsePublishArgs(t *testing.T) {
 	got, err := parsePublishArgs([]string{"https://github.com/acme/shop/pull/9", "--repo-dir", "/r", "--wait", "--timeout", "90s", "--dry-run", "--no-comment", "--json"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := publishArgs{PRArg: "https://github.com/acme/shop/pull/9", RepoDir: "/r", Wait: true, Timeout: 90 * time.Second, DryRun: true, NoComment: true, JSON: true}
+	if got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+	got, err = parsePublishArgs([]string{"7", "--if-open"})
+	if err != nil || !got.IfOpen {
+		t.Errorf("--if-open: got %+v, %v", got, err)
+	}
+	got, _ = parsePublishArgs([]string{"https://github.com/acme/shop/pull/9", "--repo-dir", "/r", "--wait", "--timeout", "90s", "--dry-run", "--no-comment", "--json"})
 	if got != want {
 		t.Errorf("got %+v, want %+v", got, want)
 	}
