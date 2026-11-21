@@ -454,6 +454,27 @@ func TestHeadSHA(t *testing.T) {
 	}
 }
 
+func TestState(t *testing.T) {
+	key := "pr view 42 -R acme/shop --json state --jq .state"
+	for _, want := range []string{"OPEN", "MERGED", "CLOSED"} {
+		r := newFakeRunner(t)
+		r.responses[key] = []byte(want + "\n")
+		if got, err := State(r, testRepo, 42); err != nil || got != want {
+			t.Errorf("State = %q, %v, want %q", got, err, want)
+		}
+	}
+
+	r := newFakeRunner(t)
+	r.responses[key] = []byte("\n")
+	if _, err := State(r, testRepo, 42); err == nil {
+		t.Error("an empty state was accepted")
+	}
+	r.errs[key] = errors.New("gh failed")
+	if _, err := State(r, testRepo, 42); err == nil {
+		t.Error("a gh failure was swallowed")
+	}
+}
+
 // pushingGitHub is a fake GitHub where someone pushes right after gh pr view
 // answers: the head view returned is already stale when the diff or the files
 // are asked for. Every source renders the file at the head it reads.
