@@ -78,10 +78,12 @@ report is fully deterministic. Turning a scan into a published review is
 ## Publishing: `paircli publish`
 
 `paircli publish <pr> [--repo-dir DIR] [--wait] [--timeout DUR] [--dry-run]
-[--no-comment] [--json]` runs the scan above (snapshot on, no LLM) and sends
+[--no-comment] [--json] [--if-open]` runs the scan above (snapshot on, no LLM) and sends
 the result, plus the new part of the raw agent transcripts, to Pair. Pair's
 worker does all LLM generation; the client only collects, redacts and
-uploads. The steps, each written to the PR's publication record
+uploads. With `--if-open`, which the hooks pass, a PR GitHub reports as merged
+or closed is left alone before any step below: the run logs one line and
+exits 0, with no record change and no notification. The steps, each written to the PR's publication record
 (`~/.paircli/state/publications/<owner>__<repo>__<n>.json`, see
 [SETUP.md](SETUP.md)) so `paircli status` can show where a run is:
 

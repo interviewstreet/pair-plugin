@@ -166,7 +166,7 @@ func TestStartDetached_WritesALogUnderTheLogDir(t *testing.T) {
 // review is ready.
 func TestPublishArgs_FollowTheReviewWithTheDefaultTimeout(t *testing.T) {
 	got := strings.Join(PublishArgs(wantPR, "/repo", ""), " ")
-	want := "publish " + wantPR.URL() + " --repo-dir /repo --wait"
+	want := "publish " + wantPR.URL() + " --repo-dir /repo --wait --if-open"
 	if got != want {
 		t.Errorf("args = %q, want %q", got, want)
 	}
@@ -176,7 +176,7 @@ func TestPublishArgs_FollowTheReviewWithTheDefaultTimeout(t *testing.T) {
 func TestPublishArgs_PushNamesThePushedCommit(t *testing.T) {
 	head := strings.Repeat("c", 40)
 	got := strings.Join(PublishArgs(wantPR, "/repo", head), " ")
-	want := "publish " + wantPR.URL() + " --repo-dir /repo --wait --expect-head " + head
+	want := "publish " + wantPR.URL() + " --repo-dir /repo --wait --if-open --expect-head " + head
 	if got != want {
 		t.Errorf("args = %q, want %q", got, want)
 	}

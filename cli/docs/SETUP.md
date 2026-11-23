@@ -104,9 +104,11 @@ Claude Code and Codex. Besides recording git state changes, it watches for:
 
 - a successful `gh pr create`, and
 - a successful `git push` of the current branch while it has an open PR
-  (`gh pr view` in the command's directory, 3 second limit).
+  (`gh pr view` in the command's directory, 3 second limit). A branch whose
+  PR is merged or closed starts nothing and prints nothing.
 
-It then starts `paircli publish <pr-url> --repo-dir <dir> --wait` detached (a
+It then starts `paircli publish <pr-url> --repo-dir <dir> --wait --if-open`
+detached (`--if-open` makes it do nothing if the PR is no longer open; a
 push adds `--expect-head <sha>`, the commit checked out after it, so the publish
 waits up to 30 s for GitHub to show that commit as the PR head), in its own
 session, with stdout and stderr in
