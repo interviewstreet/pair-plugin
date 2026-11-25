@@ -250,7 +250,10 @@ What happens automatically:
      and needs no portable `flock(1)` (macOS doesn't ship one).
    - **Already installed:** `install.sh` first reads only `latest.json`. If the existing binary has the plugin's
      migration marker and `~/.paircli/bin/paircli version` equals the manifest version, it skips the binary
-     download and execs the installed `init`. Otherwise (missing, unmigrated or older, including a plugin
+     download and execs the installed `init`.
+     - If the installed version is on the manifest's `revoked` list, it's always replaced.
+     - If the installed version is *newer* than the manifest, it's kept. There's no rollback, and `init` runs
+       from the installed binary. Otherwise (missing, unmigrated or older, including a plugin
      user's binary from before `init` existed) it downloads, verifies and installs the new one.
    - **Lock order** (used everywhere, so there's no deadlock):
      - a process never holds `.bootstrap.lock` while waiting for the setup lock;
@@ -287,7 +290,11 @@ What happens automatically:
 4. **Codex trust with no `/hooks` step (decided, D1).** With `--grant-codex-trust`, after writing
    `hooks.json`, setup runs Orca's method. Pair **never** computes the hash itself the way git-ai does. The
    grant rules:
-   - **Find `codex`:** `$PATH` first, then the known bundled locations of the Codex desktop app. If it isn't
+   - **Find `codex`:**
+     - When `init` runs, it looks on `$PATH` first, then in the known bundled locations of the Codex desktop
+       app. It saves the path it resolved in `init.json`.
+     - `maintain` tries that saved path first. It runs from a SessionStart hook, whose `PATH` can differ from
+       the shell's (nvm and npm-global installs, for example). If it isn't
      found, record `codex_trust: "skipped: codex binary not found"` in `setup.json` and in `doctor`, and print
      today's `/hooks` message.
    - **Scope:** start `codex app-server` and call `hooks/list` with `cwds` set to the user's home directory
@@ -300,22 +307,29 @@ What happens automatically:
      - its `key` is in the exact expected set computed from the existing `ourHookPositions()`
        (`cli/internal/codex/hooks.go:248`), normalized the way Orca's `expectedTrustKeys` is;
      - the **whole entry** matches what `InstallHooks` writes: `handlerType == "command"`, the exact per-event
-       `command`, and `timeoutSec == 10`. An entry whose timeout the user edited isn't Pair's to trust.
+       `command`, `timeoutSec == 10`, and the `matcher` Pair writes (`"Bash"` for PostToolUse, `null`
+       otherwise). An entry whose timeout or matcher the user edited isn't Pair's to trust.
 
      Grant every exact match.
      - An event that this Codex version doesn't list (for example an older Codex without `interrupt`) is
        reported by name ("not listed by this Codex: interrupt") and doesn't block the other events.
      - More than one match for the same event is ambiguous. That event is refused and reported.
+   - **Concurrent writers:** a running Codex TUI or desktop app may write `config.toml` at the same moment.
+     The verify `hooks/list` after the write catches a lost write. It's reported as `verify-failed`, and the
+     next `maintain` or `init` retries.
    - **Time limit:** the whole app-server session (start, list, write, verify) has a 20 s limit. When it
      expires, Pair kills the process group and records `codex_trust: "timeout"`. A hung Codex can't keep
      `maintain` holding the setup lock.
    - **Grant:** call `config/batchWrite` with `trusted_hash = currentHash`, using the hash and key exactly as
      Codex reported them. Already trusted means no write.
-   - **Respect the user's own choices.** `init.json` records each granted `{key, hash}`.
-     - `maintain` grants only a picked entry whose `(key, currentHash)` isn't in that record, meaning this run
-       wrote it or changed it.
-     - It **never** grants an entry reported `enabled: false`. It also never re-grants an entry whose hash is
-       already in the record but which is untrusted now: the user revoked it.
+   - **Respect the user's own choices.** `init.json` records, **per key**, whether Pair has granted it and
+     whether the user has revoked it.
+     - `maintain` auto-grants a key only if Pair has never seen that key, or Pair granted it before and it's
+       untrusted only because Pair's own entry changed (a new hash). Even then, only if the key isn't marked
+       revoked.
+     - A key Pair granted that is now untrusted, while Pair didn't change its entry, is marked **revoked**.
+       After that, it's never auto-granted again, even if a later Pair update changes the hash.
+     - It **never** grants an entry reported `enabled: false`.
      - `doctor` and `status` report "Codex trust for Pair hooks was revoked in `/hooks`; run
        `~/.paircli/bin/paircli init` to grant it again". The installer doesn't put `~/.paircli/bin` on PATH, so
        every message names the full path.
@@ -343,6 +357,11 @@ What happens automatically:
      outcome and any agent that failed are recorded.
      - So MDM rollouts that use `--no-login` are still enrolled and get `maintain`.
      - An agent that failed (for example pi) doesn't block enrolment for the others. `maintain` retries it.
+       Today `installAllHarnesses` returns one combined error (`hook.go:150`), and that fails the hooks step.
+       So `runSetupSteps` gets per-agent outcomes from a variant that returns them:
+       - `setup` keeps today's result: any failure → `state: "failed"`;
+       - `init` and `maintain` record each agent's outcome in `setup.json` `steps`;
+       - they report `state: "failed"` only when every detected agent failed.
      - If no agent's hooks install, or the login fails, no marker is written, `init` exits non-zero, and
        re-running the one command starts over. So a partial enrolment is never ambiguous.
      - `maintain` later updates the same file, for example new grants or new harnesses.
@@ -487,8 +506,9 @@ So the order a user takes them in doesn't matter:
   - `cli/internal/selfupdate/update_test.go`:
     - With `~/.paircli/bin/.bootstrap.lock` held (the exact file `bootstrap.py` uses), the update is skipped
       as a tolerated outcome and the binary is untouched.
-    - Without a plugin version (the `maintain` and installer paths), a manifest's `min_plugin_version` doesn't
-      block the update.
+    - Regression guard (passes on main today, and pins the contract the new paths rely on): without a plugin
+      version (the `maintain` and installer paths), a manifest's `min_plugin_version` doesn't block the
+      update.
   - `--install-self` tests in `cli/cmd/paircli`:
     - the rename seam fails with EXDEV, or the source is on another filesystem → the copy-then-rename path
       still installs;
@@ -509,7 +529,7 @@ So the order a user takes them in doesn't matter:
 | --- | --- |
 | Remove the plugin, keep Pair working (switch to the installer path) | `claude plugin uninstall pair@pair` / `codex plugin remove pair@pair`. The CLI hooks, login and capture keep working. After Phase 2, `maintain` keeps the CLI updated; before that, re-run the installer or `paircli update` |
 | Keep the plugin, "remove the installer" | Nothing to remove. The installer leaves no state of its own beyond what the plugin path uses. Delete `install.json` if Phase 3 added it |
-| Remove Pair completely | 1. Uninstall the plugin **first**. Otherwise its bootstrap reinstalls Pair at the next session start. 2. Run the new `~/.paircli/bin/paircli uninstall` (Phase 1). It does `hook uninstall` (every harness) + `logout` + removes `~/.paircli`. It also removes the Codex trust entries recorded in `init.json` through the same app-server `config/batchWrite`, when Codex is available; otherwise those entries are inert, because they match no hook. It doesn't try to detect the plugin. It always prints the two plugin uninstall commands as a reminder. The existing three-command README sequence keeps working |
+| Remove Pair completely | 1. Uninstall the plugin **first**. Otherwise its bootstrap reinstalls Pair at the next session start. 2. Run the new `~/.paircli/bin/paircli uninstall` (Phase 1). It does `hook uninstall` (every harness) + `logout` + removes `~/.paircli`. It also removes the Codex trust entries recorded in `init.json` through app-server, **if** `config/batchWrite` turns out to support deleting `hooks.state` keys. Orca only upserts, so this has to be checked when it's built. Otherwise uninstall leaves those entries and says so in its output. They're inert, because they match no hook. It doesn't try to detect the plugin. It always prints the two plugin uninstall commands as a reminder. The existing three-command README sequence keeps working |
 
 ### Phases and concrete repo changes
 
