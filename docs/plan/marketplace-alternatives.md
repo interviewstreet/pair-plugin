@@ -682,13 +682,14 @@ So the order a user takes them in doesn't matter:
   - Until that redirect is live, docs use the GitHub release URL, which works with no server change.
   - The command stays `paircli` at `~/.paircli/bin/paircli`. The installer doesn't edit shell rc files or add
     anything to PATH, and there's no `pair` alias. Messages always show the full path.
+- **D7. Directory strategy is out of scope for this plan.** The team handles the Verified request and any
+  directory conversations separately. Phase 4 stays as background only. Nothing in Phases 0–3 depends on a
+  listing.
 - **D2. Plugin's future: keep the plugin long-term.** It remains a supported path next to the installer, with
   no deprecation in any phase. Existing `pair@pair` users need to do nothing.
 
 ### Open (product, copy, policy: not decided here)
 
-5. **Directory strategy.** After Verified status, do we still want a directory listing, given the §1.G risk?
-   Who owns the conversation with Anthropic and with OpenAI?
 6. **Windows.** Still out of scope?
 
 ## Sources
