@@ -397,12 +397,19 @@ What happens automatically:
    - It never blocks a session. Failures are recorded in `setup.json` and shown by `paircli status` and
      `doctor`, not swallowed.
 7. **Prerequisites.**
-   - If `gh` is missing or not signed in, `init` says so and offers `gh auth login --web` inline (another
-     browser click, not a copy-paste).
+   - **`gh` is a prerequisite that the user sets up (D5).** `init` checks `gh` (`gh --version`, then
+     `gh auth status`) and never installs or logs in to it for the user.
+     - If it's missing or logged out, `init` still finishes everything else: CLI, hooks, Codex approval and
+       Pair login.
+     - It then ends with a clear "one step left" message instead of "Done":
+       - `gh` missing: "Install the GitHub CLI: `brew install gh` (macOS) or see https://cli.github.com
+         (Linux), then run `gh auth login`."
+       - logged out: "Run `gh auth login`."
+     - No re-run is needed afterwards: `gh` is checked again at publish time, so the next PR publishes.
+     - `status` and `doctor` keep showing the missing step until it's fixed.
    - `curl` is needed only by the installer.
    - `python3` isn't needed on the installer path. The plugin path still uses it to run `bootstrap.py`.
 
-   *Whether Pair should keep depending on `gh` is Q3.*
 
 ### 5.1 Compatibility: what stays, and how the two paths coexist
 
@@ -663,13 +670,17 @@ So the order a user takes them in doesn't matter:
   - No token goes into a shell command, so nothing sensitive lands in shell history, and no new server
     endpoint is needed.
   - Revisit only if onboarding data shows users dropping off at the Approve step.
+- **D5. `gh` stays a prerequisite, set up by the user.**
+  - If `gh` is missing, Pair asks the user to install it. If it's logged out, Pair asks them to run
+    `gh auth login`. Pair doesn't install `gh` or log in to it for them.
+  - Everything else is still set up, and Pair keeps using the user's `gh` for PR reads and the PR comment, as
+    today.
+  - For users without `gh`, onboarding is 1 command + Approve + installing and logging in to `gh`.
 - **D2. Plugin's future: keep the plugin long-term.** It remains a supported path next to the installer, with
   no deprecation in any phase. Existing `pair@pair` users need to do nothing.
 
 ### Open (product, copy, policy: not decided here)
 
-3. **The `gh` dependency.** Keep requiring `gh auth login`, or have pair.sh's GitHub App do the PR reads and
-   comments server-side so the CLI doesn't need `gh`?
 4. **Hosting and brand.** Who owns `pair.sh/install` (a redirect on the web app)? Is the user-facing command
    `pair` or `paircli` (that is, add a `pair` symlink)?
 5. **Directory strategy.** After Verified status, do we still want a directory listing, given the §1.G risk?
