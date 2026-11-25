@@ -184,7 +184,7 @@ one step.
 | # | Onboarding steps (new user, both agents) | Option | Automatic | Evidence reliability | Review exposure | Maintenance | Claude + Codex |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | A | **0** (admin does the work) | **Org-managed rollout**: Claude `managed-settings.json` (`extraKnownMarketplaces` + force-enabled `enabledPlugins`) or an MDM script that runs the installer. Codex `requirements.toml` managed hooks | Everything. Codex hooks trusted by policy. Survives `allowManagedHooksOnly` | Full | None (no directory) | A managed config template plus an MDM script | Both |
-| B | **1 command + 1 Approve click** (0 clicks with a pre-authorized token, see Phase 3) | **One-line installer + CLI-owned lifecycle**: `curl -fsSL https://pair.sh/install \| sh` | Detects agents, installs hooks, grants Codex trust, device login with browser opened, self-update and repair from the SessionStart hook | Full. Hooks are live in already-running Claude sessions | None (no directory). Security review of the installer by the user's org | Installer script, Codex trust integration | Both |
+| B | **1 command + 1 Approve click** | **One-line installer + CLI-owned lifecycle**: `curl -fsSL https://pair.sh/install \| sh` | Detects agents, installs hooks, grants Codex trust, device login with browser opened, self-update and repair from the SessionStart hook | Full. Hooks are live in already-running Claude sessions | None (no directory). Security review of the installer by the user's org | Installer script, Codex trust integration | Both |
 | C | 3–4: `claude plugin install pair --marketplace interviewstreet/pair-plugin`, new session, Approve, plus `gh` if missing. Codex adds `codex plugin marketplace add …`, `codex plugin add pair@pair`, new session, trust the bootstrap hook, then **trust the paircli hooks again**: **~8 total** | **Self-hosted marketplace (today)** | Bootstrap → setup | Full after trust | None (no directory). Generic plugin warning | Two catalogs, plugin version kept in sync in 4 places | Both, Codex awkward |
 | D | Same as C (~3 Claude). Not possible for Codex | **Wait for Verified status** | Same as C, from the directory | Full | **High**: §1.G may still block. Codex never | None while waiting | Claude only |
 | E | 2 Claude: install from the directory, then `/pair setup`, which runs the installer under a Bash permission prompt. Codex the same, and listing a skills-only plugin there is uncertain | **Directory-safe slim plugin** (skills/commands only) + `paircli init` installs the hooks | Same as B after the prompt | Full | **Medium–high**: a plugin whose purpose is installing an extractor may still meet §1.G / §6.4. `docs/DIRECTORY_SUBMISSION.md` warns that "Running the same extraction through another tool is not a remedy" | Extra plugin to maintain | Both in principle |
@@ -356,9 +356,10 @@ What happens automatically:
 5. **Auth with no copy-pasting.**
    - The device flow opens the browser with the `user_code` prefilled, so the user only clicks Approve.
    - If there's no browser (SSH), it prints the URL and a QR code.
-   - When the user started from the pair.sh onboarding page while logged in, the command carries a
-     single-use, short-lived install token (`… | sh -s -- --token <t>`). The CLI exchanges it, so no approval
-     is needed (Phase 3, Q2).
+   - There's no pre-authorized install token (D4). The Approve click stays the only login step.
+   - **MDM installs** run with `--no-login`. The person gets the same Approve page the first time they start
+     an agent session: `maintain` runs the login step when an enrolled machine has no credential, at most
+     once every 24 h. That's the same way the plugin logs in from session start today.
 6. **Auto-update and self-repair, for installer users only.**
    - `init --enroll` writes `~/.paircli/state/init.json` with `{schema_version, harnesses, codex_trust,
      enrolled_at}`. It writes the file atomically, **only after the hooks step succeeds for at least one
@@ -561,7 +562,7 @@ So the order a user takes them in doesn't matter:
     `sha256sum` or `shasum -a 256`) and size cap;
   - runs `exec "$tmp/paircli" init --install-self --enroll --grant-codex-trust "$@"` (step 1).
 
-  It passes `--yes`, `--no-login`, `--token` and `--harness` through. Test-only overrides
+  It passes `--yes`, `--no-login` and `--harness` through. Test-only overrides
   (`PAIR_INSTALL_MANIFEST_URL`, `PAIR_INSTALL_RELEASE_PREFIX`) let tests point at a fake server. They're
   documented as test-only, and they're refused unless `PAIR_INSTALL_TEST=1` is set.
 - `.github/workflows/release.yml`: attach `install.sh` to each release, and include it in the existing
@@ -611,9 +612,8 @@ So the order a user takes them in doesn't matter:
 
 **Phase 3: zero-step channels (after Phase 2).**
 
-- Onboarding page on pair.sh that shows the command with an embedded single-use install token. This needs a
-  server endpoint and a `paircli login --token` exchange.
-- `mdm/` directory with Jamf/Intune/Kandji scripts that run `install.sh --yes --token-file …`. Also a Codex
+- `mdm/` directory with Jamf/Intune/Kandji scripts that run `install.sh --no-login`. The user approves the
+  login at their first agent session (step 5). Also a Codex
   `requirements.toml` managed-hooks template and a Claude `managed-settings.json` template, both in
   `docs/ORG_ROLLOUT.md`.
 - Optional Homebrew tap (`brew install interviewstreet/tap/pair && pair init`). That's 2 steps, for users who
@@ -658,13 +658,16 @@ So the order a user takes them in doesn't matter:
   - `maintain` adding hooks and approval for a later-installed agent is covered by this summary, so it isn't
     announced again.
   - The draft copy is in §5. Final wording is a copy review, not a design decision.
+- **D4. Login: keep the Approve click. No pre-authorized install tokens.**
+  - The device login opens pair.sh with the code prefilled. The user clicks Approve once.
+  - No token goes into a shell command, so nothing sensitive lands in shell history, and no new server
+    endpoint is needed.
+  - Revisit only if onboarding data shows users dropping off at the Approve step.
 - **D2. Plugin's future: keep the plugin long-term.** It remains a supported path next to the installer, with
   no deprecation in any phase. Existing `pair@pair` users need to do nothing.
 
 ### Open (product, copy, policy: not decided here)
 
-2. **Pre-authorized install tokens.** Are we OK with a short-lived, single-use token in a shell command,
-   which ends up in shell history? What TTL? Does it bind to the GitHub identity?
 3. **The `gh` dependency.** Keep requiring `gh auth login`, or have pair.sh's GitHub App do the PR reads and
    comments server-side so the CLI doesn't need `gh`?
 4. **Hosting and brand.** Who owns `pair.sh/install` (a redirect on the web app)? Is the user-facing command
