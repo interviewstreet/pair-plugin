@@ -475,8 +475,9 @@ So the order a user takes them in doesn't matter:
   runs both under a pseudo-tty (Python `pty`) and with no tty, which proves prompts read `/dev/tty` and the
   no-tty path doesn't hang.
 - `cli/cmd/paircli/setup.go`: add the `--grant-codex-trust` and `--enroll` flags and the trust step. A new
-  `init` command in `main.go` wraps `setupRun` with `--install-self` (under `.bootstrap.lock`), `/dev/tty`
-  detection, waiting on the lock, and readable progress. `setup`'s defaults don't change, so the plugin path
+  `init` command in `main.go` calls the split-out `runSetupSteps` (step 2) with `--install-self` (under
+  `.bootstrap.lock`), `/dev/tty` detection, `WaitLock`, and readable progress. `selfupdate.Run` also takes
+  `.bootstrap.lock` (step 1). `setup`'s defaults don't change, so the plugin path
   is untouched.
 - `cli/internal/codex/trust.go` and `trust_test.go`: the grant rules in step 4. Tests drive a **fake
   `codex app-server`** script that speaks the JSON-RPC subset. Cases: all already trusted (no write),
@@ -497,8 +498,9 @@ So the order a user takes them in doesn't matter:
 - Update the package comment in `cli/internal/codex/hooks.go:4` to reflect D1's narrowed rule.
 - `cli/internal/claudecode/hooks.go` and `cli/internal/codex/hooks.go`, `SessionStart` case: spawn the
   detached `paircli maintain` only when `init.json` exists and `maintain.json` is over 24 h old (step 6).
-- `cli/cmd/paircli/maintain.go` (new, small): `TryLock("setup")` → self-update → re-exec if updated →
-  `setupRun --no-login --grant-codex-trust` → write the timestamp. Logged to `~/.paircli/logs/maintain-*.log`.
+- `cli/cmd/paircli/maintain.go` (new, small): `TryLock("setup")` → update step → if updated, release the lock
+  and re-exec `maintain --after-update` → `runSetupSteps` with `--no-login --grant-codex-trust` → write the
+  timestamp. Logged to `~/.paircli/logs/maintain-*.log`.
 - `cli/internal/claudecode/hooks.go` and `cli/internal/codex/hooks.go`: write only when something changed, and
   keep the position of Pair's group (§5.1 coexistence requirements). Same entries, same events.
 - `plugins/pair/hooks/bootstrap.py`: no change. It keeps working for every plugin user. The plugin and the
