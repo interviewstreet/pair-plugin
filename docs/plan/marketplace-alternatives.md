@@ -204,6 +204,13 @@ A, B and C all end in the same CLI state, so a user can start with any of them.
 
 ```text
 $ curl -fsSL https://pair.sh/install | sh        ← the only command
+Pair will set up:                                 ← printed summary, no prompt (D3)
+  - the Pair CLI in ~/.paircli/bin
+  - hooks in Claude Code and Codex, approved in Codex on your behalf
+  - after you log in, PR evidence (including redacted agent transcripts) is uploaded to pair.sh
+    when you create or push a PR
+  - automatic updates, and hooks for agents you install later
+Uninstall any time: ~/.paircli/bin/paircli uninstall
 Pair: installed paircli 0.6.0 to ~/.paircli/bin
 Pair: found Claude Code, Codex
 Pair: hooks installed for Claude Code (~/.claude/settings.json)
@@ -272,8 +279,10 @@ What happens automatically:
    - Agent detection is the existing `installAllHarnesses` (`harnessOrder`). Agents that aren't installed are
      skipped and picked up later (step 6).
    - **Interactivity.** Under `curl … | sh`, stdin is the pipe. So `init` decides whether it's interactive by
-     opening `/dev/tty`, never from stdin, and any prompt (Q1) reads `/dev/tty`. With no `/dev/tty` (CI, MDM),
-     it runs non-interactively. The prompt behaviour there depends on the Q1 decision; `--yes` always works.
+     opening `/dev/tty`, never from stdin. There's no confirmation prompt (D3): the summary is printed and
+     setup continues. `/dev/tty` only decides whether to open the browser and show live progress. With no
+     `/dev/tty` (CI, MDM), `init` prints the same summary to stderr and runs the same steps. `--yes` is
+     accepted as a no-op, so scripts that pass it keep working.
    - **Setup lock: split, so nothing locks itself out.** `setupRun` today takes `TryLock("setup")` itself, and
      a second flock on the same file conflicts even inside one process. So `setupRun` is split into argument
      parsing plus `runSetupSteps(a, lock)`:
@@ -342,8 +351,8 @@ What happens automatically:
    - Every failure is a named step outcome in `setup.json`. None of them fails the Claude Code half of setup.
    - **Scope of D1:** only `init` and `maintain` pass the flag. The plugin's
      `paircli setup --harness <h>` is unchanged. The "never write trust" rule in `cli/internal/codex/hooks.go`
-     is narrowed to "only through Codex's own trust RPC, only when asked". What the installer tells the user
-     up front is still open (Q1).
+     is narrowed to "only through Codex's own trust RPC, only when asked". The installer's printed summary
+     says so up front (D3).
 5. **Auth with no copy-pasting.**
    - The device flow opens the browser with the `user_code` prefilled, so the user only clicks Approve.
    - If there's no browser (SSH), it prints the URL and a QR code.
@@ -562,7 +571,7 @@ So the order a user takes them in doesn't matter:
   `https://pair.sh/install` as a redirect to `releases/latest/download/install.sh` (pair.sh owners, Q4).
 - `tests/test_install_sh.py`: runs **`cat install.sh | sh`** against a fake manifest server. Cases: checksum
   mismatch, revoked release, unsupported platform, script truncated mid-`main` and mid-line runs nothing, and re-run is a no-op. It
-  runs both under a pseudo-tty (Python `pty`) and with no tty, which proves prompts read `/dev/tty` and the
+  runs both under a pseudo-tty (Python `pty`) and with no tty, which proves `init` never reads stdin and the
   no-tty path doesn't hang.
 - `cli/cmd/paircli/setup.go`: add the `--grant-codex-trust` and `--enroll` flags and the trust step. A new
   `init` command in `main.go` calls the split-out `runSetupSteps` (step 2) with `--install-self` (under
@@ -636,22 +645,24 @@ So the order a user takes them in doesn't matter:
     it itself.
   - Codex builds without the trust RPC fall back to today's `/hooks` message.
   - This applies to `init`/`maintain` only. The plugin's `paircli setup` path keeps its current behaviour.
-  - Disclosure of what is installed and trusted stays open (Q1).
+  - The installer's printed summary discloses it (D3).
+- **D3. Up-front disclosure: a printed summary, no confirmation prompt.**
+  - Before it changes anything, `init` prints what it will set up:
+    - the CLI;
+    - hooks in the detected agents;
+    - Codex approval on the user's behalf;
+    - that PR evidence, including redacted transcripts, is uploaded after login;
+    - that it updates automatically and adds hooks for agents installed later;
+    - how to uninstall.
+  - Then it continues without asking. That keeps the path at one command plus the login click.
+  - `maintain` adding hooks and approval for a later-installed agent is covered by this summary, so it isn't
+    announced again.
+  - The draft copy is in §5. Final wording is a copy review, not a design decision.
 - **D2. Plugin's future: keep the plugin long-term.** It remains a supported path next to the installer, with
   no deprecation in any phase. Existing `pair@pair` users need to do nothing.
 
 ### Open (product, copy, policy: not decided here)
 
-1. **Up-front disclosure and consent copy.** The installer must say what it installs before it does it:
-   - the CLI;
-   - hooks in which agents;
-   - Codex trust granted on the user's behalf (D1);
-   - that transcripts are uploaded after login;
-   - that later, `maintain` adds hooks and grants Codex trust automatically if Codex is installed after
-     enrolment. The user isn't asked again at that point, so the up-front copy has to cover it.
-
-   Is a printed summary enough, or do we need an explicit `[Y/n]` (skipped by `--yes`)? There are also wording
-   questions for the "Done" line and for the `gh` prompt.
 2. **Pre-authorized install tokens.** Are we OK with a short-lived, single-use token in a shell command,
    which ends up in shell history? What TTL? Does it bind to the GitHub identity?
 3. **The `gh` dependency.** Keep requiring `gh auth login`, or have pair.sh's GitHub App do the PR reads and
