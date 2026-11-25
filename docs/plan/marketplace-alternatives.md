@@ -222,13 +222,15 @@ What happens automatically:
    `hooks/list`, then `config/batchWrite`, so Codex computes and stores the trusted hash for exactly Pair's
    entries. Then it checks again with `hooks/list`. This is Orca's method. Codex older than the app-server
    trust API falls back to the current message ("approve in `/hooks`"). Pair **never** computes the hash
-   itself the way git-ai does. *This changes the CLI's current "never write trust" rule. See Q1.*
+   itself the way git-ai does. **Decided (D1):** `init` does this with no manual step. It replaces the CLI's
+   current "never write trust" rule for the `init` and `maintain` paths. What the installer tells the user up
+   front is still open (Q1).
 5. **Auth with no copy-pasting.**
    - The device flow opens the browser with the `user_code` prefilled, so the user only clicks Approve.
    - If there's no browser (SSH), it prints the URL and a QR code.
    - When the user started from the pair.sh onboarding page while logged in, the command carries a
      single-use, short-lived install token (`… | sh -s -- --token <t>`). The CLI exchanges it, so no approval
-     is needed (Phase 3, Q3).
+     is needed (Phase 3, Q2).
 6. **Auto-update and self-repair.** The installed Claude/Codex `SessionStart` hook handler
    (`paircli hook <harness> SessionStart`) starts a detached `paircli maintain` at most once every 24 h. It:
    - self-updates;
@@ -244,7 +246,7 @@ What happens automatically:
    - `curl` is needed only by the installer.
    - `python3` isn't needed on the installer path. The plugin path still uses it to run `bootstrap.py`.
 
-   *Whether Pair should keep depending on `gh` is Q4.*
+   *Whether Pair should keep depending on `gh` is Q3.*
 
 ### 5.1 Compatibility: what stays, and how the two paths coexist
 
@@ -274,7 +276,7 @@ So the order a user takes them in doesn't matter:
     (the same check as `uses_plugin_release`).
   - `init` → `setupRun` re-merges the hooks. This is a no-op: there's still exactly one Pair entry per event.
   - The login is already valid, so it's skipped.
-  - The user ends up with what they already had, plus Codex trust (if Q1 is approved).
+  - The user ends up with what they already had, plus Codex trust granted by `init` (D1).
 - **Installer first, then plugin.**
   - `bootstrap.py` sees the binary and the marker that `install.sh` wrote, so it downloads nothing.
   - It runs `paircli setup --harness <h>`, which is the same no-op merge.
@@ -357,7 +359,7 @@ So the order a user takes them in doesn't matter:
   Flags it passes through: `--yes`, `--no-login`, `--token`, `--harness`. It's safe to pipe: everything is
   wrapped in a `main` function that's called on the last line.
 - `.github/workflows/release.yml`: attach `install.sh` and its checksum to each release. Serve
-  `https://pair.sh/install` as a redirect to `releases/latest/download/install.sh` (pair.sh owners, Q5).
+  `https://pair.sh/install` as a redirect to `releases/latest/download/install.sh` (pair.sh owners, Q4).
 - `tests/test_install_sh.py`: run the script against a fake manifest server (checksum mismatch, revoked
   release, unsupported platform, re-run is a no-op).
 - `cli/cmd/paircli/main.go`: add an `init` command, which is `setupRun` with TTY progress output. Without a
@@ -370,7 +372,7 @@ So the order a user takes them in doesn't matter:
 **Phase 2: the CLI owns the lifecycle (2–3 weeks).**
 
 - `cli/internal/codex/trust.go`: app-server trust grant, version-gated with fallback, plus `doctor` output.
-  Update the package comment in `cli/internal/codex/hooks.go:4` once Q1 is decided.
+  Update the package comment in `cli/internal/codex/hooks.go:4` to reflect D1.
 - `cli/internal/claudecode/hooks.go` and `cli/internal/codex/hooks.go`, `SessionStart` case: start a
   throttled, detached `paircli maintain`, with a timestamp in `~/.paircli/state/maintain.json`.
 - `cli/cmd/paircli/maintain.go` (new): update → `installAllHarnesses` → trust, logged to
@@ -407,26 +409,40 @@ So the order a user takes them in doesn't matter:
 - **Hook-free daemon (G)**: keep it as a possible fallback for users who refuse hooks, but it captures less
   precisely and costs more to build.
 
-## 6. Open questions (product, copy, policy: not decided here)
+## 6. Decisions and open questions
 
-1. **Codex trust grant.** May `paircli init` grant Codex hook trust through app-server, on the basis that
-   running the installer is the user's consent? That removes a step, but it reverses the current
-   "only Codex, after the user reviews" rule. If yes, should `init` show a confirmation (`[Y/n]`, skipped by
-   `--yes`) that lists the hooks being trusted? Security sign-off is needed.
-2. **Consent and disclosure copy.** What should the installer print before it installs hooks that upload
-   transcripts? Is a single summary line enough, or do we need an explicit confirmation? There are also
-   wording questions for the "Done" line and for the `gh` prompt.
-3. **Pre-authorized install tokens.** Are we OK with a short-lived, single-use token in a shell command,
+### Decided
+
+- **D1. Codex hook trust: `paircli init` does everything.**
+  - After writing Pair's entries, `init` approves them inside Codex through Codex's own `codex app-server`
+    trust RPCs (Orca's method), so the user has no `/hooks` step.
+  - `maintain` does the same for hooks it adds or repairs later. Codex computes the hash; Pair never computes
+    it itself.
+  - Codex builds without the trust RPC fall back to today's `/hooks` message.
+  - This applies to `init`/`maintain` only. The plugin's `paircli setup` path keeps its current behaviour.
+  - Disclosure of what is installed and trusted stays open (Q1).
+- **D2. Plugin's future: keep the plugin long-term.** It remains a supported path next to the installer, with
+  no deprecation in any phase. Existing `pair@pair` users need to do nothing.
+
+### Open (product, copy, policy: not decided here)
+
+1. **Up-front disclosure and consent copy.** The installer must say what it installs before it does it:
+   - the CLI;
+   - hooks in which agents;
+   - Codex trust granted on the user's behalf (D1);
+   - that transcripts are uploaded after login.
+
+   Is a printed summary enough, or do we need an explicit `[Y/n]` (skipped by `--yes`)? There are also wording
+   questions for the "Done" line and for the `gh` prompt.
+2. **Pre-authorized install tokens.** Are we OK with a short-lived, single-use token in a shell command,
    which ends up in shell history? What TTL? Does it bind to the GitHub identity?
-4. **The `gh` dependency.** Keep requiring `gh auth login`, or have pair.sh's GitHub App do the PR reads and
+3. **The `gh` dependency.** Keep requiring `gh auth login`, or have pair.sh's GitHub App do the PR reads and
    comments server-side so the CLI doesn't need `gh`?
-5. **Hosting and brand.** Who owns `pair.sh/install` (a redirect on the web app)? Is the user-facing command
+4. **Hosting and brand.** Who owns `pair.sh/install` (a redirect on the web app)? Is the user-facing command
    `pair` or `paircli` (that is, add a `pair` symlink)?
-6. ~~**Plugin's future.**~~ **Resolved: keep the plugin long-term.** It remains a supported path next to the
-   installer, with no deprecation in any phase. Existing `pair@pair` users need to do nothing.
-7. **Directory strategy.** After Verified status, do we still want a directory listing, given the §1.G risk?
+5. **Directory strategy.** After Verified status, do we still want a directory listing, given the §1.G risk?
    Who owns the conversation with Anthropic and with OpenAI?
-8. **Windows.** Still out of scope?
+6. **Windows.** Still out of scope?
 
 ## Sources
 
