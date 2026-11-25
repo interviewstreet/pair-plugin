@@ -1,4 +1,4 @@
-"""Check that all four built CLI assets match bootstrap's release contract."""
+"""Check that all four built CLI assets and install.sh match bootstrap's release contract."""
 from __future__ import annotations
 
 import hashlib
@@ -29,6 +29,10 @@ def check_release(manifest_path: Path) -> None:
         if hashlib.sha256(artifact.read_bytes()).hexdigest() != expected:
             raise ValueError(f"artifact checksum mismatch: {key}")
         checksums.append(f"{expected}  paircli-{key}")
+    installer = manifest_path.parent / manifest["version"] / "install.sh"
+    if not installer.is_file() or installer.read_bytes() != (ROOT / "install.sh").read_bytes():
+        raise ValueError("release must contain this repository's install.sh")
+    checksums.append(f"{hashlib.sha256(installer.read_bytes()).hexdigest()}  install.sh")
     published = (manifest_path.parent / manifest["version"] / "SHA256SUMS").read_text().splitlines()
     if sorted(published) != sorted(checksums):
         raise ValueError("SHA256SUMS does not match the release manifest")
@@ -36,4 +40,4 @@ def check_release(manifest_path: Path) -> None:
 
 if __name__ == "__main__":
     check_release(Path(sys.argv[1]))
-    print("Verified four CLI artifacts, plugin compatibility, release URLs and checksums.")
+    print("Verified four CLI artifacts, install.sh, plugin compatibility, release URLs and checksums.")

@@ -44,7 +44,38 @@ download it on every push. Session-start setup checks for updates as before.
 
 ## Install
 
-### Claude Code
+There are two ways to install Pair. Both set up the same CLI, so you can use either one, or both on the same
+machine. macOS and Linux only; on Windows, use WSL.
+
+### One command (Claude Code and Codex)
+
+```sh
+curl -fsSL https://github.com/interviewstreet/pair-plugin/releases/latest/download/install.sh | sh
+```
+
+The installer prints what it will set up, then:
+
+1. installs `paircli` in `~/.paircli/bin` (nothing is added to your `PATH`);
+2. installs the PR hooks in every agent it finds (Claude Code, Codex) and approves them in Codex for you, so
+   there is no `/hooks` step;
+3. opens the Pair login in your browser. Click **Approve**.
+
+It needs `curl`, not `python3`. [`gh`](https://cli.github.com) must be installed and signed in; if it isn't,
+the installer sets up everything else and tells you the one step left. Run the command again at any time:
+it only changes what is missing.
+
+To check the script before running it:
+
+```sh
+curl -fsSLO https://github.com/interviewstreet/pair-plugin/releases/latest/download/install.sh
+gh attestation verify install.sh -R interviewstreet/pair-plugin
+sh install.sh
+```
+
+On a machine without a browser, or from a script, add `--no-login` (`sh -s -- --no-login`) and run
+`~/.paircli/bin/paircli login` later.
+
+### Plugin: Claude Code
 
 In a session (Claude Code 2.1.275 or later):
 
@@ -67,7 +98,7 @@ claude plugin install pair@pair
 
 Then start a new session. The plugin's session-start hook sets everything up.
 
-### Codex
+### Plugin: Codex
 
 ```sh
 codex plugin marketplace add interviewstreet/pair-plugin
@@ -226,8 +257,9 @@ Nothing here is hidden. This is everything the plugin does:
 
 ## Requirements
 
-- macOS or Linux on arm64 or amd64. Windows is not supported.
-- `python3` runs the session-start hook. `curl` downloads the CLI; it's only needed until the CLI is installed.
+- macOS or Linux on arm64 or amd64. Windows is not supported; on Windows, use WSL.
+- `curl` downloads the CLI; it's only needed until the CLI is installed. With the plugin, `python3` runs the
+  session-start hook; the one-command installer doesn't need it.
 - [`gh`](https://cli.github.com), signed in with `gh auth login`, is what Pair uses to read and comment on PRs.
   Without it, setup still runs, and the status line tells you what's missing.
 
@@ -251,11 +283,29 @@ claude plugin marketplace update pair && claude plugin update pair@pair   # Clau
 codex plugin marketplace upgrade                                          # Codex
 ```
 
-The CLI also checks for a newer `paircli` each time setup runs.
+The CLI also checks for a newer `paircli` each time setup runs. If you installed with the one command, run it
+again to update.
 
 ## Uninstall
 
-Remove the CLI pieces first, because the binary is needed for the first two commands:
+If you have the plugin, uninstall it **first**; otherwise its session-start hook installs Pair again:
+
+```sh
+claude plugin uninstall pair@pair       # Claude Code
+codex plugin remove pair@pair           # Codex
+```
+
+Then remove Pair:
+
+```sh
+~/.paircli/bin/paircli uninstall
+```
+
+It removes the PR hooks from every agent, the hook approvals Pair added in Codex, the stored credential and
+`~/.paircli`. To keep using Pair without the plugin, uninstall only the plugin; the CLI's hooks keep working.
+
+The manual sequence still works too. Remove the CLI pieces first, because the binary is needed for the first
+two commands:
 
 ```sh
 ~/.paircli/bin/paircli hook uninstall   # remove the PR hooks from every harness
@@ -263,12 +313,13 @@ Remove the CLI pieces first, because the binary is needed for the first two comm
 rm -rf ~/.paircli                       # binary, logs and state
 ```
 
-Then remove the plugin:
+Then remove the plugin as above.
 
-```sh
-claude plugin uninstall pair@pair       # Claude Code
-codex plugin remove pair@pair           # Codex
-```
+## Using both
+
+The plugin and the one-command installer share the same binary, login, state and hooks. Running both is
+fine: there is still one Pair hook per event, and one upload per push. The CLI owns the PR hooks on either
+path; the plugin only adds its session-start hook, which installs or updates the CLI.
 
 ## How it works
 
@@ -292,6 +343,7 @@ codex plugin remove pair@pair           # Codex
 .agents/plugins/       Codex marketplace
 plugins/pair/          installable plugin: manifests, startup hook, skill, icon and docs
 cli/                   Pair CLI Go source, runtime, tests and release scripts
+install.sh             one-command installer, published with each release
 docs/ONBOARDING.md     setup, upload contents and uninstall in detail
 tests/                 hook tests
 ```
@@ -316,7 +368,7 @@ go build ./cmd/paircli
 `v*` tags in this repository are CLI releases. The root release workflow tests
 the plugin and CLI, builds macOS/Linux binaries for arm64/amd64, verifies their
 checksums and download URLs, attests them, and publishes `latest.json`,
-`SHA256SUMS` and the four binaries to this repository's GitHub Release.
+`SHA256SUMS`, `install.sh` and the four binaries to this repository's GitHub Release.
 CLI versions are independent of the plugin manifest version.
 
 See [the migration and rollout checklist](docs/CLI_MIGRATION.md) before enabling

@@ -41,11 +41,17 @@ DARWIN_AMD64_SHA="$(build_target darwin-amd64 darwin amd64)"
 LINUX_AMD64_SHA="$(build_target linux-amd64 linux amd64)"
 LINUX_ARM64_SHA="$(build_target linux-arm64 linux arm64)"
 
+# The one-line installer ships as a release asset, so
+# releases/latest/download/install.sh always matches latest.json.
+cp "$ROOT/../install.sh" "$RELEASE_DIR/install.sh"
+INSTALL_SH_SHA="$(shasum -a 256 "$RELEASE_DIR/install.sh" | awk '{print $1}')"
+
 cat >"$RELEASE_DIR/SHA256SUMS" <<EOF
 $DARWIN_ARM64_SHA  paircli-darwin-arm64
 $DARWIN_AMD64_SHA  paircli-darwin-amd64
 $LINUX_AMD64_SHA  paircli-linux-amd64
 $LINUX_ARM64_SHA  paircli-linux-arm64
+$INSTALL_SH_SHA  install.sh
 EOF
 
 cat >"$OUTPUT_ROOT/latest.json" <<EOF

@@ -27,6 +27,9 @@ def make_release(root):
         checksums.append(f"{digest}  {name}")
         document["artifacts"][key] = {"url": f"https://github.com/interviewstreet/pair-plugin/releases/download/v{version}/{name}",
                                       "sha256": digest}
+    installer = (ROOT / "install.sh").read_bytes()
+    (directory / "install.sh").write_bytes(installer)
+    checksums.append(f"{hashlib.sha256(installer).hexdigest()}  install.sh")
     (directory / "SHA256SUMS").write_text("\n".join(checksums) + "\n")
     manifest = root / "latest.json"
     manifest.write_text(json.dumps(document))
@@ -48,6 +51,16 @@ def test_check_release_rejects_wrong_checksum_file(tmp_path):
     manifest = make_release(tmp_path)
     (tmp_path / "0.5.0/SHA256SUMS").write_text("wrong\n")
     with pytest.raises(ValueError, match="SHA256SUMS"):
+        release_check.check_release(manifest)
+
+
+def test_check_release_requires_the_repositorys_install_sh(tmp_path):
+    manifest = make_release(tmp_path)
+    (tmp_path / "0.5.0/install.sh").write_text("#!/bin/sh\necho tampered\n")
+    with pytest.raises(ValueError, match="install.sh"):
+        release_check.check_release(manifest)
+    (tmp_path / "0.5.0/install.sh").unlink()
+    with pytest.raises(ValueError, match="install.sh"):
         release_check.check_release(manifest)
 
 

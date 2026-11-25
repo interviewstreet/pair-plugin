@@ -261,6 +261,26 @@ def test_child_runs_setup_with_harness_and_plugin_version(tmp_path, monkeypatch)
     assert seen == [[str(binary), "setup", "--harness", "codex", "--plugin-version", bootstrap.PLUGIN_VERSION]]
 
 
+def test_child_uses_a_binary_the_installer_put_there(tmp_path, monkeypatch):
+    """The installer path (`paircli init --install-self`) writes the binary and the same marker."""
+    binary = tmp_path / ".paircli" / "bin" / "paircli"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    # What paircli's init writes (Go's indented JSON), not bootstrap's own json.dump.
+    binary.with_name("release-source.json").write_text('{\n  "manifest_url": "%s"\n}\n' % bootstrap.MANIFEST_URL)
+    downloads, seen = [], []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(bootstrap, "install_binary", lambda *args, **kwargs: downloads.append(args))
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda command, **kwargs: seen.append(command) or Done())
+    bootstrap.run_child("claude-code", tmp_path)
+    assert downloads == []
+    assert seen == [[str(binary), "setup", "--harness", "claude-code", "--plugin-version", bootstrap.PLUGIN_VERSION]]
+
+
 @pytest.mark.parametrize("release", [None, [], {}, manifest(schema="unknown"), manifest(version="not-a-version"),
                                     manifest(revoked=["0.3.0"]), manifest(revoked="0.3.0")])
 def test_select_artifact_rejects_invalid_or_revoked_manifest(release):

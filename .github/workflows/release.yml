@@ -45,7 +45,7 @@ jobs:
           bash cli/scripts/build-release-artifacts.sh "$VERSION"
           python3 scripts/check-release-artifacts.py cli/dist/paircli/latest.json
       - name: Test real binaries in isolated homes
-        run: PAIRCLI_TEST_RELEASE_DIR=cli/dist/paircli python -m pytest tests/test_release_binary.py -q
+        run: PAIRCLI_TEST_RELEASE_DIR=cli/dist/paircli python -m pytest tests/test_release_binary.py tests/test_install_sh.py -q
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@v2
         with:
