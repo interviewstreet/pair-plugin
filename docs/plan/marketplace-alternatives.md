@@ -601,7 +601,8 @@ So the order a user takes them in doesn't matter:
 - `cli/cmd/paircli/uninstall.go` (new): the full uninstall in §5.1, including the recorded Codex trust
   entries. It also removes `init.json` and `maintain.json`. It doesn't shell out to detect the plugin. It
   always prints the two plugin uninstall commands as a reminder.
-- `README.md`, `docs/ONBOARDING.md`: show the two supported paths side by side in "Install", "One command"
+- `README.md`, `docs/ONBOARDING.md`: add "macOS and Linux only; on Windows, use WSL" (D8). Show the two
+  supported paths side by side in "Install", "One command"
   and "Plugin". The existing plugin instructions stay as they are. Add the coexistence and uninstall notes
   from §5.1.
 
@@ -653,6 +654,8 @@ So the order a user takes them in doesn't matter:
   - Codex builds without the trust RPC fall back to today's `/hooks` message.
   - This applies to `init`/`maintain` only. The plugin's `paircli setup` path keeps its current behaviour.
   - The installer's printed summary discloses it (D3).
+- **D2. Plugin's future: keep the plugin long-term.** It remains a supported path next to the installer, with
+  no deprecation in any phase. Existing `pair@pair` users need to do nothing.
 - **D3. Up-front disclosure: a printed summary, no confirmation prompt.**
   - Before it changes anything, `init` prints what it will set up:
     - the CLI;
@@ -688,8 +691,6 @@ So the order a user takes them in doesn't matter:
 - **D8. Windows stays out of scope.** Both paths support macOS and Linux (arm64/amd64) only. The README
   says "on Windows, use WSL". It isn't tested or officially supported. Native Windows would be a separate
   project.
-- **D2. Plugin's future: keep the plugin long-term.** It remains a supported path next to the installer, with
-  no deprecation in any phase. Existing `pair@pair` users need to do nothing.
 
 ### Open
 
