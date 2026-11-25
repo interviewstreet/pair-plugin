@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/interviewstreet/pair-plugin/cli/internal/state"
 )
 
 func TestRunReplacesBinaryWithVerifiedNewerRelease(t *testing.T) {
@@ -296,4 +298,77 @@ func TestParseVersionRejectsInvalidSemVer(t *testing.T) {
 
 func serverURL(request *http.Request) string {
 	return "http://" + request.Host
+}
+
+// releaseServer serves a 0.2.0 manifest with min_plugin_version 0.9.0 and a
+// binary for darwin-arm64.
+func releaseServer(t *testing.T, binary []byte) *httptest.Server {
+	t.Helper()
+	checksum := sha256.Sum256(binary)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/latest.json":
+			writer.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(writer, `{"schema":"paircli-release/v1","version":"0.2.0","min_plugin_version":"0.9.0","revoked":[],"artifacts":{"darwin-arm64":{"url":%q,"sha256":%q}}}`,
+				serverURL(request)+"/paircli", hex.EncodeToString(checksum[:]))
+		case "/paircli":
+			_, _ = writer.Write(binary)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// While the plugin's bootstrap (or `init --install-self`) holds
+// .bootstrap.lock next to the binary, self-update leaves the binary alone.
+func TestRunSkipsWhileBootstrapLockIsHeld(t *testing.T) {
+	server := releaseServer(t, []byte("new paircli binary"))
+	dir := t.TempDir()
+	target := filepath.Join(dir, "paircli")
+	if err := os.WriteFile(target, []byte("old paircli binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	held, err := state.TryLockPath(filepath.Join(dir, ".bootstrap.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+
+	result, err := Run(context.Background(), Options{
+		CurrentVersion: "0.1.0", ManifestURL: server.URL + "/latest.json",
+		ExecutablePath: target, Platform: "darwin-arm64", AllowInsecure: true,
+	})
+	if err != nil || result.Updated || result.SkippedReason != "another install in progress" {
+		t.Fatalf("Run() = %#v, %v; want skipped for the held lock", result, err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "old paircli binary" {
+		t.Errorf("binary replaced under a held lock: %q", got)
+	}
+
+	held.Release()
+	if result, err := Run(context.Background(), Options{
+		CurrentVersion: "0.1.0", ManifestURL: server.URL + "/latest.json",
+		ExecutablePath: target, Platform: "darwin-arm64", AllowInsecure: true,
+	}); err != nil || !result.Updated {
+		t.Fatalf("Run() after release = %#v, %v; want updated", result, err)
+	}
+}
+
+// The installer and maintain paths pass no plugin version, so a manifest's
+// min_plugin_version never blocks their update (it only applies to the plugin).
+func TestRunWithoutPluginVersionIgnoresMinPluginVersion(t *testing.T) {
+	server := releaseServer(t, []byte("new paircli binary"))
+	target := filepath.Join(t.TempDir(), "paircli")
+	if err := os.WriteFile(target, []byte("old paircli binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Run(context.Background(), Options{
+		CurrentVersion: "0.1.0", ManifestURL: server.URL + "/latest.json",
+		ExecutablePath: target, Platform: "darwin-arm64", AllowInsecure: true,
+	})
+	if err != nil || !result.Updated {
+		t.Fatalf("Run() = %#v, %v; want updated despite min_plugin_version", result, err)
+	}
 }

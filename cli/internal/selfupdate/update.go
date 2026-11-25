@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/interviewstreet/pair-plugin/cli/internal/state"
 )
 
 const (
@@ -128,6 +131,17 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	if isHomebrewManaged(executable) {
 		return Result{}, fmt.Errorf("paircli is managed by Homebrew; update it with brew upgrade paircli")
 	}
+	// The plugin's bootstrap and `paircli init --install-self` replace the
+	// same binary under this lock; never race them.
+	lock, err := state.TryLockPath(filepath.Join(filepath.Dir(executable), ".bootstrap.lock"))
+	if errors.Is(err, state.ErrLocked) {
+		result.SkippedReason = "another install in progress"
+		return result, nil
+	}
+	if err != nil {
+		return Result{}, fmt.Errorf("lock install: %w", err)
+	}
+	defer lock.Release()
 	if err := downloadAndReplace(ctx, client, artifact, executable); err != nil {
 		return Result{}, err
 	}
