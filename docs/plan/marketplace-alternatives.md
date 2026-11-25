@@ -551,7 +551,7 @@ So the order a user takes them in doesn't matter:
   is untouched.
 - `cli/internal/codex/trust.go` and `trust_test.go`: the grant rules in step 4. Tests drive a **fake
   `codex app-server`** script that speaks the JSON-RPC subset. Cases: all already trusted (no write),
-  granted, entry count mismatch (refused, nothing written), verify-failed, and no hash or status (old Codex →
+  granted, two matches for one event (that event refused), an event missing from the list (reported, others granted), verify-failed, and no hash or status (old Codex →
   fallback message). This moves from Phase 2 to Phase 1, because D1 is part of `init`'s promise.
 - `cli/internal/codex/hooks.go` `parseTrustedKeys` (used by `doctor`): compare against the trust keys as
   Codex reports them through `hooks/list` when Codex is available. Orca normalizes the path part. Fall back to
