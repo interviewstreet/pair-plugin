@@ -73,7 +73,8 @@ sh install.sh
 ```
 
 On a machine without a browser, or from a script, add `--no-login` (`sh -s -- --no-login`) and run
-`~/.paircli/bin/paircli login` later.
+`~/.paircli/bin/paircli login` later. To roll Pair out to managed machines (MDM, managed settings), see
+[docs/ORG_ROLLOUT.md](docs/ORG_ROLLOUT.md).
 
 ### Plugin: Claude Code
 
@@ -345,6 +346,7 @@ path; the plugin only adds its session-start hook, which installs or updates the
 plugins/pair/          installable plugin: manifests, startup hook, skill, icon and docs
 cli/                   Pair CLI Go source, runtime, tests and release scripts
 install.sh             one-command installer, published with each release
+mdm/                   MDM install scripts and managed-hook templates (docs/ORG_ROLLOUT.md)
 docs/ONBOARDING.md     setup, upload contents and uninstall in detail
 tests/                 hook tests
 ```

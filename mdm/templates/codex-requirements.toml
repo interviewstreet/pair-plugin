@@ -1,0 +1,61 @@
+# Pair's Codex hooks as managed hooks, for requirements.toml.
+# Managed hooks are trusted by policy. Use them only with allow_managed_hooks_only = true:
+# otherwise Pair's own hooks in ~/.codex/hooks.json run as well, and every event is recorded twice.
+
+allow_managed_hooks_only = true
+
+[features]
+hooks = true
+
+[hooks]
+# pair-hook.sh lives here; the MDM install scripts put it there.
+managed_dir = "/usr/local/share/pair"
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/usr/local/share/pair/pair-hook.sh hook codex SessionStart"
+timeout = 10
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/usr/local/share/pair/pair-hook.sh hook codex UserPromptSubmit"
+timeout = 10
+
+[[hooks.PostToolUse]]
+matcher = "Bash"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "/usr/local/share/pair/pair-hook.sh hook codex PostToolUse"
+timeout = 10
+
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "/usr/local/share/pair/pair-hook.sh hook codex PermissionRequest"
+timeout = 10
+
+[[hooks.Interrupt]]
+[[hooks.Interrupt.hooks]]
+type = "command"
+command = "/usr/local/share/pair/pair-hook.sh hook codex Interrupt"
+timeout = 3
+
+[[hooks.PreCompact]]
+[[hooks.PreCompact.hooks]]
+type = "command"
+command = "/usr/local/share/pair/pair-hook.sh hook codex PreCompact"
+timeout = 10
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/usr/local/share/pair/pair-hook.sh hook codex Stop"
+timeout = 10
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = "/usr/local/share/pair/pair-hook.sh hook codex SessionEnd"
+timeout = 3
