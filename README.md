@@ -46,11 +46,19 @@ download it on every push. Session-start setup checks for updates as before.
 
 ### Claude Code
 
+In a session (Claude Code 2.1.275 or later):
+
 ```text
 /plugin install pair --marketplace interviewstreet/pair-plugin
 ```
 
-Or from your shell:
+Or from your shell, in one command (Claude Code 2.1.292 or later):
+
+```sh
+claude plugin install pair --marketplace interviewstreet/pair-plugin
+```
+
+Or in two steps, on any version:
 
 ```sh
 claude plugin marketplace add interviewstreet/pair-plugin
