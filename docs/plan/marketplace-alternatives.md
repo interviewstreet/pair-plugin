@@ -217,14 +217,21 @@ What happens automatically:
 1. **Binary.**
    - `install.sh` only fetches and verifies, using the same checks as `bootstrap.py`: manifest schema, revoked
      list, exact release URL, SHA-256 and size cap. It downloads into a `mktemp -d` directory.
-   - **`min_plugin_version` is still enforced wherever a plugin has run.**
-     - `setup` now saves the `--plugin-version` it receives to `~/.paircli/state/plugin.json`
-       (`{version, seen_at}`). This is an additive write; `setup`'s behaviour is otherwise unchanged.
-     - `install.sh` reads that file. If it exists, `install.sh` rejects a manifest whose `min_plugin_version`
-       is above the saved version. This is `bootstrap.py`'s `select_artifact` rule, and it leaves the current
-       binary in place. The check is skipped only when no plugin has ever run on the machine.
-     - `maintain` passes the same saved version to `selfupdate.Run` as `PluginVersion`. So neither new path can
-       install a binary that an older plugin bootstrap wasn't built to drive.
+   - **Plugin compatibility lives where the plugin calls the binary, not in a state file.** A saved plugin
+     version could be wrong in both directions: old binaries never wrote one, and a removed plugin would leave
+     a stale one behind. So:
+     - The binary **keeps the bootstrap contract stable**: `setup --harness <h> --plugin-version <v>`, and the
+       `status --json` fields `bootstrap.py` reads (`logged_in`, `hooks.<harness>`, `cli_version`,
+       `setup.log`). This holds for every released plugin version (0.4.0 and later). A new binary can always
+       be driven by an old bootstrap.
+     - The binary has a built-in `minPluginVersion`. When `setup` receives a lower `--plugin-version`, it still
+       runs every step. It never breaks the old plugin. It also records the step outcome
+       `plugin: "update the Pair plugin (have <v>, recommended >= <min>)"` in `setup.json`, which `status` and
+       `doctor` show.
+     - `install.sh` and `maintain` **ignore** `min_plugin_version`. The manifest field and its existing use by
+       `bootstrap.py` and the plugin's `setup --plugin-version` self-update are unchanged.
+     - A release that must break the bootstrap contract is out of scope for this plan. It would need a new
+       manifest schema version, which `bootstrap.py` already refuses.
    - It then hands off to the verified binary: `"$tmp/paircli" init --install-self …`. The **Go binary**
      installs itself:
      - it takes `~/.paircli/bin/.bootstrap.lock`, the same file and the same `flock` syscall as
@@ -283,12 +290,25 @@ What happens automatically:
    - **Find `codex`:** `$PATH` first, then the known bundled locations of the Codex desktop app. If it isn't
      found, record `codex_trust: "skipped: codex binary not found"` in `setup.json` and in `doctor`, and print
      today's `/hooks` message.
-   - **Scope:** start `codex app-server` and call `hooks/list` for `$CODEX_HOME`. `hooks/list` has no
-     source-file field. So compute the **exact expected keys** from the existing `ourHookPositions()`
-     (`cli/internal/codex/hooks.go:248`), as `<hooks.json>:<event>:<group>:<index>`. Normalize them the way
-     Orca does with `expectedTrustKeys`. Pick only listed entries whose key is in that set **and** whose
-     `command` exactly equals the per-event command `InstallHooks` just wrote. The number picked must equal `len(hookEvents)`, keyed by event. Otherwise **refuse**: grant
-     nothing, and report "found N Pair hook entries, expected M".
+   - **Scope:** start `codex app-server` and call `hooks/list` with `cwds` set to the user's home directory
+     (a real directory). Codex's `HookMetadata` reports `key`, `sourcePath`, `source`, `pluginId`,
+     `isManaged`, `enabled`, `timeoutSec`, `handlerType`, `command`, `currentHash` and `trustStatus`
+     ([HookMetadata.ts](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/HookMetadata.ts)).
+     Pick an entry only if **all** of these hold:
+     - `sourcePath` equals `$CODEX_HOME/hooks.json`;
+     - `isManaged == false` and `pluginId == null`;
+     - its `key` is in the exact expected set computed from the existing `ourHookPositions()`
+       (`cli/internal/codex/hooks.go:248`), normalized the way Orca's `expectedTrustKeys` is;
+     - the **whole entry** matches what `InstallHooks` writes: `handlerType == "command"`, the exact per-event
+       `command`, and `timeoutSec == 10`. An entry whose timeout the user edited isn't Pair's to trust.
+
+     Grant every exact match.
+     - An event that this Codex version doesn't list (for example an older Codex without `interrupt`) is
+       reported by name ("not listed by this Codex: interrupt") and doesn't block the other events.
+     - More than one match for the same event is ambiguous. That event is refused and reported.
+   - **Time limit:** the whole app-server session (start, list, write, verify) has a 20 s limit. When it
+     expires, Pair kills the process group and records `codex_trust: "timeout"`. A hung Codex can't keep
+     `maintain` holding the setup lock.
    - **Grant:** call `config/batchWrite` with `trusted_hash = currentHash`, using the hash and key exactly as
      Codex reported them. Already trusted means no write.
    - **Respect the user's own choices.** `init.json` records each granted `{key, hash}`.
@@ -296,8 +316,9 @@ What happens automatically:
        wrote it or changed it.
      - It **never** grants an entry reported `enabled: false`. It also never re-grants an entry whose hash is
        already in the record but which is untrusted now: the user revoked it.
-     - `doctor` and `status` report "Codex trust for Pair hooks was revoked in `/hooks`; run `paircli init`
-       to grant it again".
+     - `doctor` and `status` report "Codex trust for Pair hooks was revoked in `/hooks`; run
+       `~/.paircli/bin/paircli init` to grant it again". The installer doesn't put `~/.paircli/bin` on PATH, so
+       every message names the full path.
      - An explicit `paircli init` re-run is the user asking again, so it grants anything picked that isn't
        disabled.
    - **Verify:** call `hooks/list` again. Every picked entry must report trusted. If not, report
@@ -317,10 +338,13 @@ What happens automatically:
      is needed (Phase 3, Q2).
 6. **Auto-update and self-repair, for installer users only.**
    - `init --enroll` writes `~/.paircli/state/init.json` with `{schema_version, harnesses, codex_trust,
-     enrolled_at}`. It writes the file atomically, **only after the hooks step and the login succeed**. The
-     trust outcome is recorded, whether it was granted or fell back.
-     - If either step fails, no marker is written, `init` exits non-zero, and re-running the one command
-       starts over. So a partial enrolment is never ambiguous.
+     enrolled_at}`. It writes the file atomically, **only after the hooks step succeeds for at least one
+     detected agent, and the login succeeds** (or was skipped on purpose with `--no-login`). The trust
+     outcome and any agent that failed are recorded.
+     - So MDM rollouts that use `--no-login` are still enrolled and get `maintain`.
+     - An agent that failed (for example pi) doesn't block enrolment for the others. `maintain` retries it.
+     - If no agent's hooks install, or the login fails, no marker is written, `init` exits non-zero, and
+       re-running the one command starts over. So a partial enrolment is never ambiguous.
      - `maintain` later updates the same file, for example new grants or new harnesses.
    - The installed Claude/Codex `SessionStart` hook handler starts a detached `paircli maintain` **only when
      `init.json` exists**, at most once every 24 h. The throttle uses its own timestamp in
@@ -378,7 +402,7 @@ So the order a user takes them in doesn't matter:
   - `install.sh` reads `latest.json`. If the plugin's binary is migrated and at the latest version, it skips the
     binary download. Otherwise (for example an older binary without `init`), it installs the newer verified
     binary under `.bootstrap.lock` (step 1).
-  - `init` → `setupRun` re-merges the hooks. This is a no-op: there's still exactly one Pair entry per event.
+  - `init` → `runSetupSteps` re-merges the hooks. This is a no-op: there's still exactly one Pair entry per event.
   - The login is already valid, so it's skipped.
   - The user ends up with what they already had, plus Codex trust granted by `init` (D1).
 - **Installer first, then plugin.**
@@ -444,13 +468,27 @@ So the order a user takes them in doesn't matter:
     - With the lock held elsewhere, `init` waits, then exits 3 with the log path.
     - `setup` with the lock held still exits 0 with "already running" (unchanged).
     - Setup without `--grant-codex-trust` never calls the trust seam.
-  - `cli/internal/codex/trust_test.go` (fake app-server): an entry the user revoked (hash recorded in
-    `init.json`, now untrusted) gets no write from `maintain`. An `enabled: false` entry is never granted.
-    An explicit `init` re-grants the revoked entry.
+    - Enrolment:
+      - login fails → no `init.json`, non-zero exit;
+      - `--no-login` with hooks installed → `init.json` written;
+      - one agent fails and another succeeds → `init.json` written with the failed agent recorded.
+    - `setup --plugin-version` below `minPluginVersion` → all steps run, and the `plugin` outcome holds the
+      "update the Pair plugin" note.
+  - Bootstrap contract test (`cli/cmd/paircli/setup_test.go` + `status_test.go`): `setup --harness
+    claude-code --plugin-version 0.4.0` parses and runs. `status --json` still has every field `bootstrap.py`
+    reads. This test fails if a future change breaks the plugin.
+  - `cli/internal/codex/trust_test.go` (fake app-server):
+    - an entry the user revoked (hash recorded in `init.json`, now untrusted) gets no write from `maintain`;
+    - an `enabled: false` entry is never granted;
+    - an explicit `init` re-grants the revoked entry;
+    - a matching command in a plugin-sourced or managed entry, or with an edited timeout, isn't granted;
+    - an event this Codex doesn't list is reported by name and the rest are granted;
+    - an app-server that never answers is killed at the time limit, with outcome `timeout`.
   - `cli/internal/selfupdate/update_test.go`:
     - With `~/.paircli/bin/.bootstrap.lock` held (the exact file `bootstrap.py` uses), the update is skipped
       as a tolerated outcome and the binary is untouched.
-    - A manifest whose `min_plugin_version` is above the saved `plugin.json` version is refused.
+    - Without a plugin version (the `maintain` and installer paths), a manifest's `min_plugin_version` doesn't
+      block the update.
   - `--install-self` tests in `cli/cmd/paircli`:
     - the rename seam fails with EXDEV, or the source is on another filesystem → the copy-then-rename path
       still installs;
@@ -460,7 +498,7 @@ So the order a user takes them in doesn't matter:
     - setup lock taken → skip, `maintain.json` not written;
     - the update step reports "updated" → the lock is released before the re-exec seam is called, and
       `--after-update` runs the hook and trust steps;
-    - no `plugin.json` → no plugin version passed; with it → the saved version is passed.
+    - `maintain` passes no plugin version to `selfupdate`.
   - `cli/internal/claudecode/hooks_test.go` and `cli/internal/codex/hooks_test.go`, SessionStart case: no
     `init.json` → the maintain spawner seam isn't called. With `init.json` and a fresh timestamp → not called.
     With a stale one → called.
@@ -471,7 +509,7 @@ So the order a user takes them in doesn't matter:
 | --- | --- |
 | Remove the plugin, keep Pair working (switch to the installer path) | `claude plugin uninstall pair@pair` / `codex plugin remove pair@pair`. The CLI hooks, login and capture keep working. After Phase 2, `maintain` keeps the CLI updated; before that, re-run the installer or `paircli update` |
 | Keep the plugin, "remove the installer" | Nothing to remove. The installer leaves no state of its own beyond what the plugin path uses. Delete `install.json` if Phase 3 added it |
-| Remove Pair completely | 1. Uninstall the plugin **first**. Otherwise its bootstrap reinstalls Pair at the next session start. 2. Run the new `paircli uninstall` (Phase 1). It does `hook uninstall` (every harness) + `logout` + removes `~/.paircli`. If it detects that the plugin is still installed (`claude plugin list` / `codex plugin list` when those are on PATH), it stops and prints the exact plugin uninstall command; `--force` overrides. The existing three-command README sequence keeps working |
+| Remove Pair completely | 1. Uninstall the plugin **first**. Otherwise its bootstrap reinstalls Pair at the next session start. 2. Run the new `~/.paircli/bin/paircli uninstall` (Phase 1). It does `hook uninstall` (every harness) + `logout` + removes `~/.paircli`. It also removes the Codex trust entries recorded in `init.json` through the same app-server `config/batchWrite`, when Codex is available; otherwise those entries are inert, because they match no hook. It doesn't try to detect the plugin. It always prints the two plugin uninstall commands as a reminder. The existing three-command README sequence keeps working |
 
 ### Phases and concrete repo changes
 
@@ -523,9 +561,9 @@ So the order a user takes them in doesn't matter:
   **Phase 1** because the trust grant ships here: every move of Pair's group changes its Codex trust keys,
   and the keys of the user's own hooks after it. Without `maintain` (Phase 2), nothing would grant the trust
   again.
-- `cli/cmd/paircli/uninstall.go` (new): the full uninstall in §5.1. It also removes `init.json` and
-  `maintain.json`. It doesn't shell out to detect the plugin. It always prints the two plugin uninstall
-  commands as a reminder.
+- `cli/cmd/paircli/uninstall.go` (new): the full uninstall in §5.1, including the recorded Codex trust
+  entries. It also removes `init.json` and `maintain.json`. It doesn't shell out to detect the plugin. It
+  always prints the two plugin uninstall commands as a reminder.
 - `README.md`, `docs/ONBOARDING.md`: show the two supported paths side by side in "Install", "One command"
   and "Plugin". The existing plugin instructions stay as they are. Add the coexistence and uninstall notes
   from §5.1.
