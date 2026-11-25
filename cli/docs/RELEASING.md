@@ -57,7 +57,7 @@ Later session-start setup runs the ordinary CLI updater. PR creation/push
 hooks still use the installed binary; they do not rebuild or unconditionally
 download it. The updater refuses revoked releases, observes plugin
 compatibility, and supports `paircli update --check`. Homebrew-managed
-executables retain the existing `brew upgrade paircli` behavior; plugin
+executables are left to `brew upgrade` (the formula is `pair`); plugin
 bootstrap manages only its own path under `~/.paircli/bin`.
 
 Only the CLI updater supports the existing `PAIRCLI_UPDATE_MANIFEST_URL`
@@ -73,6 +73,21 @@ platform contract, HTTPS, checksums and a 100 MiB cap. The CLI preserves its
 existing GitHub release-asset redirect policy. These checks do not make a
 checksum an independent signature; clients do not currently verify CI
 attestations. Anonymous downloads require the repository/assets to be public.
+
+## Homebrew (optional)
+
+Pair can also be offered as a Homebrew formula in a tap (`interviewstreet/homebrew-tap`, which does not exist
+yet). Users then run `brew install interviewstreet/tap/pair && paircli init`. After a release, render the
+formula from that release's manifest and commit it to the tap as `Formula/pair.rb`:
+
+```sh
+python3 scripts/render-homebrew-formula.py cli/dist/paircli/latest.json > Formula/pair.rb
+```
+
+The renderer applies the plugin bootstrap's checks to the manifest. A Homebrew `paircli` doesn't self-update
+(`brew upgrade` does), and its hooks call the brew bin link, which survives upgrades. When `paircli init` runs
+from a Homebrew keg (or its bin link), it writes `~/.paircli/state/install.json` naming that binary, and the plugin's
+bootstrap then uses it instead of downloading a second copy. Without the file, the bootstrap behaves as before.
 
 ## Notification assets
 

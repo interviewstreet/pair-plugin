@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -128,6 +129,35 @@ func runHook(args []string) error {
 	return h.Run(event, os.Stdin)
 }
 
+// harnessResult is one harness's outcome from installEachHarness.
+type harnessResult struct {
+	Name     string
+	Detected bool
+	Err      error
+}
+
+// errNoHarnesses is the install error when no harness is detected.
+var errNoHarnesses = errors.New("no harnesses detected (looked for ~/.claude, ~/.codex or $CODEX_HOME, ~/.pi/agent); install one explicitly with: paircli hook install <harness>")
+
+// installEachHarness installs hooks for every harness detected on this
+// machine, in harnessOrder. A harness that fails does not stop the others.
+func installEachHarness(w io.Writer) []harnessResult {
+	var results []harnessResult
+	for _, name := range harnessOrder {
+		if !harnessTable[name].Detect() {
+			fmt.Fprintf(w, "paircli: skipped %s (not detected)\n", name)
+			results = append(results, harnessResult{Name: name})
+			continue
+		}
+		err := installHarness(w, name)
+		if err != nil {
+			fmt.Fprintf(w, "paircli: %s: %v\n", name, err)
+		}
+		results = append(results, harnessResult{Name: name, Detected: true, Err: err})
+	}
+	return results
+}
+
 // installAllHarnesses installs hooks for every harness detected on this
 // machine, so setting up needs one command rather than one per harness. A
 // harness that fails does not stop the others: every failure is reported and
@@ -137,20 +167,18 @@ func installAllHarnesses(w io.Writer) error {
 		detected int
 		failed   []string
 	)
-	for _, name := range harnessOrder {
-		if !harnessTable[name].Detect() {
-			fmt.Fprintf(w, "paircli: skipped %s (not detected)\n", name)
+	for _, r := range installEachHarness(w) {
+		if !r.Detected {
 			continue
 		}
 		detected++
-		if err := installHarness(w, name); err != nil {
-			fmt.Fprintf(w, "paircli: %s: %v\n", name, err)
-			failed = append(failed, name)
+		if r.Err != nil {
+			failed = append(failed, r.Name)
 		}
 	}
 
 	if detected == 0 {
-		return fmt.Errorf("no harnesses detected (looked for ~/.claude, ~/.codex or $CODEX_HOME, ~/.pi/agent); install one explicitly with: paircli hook install <harness>")
+		return errNoHarnesses
 	}
 	if len(failed) > 0 {
 		return fmt.Errorf("hook install failed for %s", strings.Join(failed, ", "))

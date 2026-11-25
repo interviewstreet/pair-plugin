@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/interviewstreet/pair-plugin/cli/internal/codex"
 	"github.com/interviewstreet/pair-plugin/cli/internal/config"
 )
 
@@ -72,10 +73,11 @@ func doctorLine(t *testing.T, lines []string, prefix string) string {
 // test. ghErr stands in for `gh auth status`; lookErr for LookPath.
 func stubDoctor(t *testing.T, ghErr, lookErr error) {
 	t.Helper()
-	prevRun, prevLook := doctorRun, doctorLookPath
+	prevRun, prevLook, prevTrust := doctorRun, doctorLookPath, doctorCodexTrust
+	doctorCodexTrust = codex.HookTrustState
 	doctorRun = func(string, ...string) error { return ghErr }
 	doctorLookPath = func(string) (string, error) { return "", lookErr }
-	t.Cleanup(func() { doctorRun, doctorLookPath = prevRun, prevLook })
+	t.Cleanup(func() { doctorRun, doctorLookPath, doctorCodexTrust = prevRun, prevLook, prevTrust })
 }
 
 // fakeExitError is an *exec.ExitError, the shape doctor reads as "the command

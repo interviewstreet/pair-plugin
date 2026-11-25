@@ -240,7 +240,14 @@ func TryLock(name string) (*Lock, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(filepath.Join(dir, name+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	return TryLockPath(filepath.Join(dir, name+".lock"))
+}
+
+// TryLockPath is TryLock on the lock file at path, which may be shared with
+// another program that flocks the same file (the plugin's bootstrap.py). The
+// file's directory must exist.
+func TryLockPath(path string) (*Lock, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -252,6 +259,18 @@ func TryLock(name string) (*Lock, error) {
 		return nil, err
 	}
 	return &Lock{file: file}, nil
+}
+
+// BootstrapLockPath is ~/.paircli/bin/.bootstrap.lock, the lock the plugin's
+// bootstrap.py takes to install the binary. Every replacement of
+// ~/.paircli/bin/paircli (bootstrap, `init --install-self`, self-update)
+// happens under it.
+func BootstrapLockPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".paircli", "bin", ".bootstrap.lock")
 }
 
 // Release drops the lock. It is safe to call more than once.
@@ -268,9 +287,18 @@ func (l *Lock) Release() {
 // read-modify-write sections of shared files (revision journal, capture
 // cursors); it returns ErrLocked when the timeout passes.
 func WaitLock(name string, timeout time.Duration) (*Lock, error) {
+	return waitFor(func() (*Lock, error) { return TryLock(name) }, timeout)
+}
+
+// WaitLockPath is WaitLock on the lock file at path (see TryLockPath).
+func WaitLockPath(path string, timeout time.Duration) (*Lock, error) {
+	return waitFor(func() (*Lock, error) { return TryLockPath(path) }, timeout)
+}
+
+func waitFor(try func() (*Lock, error), timeout time.Duration) (*Lock, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		l, err := TryLock(name)
+		l, err := try()
 		if !errors.Is(err, ErrLocked) {
 			return l, err
 		}

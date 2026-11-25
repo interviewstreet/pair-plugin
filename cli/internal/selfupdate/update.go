@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/interviewstreet/pair-plugin/cli/internal/binpath"
+	"github.com/interviewstreet/pair-plugin/cli/internal/state"
 )
 
 const (
@@ -126,8 +130,20 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		executable = resolved
 	}
 	if isHomebrewManaged(executable) {
-		return Result{}, fmt.Errorf("paircli is managed by Homebrew; update it with brew upgrade paircli")
+		result.SkippedReason = "paircli is managed by Homebrew; update it with brew upgrade"
+		return result, nil
 	}
+	// The plugin's bootstrap and `paircli init --install-self` replace the
+	// same binary under this lock; never race them.
+	lock, err := state.TryLockPath(filepath.Join(filepath.Dir(executable), ".bootstrap.lock"))
+	if errors.Is(err, state.ErrLocked) {
+		result.SkippedReason = "another install in progress"
+		return result, nil
+	}
+	if err != nil {
+		return Result{}, fmt.Errorf("lock install: %w", err)
+	}
+	defer lock.Release()
 	if err := downloadAndReplace(ctx, client, artifact, executable); err != nil {
 		return Result{}, err
 	}
@@ -362,6 +378,15 @@ func comparePrerelease(candidate, current string) int {
 	return 0
 }
 
+// VersionAtLeast reports whether actual is required or newer. An unparsable
+// version is never at least anything.
+func VersionAtLeast(actual, required string) bool {
+	if _, _, ok := parseVersion(actual); !ok {
+		return false
+	}
+	return versionAtLeast(actual, required)
+}
+
 func versionAtLeast(actual, required string) bool {
 	return actual == required || isNewer(actual, required)
 }
@@ -449,7 +474,5 @@ func isDevelopmentVersion(value string) bool {
 	return false
 }
 
-func isHomebrewManaged(executable string) bool {
-	cleaned := filepath.Clean(executable)
-	return strings.HasPrefix(cleaned, "/opt/homebrew/Cellar/") || strings.HasPrefix(cleaned, "/usr/local/Cellar/")
-}
+// isHomebrewManaged reports a binary inside a Homebrew keg (macOS or Linuxbrew).
+func isHomebrewManaged(executable string) bool { return binpath.IsHomebrewKeg(executable) }

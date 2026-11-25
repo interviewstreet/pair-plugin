@@ -105,7 +105,8 @@ func (be *fakeBackend) handle(w http.ResponseWriter, r *http.Request) {
 // test. opened and waits collect what the flow would have done.
 func stubLogin(t *testing.T, opened *[]string, waits *[]time.Duration) {
 	t.Helper()
-	prevClient, prevBrowser := loginNewClient, loginOpenBrowser
+	prevClient, prevBrowser, prevHas := loginNewClient, loginOpenBrowser, loginHasBrowser
+	loginHasBrowser = func() bool { return true }
 	loginNewClient = func(baseURL string) *deviceauth.Client {
 		c := deviceauth.NewClient(baseURL)
 		c.SetWait(func(_ context.Context, d time.Duration) error {
@@ -122,7 +123,7 @@ func stubLogin(t *testing.T, opened *[]string, waits *[]time.Duration) {
 		}
 		return nil
 	}
-	t.Cleanup(func() { loginNewClient, loginOpenBrowser = prevClient, prevBrowser })
+	t.Cleanup(func() { loginNewClient, loginOpenBrowser, loginHasBrowser = prevClient, prevBrowser, prevHas })
 }
 
 // useTempAuthFile points the store at a temp file and clears the env override.
@@ -230,6 +231,29 @@ func TestLoginRun_NoBrowser(t *testing.T) {
 	}
 	if len(opened) != 0 {
 		t.Errorf("browser opened despite --no-browser: %v", opened)
+	}
+}
+
+// On a machine with no browser (SSH, no display), login prints the URL and
+// does not try to open one.
+func TestLoginRun_HeadlessPrintsTheURLInsteadOfOpeningABrowser(t *testing.T) {
+	useTempAuthFile(t)
+	be := newFakeBackend(t, []string{""}, map[string]any{"name": "Ada"})
+	defer be.Close()
+
+	var opened []string
+	stubLogin(t, &opened, nil)
+	loginHasBrowser = func() bool { return false }
+
+	var out, progress bytes.Buffer
+	if err := loginRun([]string{"--server", be.URL()}, &out, &progress); err != nil {
+		t.Fatalf("loginRun: %v", err)
+	}
+	if len(opened) != 0 {
+		t.Errorf("opened a browser on a headless machine: %v", opened)
+	}
+	if !strings.Contains(progress.String(), "remote or headless session; open "+be.URL()) {
+		t.Errorf("progress = %q, want the URL to open elsewhere", progress.String())
 	}
 }
 

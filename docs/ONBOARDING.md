@@ -4,6 +4,11 @@ The Pair plugin owns Pair CLI's source under `cli/` and remains a thin installer
 machine and gets out of the way; everything else (scanning, redaction,
 publishing, PR detection) is done by `paircli`.
 
+Pair can be installed two ways: the plugin (below), or the one-command installer
+(`curl -fsSL https://github.com/interviewstreet/pair-plugin/releases/latest/download/install.sh | sh`, see
+"Installing without the plugin"). Both end in the same `~/.paircli` and the same hooks. macOS and Linux only;
+on Windows, use WSL.
+
 ## What happens at session start
 
 When the first Claude Code or Codex session opens after the plugin is
@@ -98,6 +103,34 @@ No AI-written text is produced locally. The AI review (overview and architecture
 arrives asynchronously, usually within minutes. The pair.sh page fills in when
 it is ready; `paircli publish --wait` waits for it and notifies you.
 
+## Installing without the plugin
+
+`install.sh` downloads the release manifest, checks the binary for your platform exactly as the plugin's
+bootstrap does (manifest schema, revoked list, release URL, SHA-256 and the 100 MiB cap) into a temp directory,
+and runs `paircli init --install-self <dir>`. init:
+
+1. prints what it will set up (no prompt);
+2. installs the binary in `~/.paircli/bin` under the same lock as the bootstrap, writes the same migration
+   marker, and removes the temp directory;
+3. installs the PR hooks in every detected agent, and approves Pair's Codex hooks through Codex itself
+   (`codex app-server`), only entries that are exactly Pair's. If your Codex can't, it prints the `/hooks`
+   step instead;
+4. runs the device login (the browser opens only when there is a terminal; `--no-login` skips it);
+5. writes `~/.paircli/state/init.json`, which records the agents and the Codex approvals;
+6. checks `gh` and tells you if `gh auth login` or installing `gh` is still needed.
+
+init never re-approves a Codex hook you revoked or disabled in `/hooks`, except when you run
+`~/.paircli/bin/paircli init` yourself from a terminal (a disabled hook is never re-approved). Run it again at any time; it only fixes what is missing.
+
+On a machine init set up, Pair's own SessionStart hook (Claude Code or Codex) starts
+`paircli maintain` in the background at most once every 24 hours (`~/.paircli/state/maintain.json`). It
+updates the CLI, installs hooks for agents added since, repairs removed or stale entries, approves Pair's
+new or changed Codex entries (never one you revoked), and opens the login if there is no credential. It logs
+to `~/.paircli/logs/maintain-*.log`. Machines that only have the plugin never run it.
+
+A `paircli` installed some other way (Homebrew) and set up with `paircli init` is recorded in
+`~/.paircli/state/install.json`; the plugin's bootstrap then runs that binary instead of downloading its own.
+
 ## Status and logs
 
 - `paircli status` (or `--json`) shows the version, server, login, installed
@@ -111,6 +144,8 @@ it is ready; `paircli publish --wait` waits for it and notifies you.
   start a new session.
 
 ## Remove Pair
+
+Uninstall the plugin first if you have it, then run `~/.paircli/bin/paircli uninstall`. Or, by hand:
 
 ```sh
 ~/.paircli/bin/paircli hook uninstall   # remove the PR hooks from every harness

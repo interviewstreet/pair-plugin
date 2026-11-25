@@ -28,6 +28,7 @@ const serverURLEnv = "PAIRCLI_SERVER_URL"
 var (
 	loginNewClient   = deviceauth.NewClient
 	loginOpenBrowser = deviceauth.OpenBrowser
+	loginHasBrowser  = deviceauth.HasBrowser
 )
 
 // loginArgs is a parsed `paircli login` invocation.
@@ -96,7 +97,11 @@ func loginRun(args []string, out, progress io.Writer) error {
 	}
 	printDeviceCode(out, progress, dc, a.JSON)
 
-	if !a.NoBrowser {
+	switch {
+	case a.NoBrowser:
+	case !loginHasBrowser():
+		fmt.Fprintf(progress, "paircli: this looks like a remote or headless session; open %s on any device to approve\n", dc.VerificationURIComplete)
+	default:
 		if err := loginOpenBrowser(dc.VerificationURIComplete); err != nil {
 			fmt.Fprintf(progress, "paircli: could not open the browser (%v); open %s yourself\n",
 				err, dc.VerificationURIComplete)

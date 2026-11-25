@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,8 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/interviewstreet/pair-plugin/cli/internal/binpath"
 	"github.com/interviewstreet/pair-plugin/cli/internal/gitinfo"
 	"github.com/interviewstreet/pair-plugin/cli/internal/hooklog"
+	"github.com/interviewstreet/pair-plugin/cli/internal/maintain"
 	"github.com/interviewstreet/pair-plugin/cli/internal/model"
 	"github.com/interviewstreet/pair-plugin/cli/internal/prtrigger"
 )
@@ -87,14 +90,12 @@ func EventsDir() (string, error) {
 
 // pairCLIBinary returns the command prefix InstallHooks writes into
 // settings.json: the absolute, symlink-resolved path to the running paircli
-// binary, single-quoted if it contains whitespace.
+// binary (for a Homebrew keg, the brew bin link, which survives an upgrade),
+// single-quoted if it contains whitespace.
 func pairCLIBinary() (string, error) {
-	exe, err := os.Executable()
+	exe, err := binpath.Executable()
 	if err != nil {
 		return "", err
-	}
-	if real, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = real
 	}
 	if strings.ContainsAny(exe, " \t") {
 		return "'" + exe + "'", nil
@@ -122,6 +123,12 @@ func InstallHooks() error {
 		}
 	}
 
+	// Snapshot before merging: the merge edits settings' nested maps in place.
+	before, err := json.Marshal(settings)
+	if err != nil {
+		return err
+	}
+
 	bin, err := pairCLIBinary()
 	if err != nil {
 		return err
@@ -137,6 +144,10 @@ func InstallHooks() error {
 	}
 	settings["hooks"] = hooksRaw
 
+	// A re-run that changes nothing leaves the file alone, byte for byte.
+	if after, err := json.Marshal(settings); err == nil && existed && bytes.Equal(before, after) {
+		return nil
+	}
 	return writeSettings(path, settings)
 }
 
@@ -263,12 +274,13 @@ func writeSettings(path string, settings map[string]interface{}) error {
 	return os.Rename(tmpPath, path)
 }
 
-// installEvent returns existing's matcher groups with any paircli-owned hook
-// command removed (see hookMarker), plus a new group holding cmd under
-// matcher (matcher == "" omits the field).
+// installEvent returns existing's matcher groups with paircli's hook set to
+// cmd under matcher (matcher == "" omits the field). When a group holding
+// only paircli hooks already exists, it is replaced where it stands, so its
+// index (and so its Codex hook-trust key, and the keys of any user group after
+// it) does not move. Otherwise paircli's hooks are removed wherever they are
+// and a new group is appended.
 func installEvent(existing interface{}, matcher, cmd string) []interface{} {
-	matchers := stripOurHooks(existing)
-
 	entry := map[string]interface{}{
 		"type":    "command",
 		"command": cmd,
@@ -280,7 +292,47 @@ func installEvent(existing interface{}, matcher, cmd string) []interface{} {
 	if matcher != "" {
 		group["matcher"] = matcher
 	}
-	return append(matchers, group)
+
+	arr, _ := existing.([]interface{})
+	own := -1
+	for i, m := range arr {
+		if isOurGroup(m) {
+			own = i
+			break
+		}
+	}
+	if own < 0 {
+		return append(stripOurHooks(existing), group)
+	}
+	// Groups before own keep their index: none of them holds only paircli
+	// hooks, so stripping drops none (except an already-empty group, which
+	// installs have always dropped).
+	out := stripOurHooks(arr[:own])
+	out = append(out, group)
+	return append(out, stripOurHooks(arr[own+1:])...)
+}
+
+// isOurGroup reports whether m is a matcher group whose hooks are all
+// paircli's own (and there is at least one).
+func isOurGroup(m interface{}) bool {
+	mm, ok := m.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	hooksList, _ := mm["hooks"].([]interface{})
+	if len(hooksList) == 0 {
+		return false
+	}
+	for _, h := range hooksList {
+		hm, ok := h.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		if cmd, _ := hm["command"].(string); !strings.Contains(cmd, hookMarker) {
+			return false
+		}
+	}
+	return true
 }
 
 // removeOurHooks is stripOurHooks with a nil (not empty-slice) result when
@@ -387,6 +439,11 @@ type hookStdinPayload struct {
 func RunHookEvent(event string, stdin io.Reader) error {
 	if mapped, ok := legacyEventArgs[event]; ok {
 		event = mapped
+	}
+
+	if event == "SessionStart" {
+		// Installer-path machines only (init.json); a no-op otherwise.
+		maintain.MaybeStart()
 	}
 
 	var payload hookStdinPayload

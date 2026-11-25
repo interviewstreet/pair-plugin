@@ -261,6 +261,74 @@ def test_child_runs_setup_with_harness_and_plugin_version(tmp_path, monkeypatch)
     assert seen == [[str(binary), "setup", "--harness", "codex", "--plugin-version", bootstrap.PLUGIN_VERSION]]
 
 
+def test_child_uses_a_binary_the_installer_put_there(tmp_path, monkeypatch):
+    """The installer path (`paircli init --install-self`) writes the binary and the same marker."""
+    binary = tmp_path / ".paircli" / "bin" / "paircli"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    # What paircli's init writes (Go's indented JSON), not bootstrap's own json.dump.
+    binary.with_name("release-source.json").write_text('{\n  "manifest_url": "%s"\n}\n' % bootstrap.MANIFEST_URL)
+    downloads, seen = [], []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(bootstrap, "install_binary", lambda *args, **kwargs: downloads.append(args))
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda command, **kwargs: seen.append(command) or Done())
+    bootstrap.run_child("claude-code", tmp_path)
+    assert downloads == []
+    assert seen == [[str(binary), "setup", "--harness", "claude-code", "--plugin-version", bootstrap.PLUGIN_VERSION]]
+
+
+def write_install_record(home, binary):
+    record = home / ".paircli" / "state" / "install.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"schema_version": 1, "binary": str(binary)}))
+
+
+def test_child_uses_the_binary_install_json_names_without_downloading(tmp_path, monkeypatch):
+    brew = tmp_path / "opt/homebrew/bin/paircli"
+    brew.parent.mkdir(parents=True)
+    brew.write_text("#!/bin/sh\n")
+    brew.chmod(0o755)
+    write_install_record(tmp_path, brew)
+    downloads, seen = [], []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(bootstrap, "install_binary", lambda *args, **kwargs: downloads.append(args))
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda command, **kwargs: seen.append(command) or Done())
+    bootstrap.run_child("codex", tmp_path)
+    assert downloads == []
+    assert seen == [[str(brew), "setup", "--harness", "codex", "--plugin-version", bootstrap.PLUGIN_VERSION]]
+    assert not (tmp_path / ".paircli" / "bin" / "paircli").exists()
+
+
+@pytest.mark.parametrize("contents", ["{not json", '{"binary": "relative/paircli"}', '{"binary": "/nonexistent/paircli"}', "[]"])
+def test_an_unusable_install_json_is_ignored(tmp_path, contents):
+    record = tmp_path / ".paircli" / "state" / "install.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(contents)
+    assert bootstrap.managed_binary(tmp_path) is None
+
+
+def test_main_with_a_managed_binary_needs_no_curl_or_migration(tmp_path, monkeypatch, capsys):
+    brew = tmp_path / "brew/paircli"
+    brew.parent.mkdir(parents=True)
+    brew.write_text("#!/bin/sh\n")
+    brew.chmod(0o755)
+    write_install_record(tmp_path, brew)
+    started = []
+    monkeypatch.setattr(bootstrap, "start_child", lambda harness, home: started.append(harness))
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda tool: None)
+    monkeypatch.setattr(bootstrap, "status_line", lambda binary, harness, managed=False: f"{binary} managed={managed}")
+    assert bootstrap.main([], home=tmp_path) == 0
+    message = json.loads(capsys.readouterr().out)["systemMessage"]
+    assert started and message.startswith(f"{brew} managed=True")
+
+
 @pytest.mark.parametrize("release", [None, [], {}, manifest(schema="unknown"), manifest(version="not-a-version"),
                                     manifest(revoked=["0.3.0"]), manifest(revoked="0.3.0")])
 def test_select_artifact_rejects_invalid_or_revoked_manifest(release):

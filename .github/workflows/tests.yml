@@ -61,4 +61,4 @@ jobs:
       - name: Test real binaries in isolated homes
         run: |
           python -m pip install "pytest>=8"
-          PAIRCLI_TEST_RELEASE_DIR=cli/dist/paircli python -m pytest tests/test_release_binary.py -q
+          PAIRCLI_TEST_RELEASE_DIR=cli/dist/paircli python -m pytest tests/test_release_binary.py tests/test_install_sh.py -q

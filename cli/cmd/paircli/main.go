@@ -30,6 +30,8 @@ func main() {
 		err = runPublish(os.Args[2:])
 	case "setup":
 		err = runSetup(os.Args[2:])
+	case "init":
+		err = runInit(os.Args[2:])
 	case "status":
 		err = runStatus(os.Args[2:])
 	case "login":
@@ -40,6 +42,10 @@ func main() {
 		err = runDoctor(os.Args[2:])
 	case "update":
 		err = runUpdate(os.Args[2:])
+	case "uninstall":
+		err = runUninstall(os.Args[2:])
+	case "maintain":
+		err = runMaintain(os.Args[2:])
 	case "version":
 		fmt.Printf("paircli %s\n", version)
 		return
@@ -71,16 +77,21 @@ Usage:
   paircli judge <snapshot.json> [flags]     run the grounded LLM pass over a scan's
                                             snapshot and rewrite its report files
   paircli publish <pr-number-or-url> [flags]  scan, redact, package and publish a PR's evidence to Pair
+  paircli init [flags]                      set up Pair from the installer: hooks in every detected
+                                            agent, approved in Codex, login, updates (idempotent)
   paircli setup [flags]                     install hooks, update the CLI and log in (idempotent)
   paircli status [flags]                    show login, hooks and the state of recent publications
   paircli hook install [harness]            install hooks; with no harness, every one
                                             detected on this machine (claude-code | codex | pi)
   paircli hook uninstall [harness]          remove hooks; with no harness, all installed ones
   paircli hook <harness> <event>            internal: invoked BY the installed hook
+  paircli maintain                          internal: daily update and repair, started by the
+                                            SessionStart hook on machines set up with init
   paircli login [flags]                     log in to the pair backend with a device code
   paircli logout [flags]                    remove the stored credential
   paircli doctor                            report capture state per harness, gh, config and llm
   paircli update [flags]                    download and install the latest verified CLI release
+  paircli uninstall                         remove Pair: hooks, Codex approvals, login and ~/.paircli
   paircli version                           print the version
 
 scan flags:
@@ -113,10 +124,18 @@ publish flags:
   --no-comment            do not post the Pair link comment on the PR
   --json                  print the result as JSON
 
+init flags:
+  --harness NAME          claude-code | codex | pi (default: every detected harness)
+  --no-login              skip the device login
+  --install-self DIR      install this binary to ~/.paircli/bin, then remove DIR (used by the installer)
+  --yes                   accepted for scripts; init never asks
+
 setup flags:
   --harness NAME          claude-code | codex | pi (default: every detected harness)
   --plugin-version VER    Pair plugin version (used by the plugin integration)
   --no-login              skip the device login
+  --grant-codex-trust     approve Pair's Codex hooks inside Codex
+  --enroll                record this machine as set up by the installer
   --json                  print the result as JSON
 
 status flags:

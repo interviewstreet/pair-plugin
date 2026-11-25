@@ -353,3 +353,25 @@ func TestOriginOfDropsPathAndDefaultPort(t *testing.T) {
 		}
 	}
 }
+
+func TestCanOpenBrowser(t *testing.T) {
+	cases := []struct {
+		goos string
+		env  map[string]string
+		want bool
+	}{
+		{"darwin", nil, true},
+		{"darwin", map[string]string{"SSH_CONNECTION": "1.2.3.4 22 5.6.7.8 22"}, false},
+		{"linux", nil, false},
+		{"linux", map[string]string{"DISPLAY": ":0"}, true},
+		{"linux", map[string]string{"WAYLAND_DISPLAY": "wayland-0"}, true},
+		{"linux", map[string]string{"WSL_DISTRO_NAME": "Ubuntu"}, true},
+		{"linux", map[string]string{"DISPLAY": ":0", "SSH_TTY": "/dev/pts/1"}, false},
+	}
+	for _, c := range cases {
+		getenv := func(k string) string { return c.env[k] }
+		if got := CanOpenBrowser(c.goos, getenv); got != c.want {
+			t.Errorf("CanOpenBrowser(%s, %v) = %v, want %v", c.goos, c.env, got, c.want)
+		}
+	}
+}

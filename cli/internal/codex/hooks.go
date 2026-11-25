@@ -1,13 +1,16 @@
 // Package codex also manages paircli's Codex CLI hook integration ("Path A"):
 // installing/uninstalling hook commands in $CODEX_HOME/hooks.json and
 // handling the events those hooks invoke (`paircli hook codex <Event>`).
-// It deliberately never writes Codex's hook-trust approvals
-// (config.toml's [hooks.state."…"] entries): only Codex itself, after the
-// user reviews a new or changed hook, may do that. See
-// docs/plan/tasks/T20-codex-hooks.md.
+// Installing hooks never writes Codex's hook-trust approvals (config.toml's
+// [hooks.state."…"] entries). Trust is written only by GrantTrust, only when
+// `paircli init` or `paircli maintain` asks for it, and only through Codex's
+// own app-server trust RPCs with the hash Codex computed (trust.go); `paircli
+// setup`, which the plugin runs, never asks. The SessionStart hook starts
+// maintain only on machines init enrolled. See docs/plan/tasks/T20-codex-hooks.md.
 package codex
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,8 +21,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/interviewstreet/pair-plugin/cli/internal/binpath"
 	"github.com/interviewstreet/pair-plugin/cli/internal/gitinfo"
 	"github.com/interviewstreet/pair-plugin/cli/internal/hooklog"
+	"github.com/interviewstreet/pair-plugin/cli/internal/maintain"
 	"github.com/interviewstreet/pair-plugin/cli/internal/model"
 	"github.com/interviewstreet/pair-plugin/cli/internal/prtrigger"
 )
@@ -104,14 +109,12 @@ func configTomlPath() string {
 
 // pairCLIBinary returns the command prefix InstallHooks writes into
 // hooks.json: the absolute, symlink-resolved path to the running paircli
-// binary, single-quoted if it contains whitespace.
+// binary (for a Homebrew keg, the brew bin link, which survives an upgrade),
+// single-quoted if it contains whitespace.
 func pairCLIBinary() (string, error) {
-	exe, err := os.Executable()
+	exe, err := binpath.Executable()
 	if err != nil {
 		return "", err
-	}
-	if real, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = real
 	}
 	if strings.ContainsAny(exe, " \t") {
 		return "'" + exe + "'", nil
@@ -141,6 +144,12 @@ func InstallHooks() error {
 		}
 	}
 
+	// Snapshot before merging: the merge edits settings' nested maps in place.
+	before, err := json.Marshal(settings)
+	if err != nil {
+		return err
+	}
+
 	bin, err := pairCLIBinary()
 	if err != nil {
 		return err
@@ -156,6 +165,10 @@ func InstallHooks() error {
 	}
 	settings["hooks"] = hooksRaw
 
+	// A re-run that changes nothing leaves the file alone, byte for byte.
+	if after, err := json.Marshal(settings); err == nil && existed && bytes.Equal(before, after) {
+		return nil
+	}
 	return writeHooksFile(path, settings)
 }
 
@@ -339,7 +352,8 @@ func parseTrustedKeys(path string) map[string]bool {
 // HookTrustState does a read-only scan of config.toml and reports how many
 // of paircli's current hooks.json hook entries Codex has recorded a
 // trusted_hash for (trusted), out of how many paircli hooks currently exist
-// in hooks.json (total). paircli never writes to config.toml itself.
+// in hooks.json (total). It is the fallback when no codex binary can answer
+// PairHookTrust; paircli never writes config.toml directly.
 func HookTrustState() (trusted, total int) {
 	positions, err := ourHookPositions()
 	if err != nil || len(positions) == 0 {
@@ -414,12 +428,13 @@ func writeHooksFile(path string, settings map[string]interface{}) error {
 	return os.Rename(tmpPath, path)
 }
 
-// installEvent returns existing's matcher groups with any paircli-owned hook
-// command removed (see hookMarker), plus a new group holding cmd under
-// matcher (matcher == "" omits the field).
+// installEvent returns existing's matcher groups with paircli's hook set to
+// cmd under matcher (matcher == "" omits the field). When a group holding
+// only paircli hooks already exists, it is replaced where it stands, so its
+// index (and so its Codex hook-trust key, and the keys of any user group after
+// it) does not move. Otherwise paircli's hooks are removed wherever they are
+// and a new group is appended.
 func installEvent(existing interface{}, matcher, cmd string) []interface{} {
-	matchers := stripOurHooks(existing)
-
 	entry := map[string]interface{}{
 		"type":    "command",
 		"command": cmd,
@@ -431,7 +446,47 @@ func installEvent(existing interface{}, matcher, cmd string) []interface{} {
 	if matcher != "" {
 		group["matcher"] = matcher
 	}
-	return append(matchers, group)
+
+	arr, _ := existing.([]interface{})
+	own := -1
+	for i, m := range arr {
+		if isOurGroup(m) {
+			own = i
+			break
+		}
+	}
+	if own < 0 {
+		return append(stripOurHooks(existing), group)
+	}
+	// Groups before own keep their index: none of them holds only paircli
+	// hooks, so stripping drops none (except an already-empty group, which
+	// installs have always dropped).
+	out := stripOurHooks(arr[:own])
+	out = append(out, group)
+	return append(out, stripOurHooks(arr[own+1:])...)
+}
+
+// isOurGroup reports whether m is a matcher group whose hooks are all
+// paircli's own (and there is at least one).
+func isOurGroup(m interface{}) bool {
+	mm, ok := m.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	hooksList, _ := mm["hooks"].([]interface{})
+	if len(hooksList) == 0 {
+		return false
+	}
+	for _, h := range hooksList {
+		hm, ok := h.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		if cmd, _ := hm["command"].(string); !strings.Contains(cmd, hookMarker) {
+			return false
+		}
+	}
+	return true
 }
 
 // removeOurHooks is stripOurHooks with a nil (not empty-slice) result when
@@ -530,6 +585,11 @@ type hookStdinPayload struct {
 // logged to ~/.paircli/hook-errors.log so a broken hook can never break the
 // calling agent.
 func RunHookEvent(event string, stdin io.Reader) error {
+	if event == "SessionStart" {
+		// Installer-path machines only (init.json); a no-op otherwise.
+		maintain.MaybeStart()
+	}
+
 	var payload hookStdinPayload
 	if err := json.NewDecoder(stdin).Decode(&payload); err != nil {
 		logHookError(fmt.Errorf("codex: decode hook stdin for %s: %w", event, err))

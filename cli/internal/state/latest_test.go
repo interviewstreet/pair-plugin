@@ -1,8 +1,11 @@
 package state
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLatest_ANewerClaimEndsTheOlderOne(t *testing.T) {
@@ -122,4 +125,24 @@ func TestLatest_GuardedRunsUnderTheGuardAndTouchesNoClaim(t *testing.T) {
 		t.Fatalf("the guard stayed locked: %v", err)
 	}
 	lock.Release()
+}
+
+func TestTryLockPathConflictsAndWaitLockPathTimesOut(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".bootstrap.lock")
+	held, err := TryLockPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := TryLockPath(path); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second TryLockPath = %v, want ErrLocked", err)
+	}
+	if _, err := WaitLockPath(path, 50*time.Millisecond); !errors.Is(err, ErrLocked) {
+		t.Fatalf("WaitLockPath = %v, want ErrLocked after the timeout", err)
+	}
+	held.Release()
+	again, err := WaitLockPath(path, time.Second)
+	if err != nil {
+		t.Fatalf("WaitLockPath after release = %v", err)
+	}
+	again.Release()
 }

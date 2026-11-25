@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/interviewstreet/pair-plugin/cli/internal/hooklog"
+	"github.com/interviewstreet/pair-plugin/cli/internal/maintain"
 	"github.com/interviewstreet/pair-plugin/cli/internal/model"
 	"github.com/interviewstreet/pair-plugin/cli/internal/prtrigger"
 )
@@ -228,6 +229,115 @@ func TestInstall_Idempotent(t *testing.T) {
 		cmds := commandsFor(settings, spec.Event)
 		if countMarked(cmds) != 1 {
 			t.Errorf("event %s: got %d paircli hooks after two installs, want 1 (%v)", spec.Event, countMarked(cmds), cmds)
+		}
+	}
+}
+
+// pairCommandAt returns the command of the first hook in event's group g.
+func pairCommandAt(t *testing.T, settings map[string]interface{}, event string, g int) string {
+	t.Helper()
+	groups := eventGroups(settings, event)
+	if g >= len(groups) {
+		t.Fatalf("%s has %d groups, want index %d", event, len(groups), g)
+	}
+	hooksList, _ := groups[g].(map[string]interface{})["hooks"].([]interface{})
+	if len(hooksList) == 0 {
+		t.Fatalf("%s group %d has no hooks", event, g)
+	}
+	cmd, _ := hooksList[0].(map[string]interface{})["command"].(string)
+	return cmd
+}
+
+// A user group after paircli's must not make a re-run move paircli's group:
+// Codex keys hook trust by group index, so a move asks for a new review.
+func TestInstall_RerunKeepsGroupBeforeUserHookAndFile(t *testing.T) {
+	home := t.TempDir()
+	path := settingsPathIn(t, home)
+
+	if err := InstallHooks(); err != nil {
+		t.Fatalf("InstallHooks (1st): %v", err)
+	}
+	settings := readTestSettings(t, path)
+	hooksRaw := settings["hooks"].(map[string]interface{})
+	for _, event := range []string{"SessionStart", "PostToolUse"} {
+		hooksRaw[event] = append(hooksRaw[event].([]interface{}), map[string]interface{}{
+			"hooks": []interface{}{map[string]interface{}{"type": "command", "command": "other-tool " + event}},
+		})
+	}
+	seeded, err := json.MarshalIndent(settings, "", "    ") // not paircli's own formatting
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(seeded))
+
+	if err := InstallHooks(); err != nil {
+		t.Fatalf("InstallHooks (2nd): %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, seeded) {
+		t.Errorf("a no-op re-run rewrote the file:\n%s\nwant:\n%s", got, seeded)
+	}
+	for _, event := range []string{"SessionStart", "PostToolUse"} {
+		if cmd := pairCommandAt(t, readTestSettings(t, path), event, 0); !strings.Contains(cmd, hookMarker) {
+			t.Errorf("%s group 0 = %q, want paircli's hook", event, cmd)
+		}
+	}
+}
+
+// A new binary path rewrites paircli's group where it stands.
+func TestInstall_NewBinaryPathRewritesGroupInPlace(t *testing.T) {
+	home := t.TempDir()
+	path := settingsPathIn(t, home)
+	writeFile(t, path, `{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "other-tool first"}]},
+      {"hooks": [{"type": "command", "command": "/old/path/paircli hook claude-code SessionStart", "timeout": 10}]},
+      {"hooks": [{"type": "command", "command": "other-tool last"}]}
+    ]
+  }
+}`)
+
+	if err := InstallHooks(); err != nil {
+		t.Fatalf("InstallHooks: %v", err)
+	}
+	settings := readTestSettings(t, path)
+	if cmd := pairCommandAt(t, settings, "SessionStart", 0); cmd != "other-tool first" {
+		t.Errorf("group 0 = %q, want other-tool first", cmd)
+	}
+	if cmd := pairCommandAt(t, settings, "SessionStart", 1); strings.Contains(cmd, "/old/path/") || !strings.Contains(cmd, hookMarker) {
+		t.Errorf("group 1 = %q, want the current paircli binary", cmd)
+	}
+	if cmd := pairCommandAt(t, settings, "SessionStart", 2); cmd != "other-tool last" {
+		t.Errorf("group 2 = %q, want other-tool last", cmd)
+	}
+}
+
+// However many paircli entries an event has (an older install, or both the
+// plugin and the installer having run), one install leaves exactly one.
+func TestInstall_CollapsesDuplicatePairEntries(t *testing.T) {
+	home := t.TempDir()
+	path := settingsPathIn(t, home)
+	writeFile(t, path, `{
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/a/paircli hook claude-code Stop"}]},
+      {"hooks": [{"type": "command", "command": "other-tool stop"}, {"type": "command", "command": "/b/paircli hook claude-code Stop"}]},
+      {"hooks": [{"type": "command", "command": "/c/paircli hook claude-code Stop"}]}
+    ]
+  }
+}`)
+
+	for run := 0; run < 2; run++ {
+		if err := InstallHooks(); err != nil {
+			t.Fatalf("InstallHooks: %v", err)
+		}
+		cmds := commandsFor(readTestSettings(t, path), "Stop")
+		if countMarked(cmds) != 1 || len(cmds) != 2 {
+			t.Errorf("run %d: Stop commands = %v, want other-tool's and one paircli hook", run, cmds)
 		}
 	}
 }
@@ -804,5 +914,58 @@ func TestRunHookEvent_PostToolUse_StartFailureIsLoggedNotPrinted(t *testing.T) {
 	logData, err := os.ReadFile(filepath.Join(home, ".paircli", "hook-errors.log"))
 	if err != nil || !strings.Contains(string(logData), "fork failed") {
 		t.Errorf("hook-errors.log = %q, %v, want the start failure", logData, err)
+	}
+}
+
+// spawnRecorder replaces maintain.Spawn and counts its calls.
+func spawnRecorder(t *testing.T) *int {
+	t.Helper()
+	n := 0
+	orig := maintain.Spawn
+	t.Cleanup(func() { maintain.Spawn = orig })
+	maintain.Spawn = func() error { n++; return nil }
+	return &n
+}
+
+// SessionStart starts maintain only on an enrolled machine, at most once a day.
+func TestRunHookEvent_SessionStartStartsMaintainOnlyWhenDue(t *testing.T) {
+	setupHookEnv(t)
+	spawned := spawnRecorder(t)
+	start := func() {
+		if err := RunHookEvent("SessionStart", strings.NewReader(`{"session_id":"s1","cwd":"/tmp"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start()
+	if *spawned != 0 {
+		t.Fatal("maintain started without init.json")
+	}
+	if err := os.MkdirAll(filepath.Dir(maintain.InitPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(maintain.InitPath(), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := maintain.WriteStamp(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	start()
+	if *spawned != 0 {
+		t.Fatal("maintain started with a fresh stamp")
+	}
+	if err := maintain.WriteStamp(time.Now().Add(-25 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	start()
+	if *spawned == 0 {
+		t.Fatal("maintain not started with a stale stamp")
+	}
+	before := *spawned
+	if err := RunHookEvent("Stop", strings.NewReader(`{"session_id":"s1","cwd":"/tmp"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if *spawned != before {
+		t.Error("an event other than SessionStart started maintain")
 	}
 }
