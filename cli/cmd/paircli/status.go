@@ -90,7 +90,7 @@ func setupNotes(steps map[string]string) []string {
 		notes = append(notes, p)
 	}
 	if strings.Contains(steps["codex_trust"], "revoked in /hooks") {
-		notes = append(notes, "Codex trust for Pair hooks was revoked in `/hooks`; run `~/.paircli/bin/paircli init` to grant it again")
+		notes = append(notes, "Codex trust for Pair hooks was revoked in `/hooks`; run `"+installedBinaryHint()+" init` to grant it again")
 	}
 	for _, name := range harnessOrder {
 		if outcome := steps["hooks:"+name]; strings.HasPrefix(outcome, "failed") {

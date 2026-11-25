@@ -166,3 +166,21 @@ func TestMaintain_ReleasesTheLockBeforeReExecAfterAnUpdate(t *testing.T) {
 		t.Errorf("setup update step = %q, want the update recorded", got)
 	}
 }
+
+// maintain keeps to the one agent `init --harness` chose.
+func TestMaintain_KeepsInitsHarnessScope(t *testing.T) {
+	calls, _ := maintainEnv(t)
+	if _, err := runInitArgs(t, "--harness", "codex", "--no-login"); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := readInitRecord(); rec.Scope != "codex" {
+		t.Fatalf("init.json scope = %q, want codex", rec.Scope)
+	}
+	*calls = nil
+	if err := maintainRun(nil, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(*calls, ","), "hooks:codex") {
+		t.Errorf("calls = %v, want hooks installed for codex only", *calls)
+	}
+}

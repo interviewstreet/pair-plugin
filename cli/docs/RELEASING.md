@@ -57,7 +57,7 @@ Later session-start setup runs the ordinary CLI updater. PR creation/push
 hooks still use the installed binary; they do not rebuild or unconditionally
 download it. The updater refuses revoked releases, observes plugin
 compatibility, and supports `paircli update --check`. Homebrew-managed
-executables retain the existing `brew upgrade paircli` behavior; plugin
+executables are left to `brew upgrade` (the formula is `pair`); plugin
 bootstrap manages only its own path under `~/.paircli/bin`.
 
 Only the CLI updater supports the existing `PAIRCLI_UPDATE_MANIFEST_URL`

@@ -120,7 +120,7 @@ and runs `paircli init --install-self <dir>`. init:
 6. checks `gh` and tells you if `gh auth login` or installing `gh` is still needed.
 
 init never re-approves a Codex hook you revoked or disabled in `/hooks`, except when you run
-`~/.paircli/bin/paircli init` yourself. Run it again at any time; it only fixes what is missing.
+`~/.paircli/bin/paircli init` yourself from a terminal (a disabled hook is never re-approved). Run it again at any time; it only fixes what is missing.
 
 On a machine init set up, Pair's own SessionStart hook (Claude Code or Codex) starts
 `paircli maintain` in the background at most once every 24 hours (`~/.paircli/state/maintain.json`). It

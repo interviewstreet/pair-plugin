@@ -82,9 +82,11 @@ func maintainRun(args []string, w io.Writer) error {
 
 	// The login step does nothing with a credential; without one it opens
 	// the Pair login, as the plugin's session start does.
+	// Keep to the agent `init --harness` chose, if it chose one.
+	rec, _ := readInitRecord()
 	err = runSetupSteps(setupArgs{
-		UpdateOutcome: update,
-		PerAgent:      true, GrantCodexTrust: true, Enroll: true,
+		Harness: rec.Scope, UpdateOutcome: update,
+		PerAgent: true, GrantCodexTrust: true, Enroll: true,
 	}, log, io.Discard)
 	if stampErr := maintain.WriteStamp(time.Now()); stampErr != nil {
 		fmt.Fprintf(log, "paircli: maintain: could not write %s: %v\n", maintain.StampPath(), stampErr)

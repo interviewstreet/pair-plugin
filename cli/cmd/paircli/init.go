@@ -124,10 +124,13 @@ func initRun(args []string, w io.Writer) error {
 		fmt.Fprintf(w, "Pair: could not record the installed binary: %v\n", err)
 	}
 	r := &initReporter{w: w}
+	// Only a person at a terminal re-running init is asking again for Codex
+	// trust they revoked; an MDM's recurring run (no terminal) never is (D1).
+	interactive := initHasTTY()
 	err = runSetupSteps(setupArgs{
 		Harness: a.Harness, NoLogin: a.NoLogin,
-		GrantCodexTrust: true, Enroll: true, PerAgent: true, ExplicitTrust: true,
-		NoBrowser: !initHasTTY(), Progress: w, Report: r.report,
+		GrantCodexTrust: true, Enroll: true, PerAgent: true, ExplicitTrust: interactive,
+		NoBrowser: !interactive, Progress: w, Report: r.report,
 	}, io.Discard, io.Discard)
 	if err != nil {
 		s := readSetupStatus()

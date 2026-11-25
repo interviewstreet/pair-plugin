@@ -78,8 +78,8 @@ func TestInit_CompletesEveryStepAndEnrolls(t *testing.T) {
 	if got := strings.Join(*calls, ","); got != "update:,login:https://pair.example" {
 		t.Errorf("calls = %s, want update and login (hooks are per agent)", got)
 	}
-	if len(*trustCalls) != 1 || !(*trustCalls)[0] {
-		t.Errorf("trust calls = %v, want one explicit grant", *trustCalls)
+	if len(*trustCalls) == 0 || (*trustCalls)[len(*trustCalls)-1] {
+		t.Errorf("trust calls = %v, want a non-explicit grant without a terminal", *trustCalls)
 	}
 	rec, err := readInitRecord()
 	if err != nil {
@@ -487,5 +487,20 @@ func TestInit_RecordsOnlyAHomebrewBinary(t *testing.T) {
 	}
 	if _, err := os.Stat(installRecordPath()); !os.IsNotExist(err) {
 		t.Errorf("install.json written for a non-Homebrew binary: %v", err)
+	}
+}
+
+// Only a person at a terminal re-running init asks again for Codex trust they
+// revoked; an MDM's recurring run (no terminal) must not override it (D1).
+func TestInit_RegrantsRevokedTrustOnlyFromATerminal(t *testing.T) {
+	for _, tty := range []bool{false, true} {
+		_, trustCalls := initEnv(t)
+		initHasTTY = func() bool { return tty }
+		if _, err := runInitArgs(t); err != nil {
+			t.Fatal(err)
+		}
+		if len(*trustCalls) == 0 || (*trustCalls)[len(*trustCalls)-1] != tty {
+			t.Errorf("tty=%v: trust calls = %v, want explicit=%v", tty, *trustCalls, tty)
+		}
 	}
 }

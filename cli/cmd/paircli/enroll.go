@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"time"
 
@@ -18,7 +17,10 @@ import (
 type initRecord struct {
 	SchemaVersion int               `json:"schema_version"`
 	Harnesses     map[string]string `json:"harnesses"`
-	CodexTrust    string            `json:"codex_trust,omitempty"`
+	// Scope is the one harness `init --harness` set up, "" for every
+	// detected one; maintain keeps to it.
+	Scope      string `json:"scope,omitempty"`
+	CodexTrust string `json:"codex_trust,omitempty"`
 	// CodexPath is the codex binary init resolved, tried first later: a
 	// SessionStart hook's PATH can be narrower than the user's shell.
 	CodexPath string `json:"codex_path,omitempty"`
@@ -85,7 +87,3 @@ func grantCodexTrust(r *initRecord, explicit bool) (outcome string, trusted bool
 	r.Trust = res.Record
 	return res.String(), res.Trusted
 }
-
-// errInitIncomplete is returned by init when it set up what it could but did
-// not finish; its message is already printed.
-var errInitIncomplete = errors.New("init did not finish")

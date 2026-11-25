@@ -261,6 +261,7 @@ func runSetupSteps(a setupArgs, stdout, stderr io.Writer) error {
 		if a.Harness != "" {
 			enrolment.Harnesses[a.Harness] = status.Steps["hooks"]
 		}
+		enrolment.Scope = a.Harness
 		if t := status.Steps["codex_trust"]; t != "" {
 			enrolment.CodexTrust = t
 		}
