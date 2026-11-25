@@ -42,6 +42,8 @@ func main() {
 		err = runDoctor(os.Args[2:])
 	case "update":
 		err = runUpdate(os.Args[2:])
+	case "uninstall":
+		err = runUninstall(os.Args[2:])
 	case "version":
 		fmt.Printf("paircli %s\n", version)
 		return
@@ -85,6 +87,7 @@ Usage:
   paircli logout [flags]                    remove the stored credential
   paircli doctor                            report capture state per harness, gh, config and llm
   paircli update [flags]                    download and install the latest verified CLI release
+  paircli uninstall                         remove Pair: hooks, Codex approvals, login and ~/.paircli
   paircli version                           print the version
 
 scan flags:

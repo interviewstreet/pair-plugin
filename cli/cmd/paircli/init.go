@@ -180,6 +180,7 @@ func printInitSummary(w io.Writer, harness string) {
   - %s
   - after you log in, PR evidence (including redacted agent transcripts) is uploaded to pair.sh
     when you create or push a PR
+Uninstall any time: ~/.paircli/bin/paircli uninstall
 `, hooks)
 }
 
