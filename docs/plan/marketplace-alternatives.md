@@ -641,7 +641,7 @@ So the order a user takes them in doesn't matter:
 - **Hook-free daemon (G)**: keep it as a possible fallback for users who refuse hooks, but it captures less
   precisely and costs more to build.
 
-## 6. Decisions and open questions
+## 6. Decisions
 
 ### Decided
 
@@ -685,12 +685,15 @@ So the order a user takes them in doesn't matter:
 - **D7. Directory strategy is out of scope for this plan.** The team handles the Verified request and any
   directory conversations separately. Phase 4 stays as background only. Nothing in Phases 0–3 depends on a
   listing.
+- **D8. Windows stays out of scope.** Both paths support macOS and Linux (arm64/amd64) only. The README
+  says "on Windows, use WSL". It isn't tested or officially supported. Native Windows would be a separate
+  project.
 - **D2. Plugin's future: keep the plugin long-term.** It remains a supported path next to the installer, with
   no deprecation in any phase. Existing `pair@pair` users need to do nothing.
 
-### Open (product, copy, policy: not decided here)
+### Open
 
-6. **Windows.** Still out of scope?
+None. Every product, copy and policy question raised by this plan is decided above (D1–D8).
 
 ## Sources
 
