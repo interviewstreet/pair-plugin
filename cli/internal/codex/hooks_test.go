@@ -231,6 +231,115 @@ func TestInstall_Idempotent(t *testing.T) {
 	}
 }
 
+// pairCommandAt returns the command of the first hook in event's group g.
+func pairCommandAt(t *testing.T, settings map[string]interface{}, event string, g int) string {
+	t.Helper()
+	groups := eventGroups(settings, event)
+	if g >= len(groups) {
+		t.Fatalf("%s has %d groups, want index %d", event, len(groups), g)
+	}
+	hooksList, _ := groups[g].(map[string]interface{})["hooks"].([]interface{})
+	if len(hooksList) == 0 {
+		t.Fatalf("%s group %d has no hooks", event, g)
+	}
+	cmd, _ := hooksList[0].(map[string]interface{})["command"].(string)
+	return cmd
+}
+
+// A user group after paircli's must not make a re-run move paircli's group:
+// Codex keys hook trust by group index, so a move asks for a new review.
+func TestInstall_RerunKeepsGroupBeforeUserHookAndFile(t *testing.T) {
+	home := t.TempDir()
+	path := codexHomeIn(t, home)
+
+	if err := InstallHooks(); err != nil {
+		t.Fatalf("InstallHooks (1st): %v", err)
+	}
+	settings := readTestHooks(t, path)
+	hooksRaw := settings["hooks"].(map[string]interface{})
+	for _, event := range []string{"SessionStart", "PostToolUse"} {
+		hooksRaw[event] = append(hooksRaw[event].([]interface{}), map[string]interface{}{
+			"hooks": []interface{}{map[string]interface{}{"type": "command", "command": "other-tool " + event}},
+		})
+	}
+	seeded, err := json.MarshalIndent(settings, "", "    ") // not paircli's own formatting
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(seeded))
+
+	if err := InstallHooks(); err != nil {
+		t.Fatalf("InstallHooks (2nd): %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, seeded) {
+		t.Errorf("a no-op re-run rewrote the file:\n%s\nwant:\n%s", got, seeded)
+	}
+	for _, event := range []string{"SessionStart", "PostToolUse"} {
+		if cmd := pairCommandAt(t, readTestHooks(t, path), event, 0); !strings.Contains(cmd, hookMarker) {
+			t.Errorf("%s group 0 = %q, want paircli's hook", event, cmd)
+		}
+	}
+}
+
+// A new binary path rewrites paircli's group where it stands.
+func TestInstall_NewBinaryPathRewritesGroupInPlace(t *testing.T) {
+	home := t.TempDir()
+	path := codexHomeIn(t, home)
+	writeFile(t, path, `{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "other-tool first"}]},
+      {"hooks": [{"type": "command", "command": "/old/path/paircli hook codex SessionStart", "timeout": 10}]},
+      {"hooks": [{"type": "command", "command": "other-tool last"}]}
+    ]
+  }
+}`)
+
+	if err := InstallHooks(); err != nil {
+		t.Fatalf("InstallHooks: %v", err)
+	}
+	settings := readTestHooks(t, path)
+	if cmd := pairCommandAt(t, settings, "SessionStart", 0); cmd != "other-tool first" {
+		t.Errorf("group 0 = %q, want other-tool first", cmd)
+	}
+	if cmd := pairCommandAt(t, settings, "SessionStart", 1); strings.Contains(cmd, "/old/path/") || !strings.Contains(cmd, hookMarker) {
+		t.Errorf("group 1 = %q, want the current paircli binary", cmd)
+	}
+	if cmd := pairCommandAt(t, settings, "SessionStart", 2); cmd != "other-tool last" {
+		t.Errorf("group 2 = %q, want other-tool last", cmd)
+	}
+}
+
+// However many paircli entries an event has (an older install, or both the
+// plugin and the installer having run), one install leaves exactly one.
+func TestInstall_CollapsesDuplicatePairEntries(t *testing.T) {
+	home := t.TempDir()
+	path := codexHomeIn(t, home)
+	writeFile(t, path, `{
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/a/paircli hook codex Stop"}]},
+      {"hooks": [{"type": "command", "command": "other-tool stop"}, {"type": "command", "command": "/b/paircli hook codex Stop"}]},
+      {"hooks": [{"type": "command", "command": "/c/paircli hook codex Stop"}]}
+    ]
+  }
+}`)
+
+	for run := 0; run < 2; run++ {
+		if err := InstallHooks(); err != nil {
+			t.Fatalf("InstallHooks: %v", err)
+		}
+		cmds := commandsFor(readTestHooks(t, path), "Stop")
+		if countMarked(cmds) != 1 || len(cmds) != 2 {
+			t.Errorf("run %d: Stop commands = %v, want other-tool's and one paircli hook", run, cmds)
+		}
+	}
+}
+
 func TestInstall_InvalidJSON(t *testing.T) {
 	home := t.TempDir()
 	path := codexHomeIn(t, home)
