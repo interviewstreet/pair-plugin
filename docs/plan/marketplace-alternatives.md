@@ -216,14 +216,29 @@ What happens automatically:
 
 1. **Binary.**
    - `install.sh` only fetches and verifies, using the same checks as `bootstrap.py`: manifest schema, revoked
-     list, exact release URL, SHA-256 and size cap. It skips the plugin-only `min_plugin_version` check. It
-     downloads into a `mktemp -d` directory.
+     list, exact release URL, SHA-256 and size cap. It downloads into a `mktemp -d` directory.
+   - **`min_plugin_version` is still enforced wherever a plugin has run.**
+     - `setup` now saves the `--plugin-version` it receives to `~/.paircli/state/plugin.json`
+       (`{version, seen_at}`). This is an additive write; `setup`'s behaviour is otherwise unchanged.
+     - `install.sh` reads that file. If it exists, `install.sh` rejects a manifest whose `min_plugin_version`
+       is above the saved version. This is `bootstrap.py`'s `select_artifact` rule, and it leaves the current
+       binary in place. The check is skipped only when no plugin has ever run on the machine.
+     - `maintain` passes the same saved version to `selfupdate.Run` as `PluginVersion`. So neither new path can
+       install a binary that an older plugin bootstrap wasn't built to drive.
    - It then hands off to the verified binary: `"$tmp/paircli" init --install-self …`. The **Go binary**
      installs itself:
-     - it takes `.bootstrap.lock` with `flock`, the same lock and the same syscall as `bootstrap.py`'s
-       `fcntl.flock`;
-     - it renames itself atomically into `~/.paircli/bin/paircli` and writes `release-source.json`;
-     - then it re-execs the installed copy.
+     - it takes `~/.paircli/bin/.bootstrap.lock`, the same file and the same `flock` syscall as
+       `bootstrap.py:150`'s `fcntl.flock`. That file isn't under `state/locks`, so this needs a small
+       path-based `state.WaitLockPath(path, timeout)`.
+     - It waits up to 330 s, which covers `bootstrap.py`'s 300 s download limit plus margin. If the lock is
+       still taken, it exits 4 with "another Pair install is running (log: `~/.paircli/logs/bootstrap-*.log`);
+       re-run in a few minutes". It never exits 0.
+     - It **copies** itself into a temp file *inside* `~/.paircli/bin` and then renames that file over
+       `paircli`, the way `selfupdate`'s `downloadAndReplace` does (`CreateTemp(filepath.Dir(executable))`).
+       A direct rename from `mktemp -d` would fail with EXDEV where `/tmp` is tmpfs (Fedora, Arch, Debian 13).
+     - It writes `release-source.json`.
+     - It removes the `mktemp` directory, whose path is passed as `--install-self <dir>`.
+     - Then it re-execs the installed copy.
    - So a plugin bootstrap and the installer can never both replace the binary. The shell script stays small,
      and needs no portable `flock(1)` (macOS doesn't ship one).
    - **Already installed:** `install.sh` first reads only `latest.json`. If the existing binary has the plugin's
@@ -234,7 +249,7 @@ What happens automatically:
      - a process never holds `.bootstrap.lock` while waiting for the setup lock;
      - `--install-self` takes `.bootstrap.lock`, installs, and **releases it** before any setup step runs;
      - `selfupdate.Run`, which already runs under the setup lock, now also takes `.bootstrap.lock` with
-       `TryLock` before replacing the binary. If it's taken, the update step is skipped as a tolerated
+       `state.TryLockPath` before replacing the binary. If it's taken, the update step is skipped as a tolerated
        outcome ("another install in progress").
      - `bootstrap.py` already takes `.bootstrap.lock` alone and releases it before running `setup`.
 
@@ -242,8 +257,8 @@ What happens automatically:
    - Truncation: the whole script is a `main` function called on its last line, so a partial download runs
      nothing.
 2. **Agent detection, through the existing setup.**
-   - `init` is a thin wrapper around `setupRun` with two new flags: `--grant-codex-trust` and `--enroll`.
-     There's no parallel lifecycle.
+   - `init` is a thin wrapper around the existing setup steps (`runSetupSteps`, below) with two new flags:
+     `--grant-codex-trust` and `--enroll`. There's no parallel lifecycle.
    - Agent detection is the existing `installAllHarnesses` (`harnessOrder`). Agents that aren't installed are
      skipped and picked up later (step 6).
    - **Interactivity.** Under `curl … | sh`, stdin is the pipe. So `init` decides whether it's interactive by
@@ -269,8 +284,9 @@ What happens automatically:
      found, record `codex_trust: "skipped: codex binary not found"` in `setup.json` and in `doctor`, and print
      today's `/hooks` message.
    - **Scope:** start `codex app-server` and call `hooks/list` for `$CODEX_HOME`. `hooks/list` has no
-     source-file field. So pick only entries whose trust key, after normalizing, starts with Pair's
-     `hooks.json` path (the same normalization Orca uses, compared through `expectedTrustKeys`) **and** whose
+     source-file field. So compute the **exact expected keys** from the existing `ourHookPositions()`
+     (`cli/internal/codex/hooks.go:248`), as `<hooks.json>:<event>:<group>:<index>`. Normalize them the way
+     Orca does with `expectedTrustKeys`. Pick only listed entries whose key is in that set **and** whose
      `command` exactly equals the per-event command `InstallHooks` just wrote. The number picked must equal `len(hookEvents)`, keyed by event. Otherwise **refuse**: grant
      nothing, and report "found N Pair hook entries, expected M".
    - **Grant:** call `config/batchWrite` with `trusted_hash = currentHash`, using the hash and key exactly as
@@ -301,7 +317,11 @@ What happens automatically:
      is needed (Phase 3, Q2).
 6. **Auto-update and self-repair, for installer users only.**
    - `init --enroll` writes `~/.paircli/state/init.json` with `{schema_version, harnesses, codex_trust,
-     enrolled_at}`.
+     enrolled_at}`. It writes the file atomically, **only after the hooks step and the login succeed**. The
+     trust outcome is recorded, whether it was granted or fell back.
+     - If either step fails, no marker is written, `init` exits non-zero, and re-running the one command
+       starts over. So a partial enrolment is never ambiguous.
+     - `maintain` later updates the same file, for example new grants or new harnesses.
    - The installed Claude/Codex `SessionStart` hook handler starts a detached `paircli maintain` **only when
      `init.json` exists**, at most once every 24 h. The throttle uses its own timestamp in
      `~/.paircli/state/maintain.json`, not `setup.json`, which the plugin's bootstrap rewrites every session.
@@ -427,8 +447,20 @@ So the order a user takes them in doesn't matter:
   - `cli/internal/codex/trust_test.go` (fake app-server): an entry the user revoked (hash recorded in
     `init.json`, now untrusted) gets no write from `maintain`. An `enabled: false` entry is never granted.
     An explicit `init` re-grants the revoked entry.
-  - `cli/internal/selfupdate/update_test.go`: with `.bootstrap.lock` held, the update is skipped as a
-    tolerated outcome and the binary is untouched.
+  - `cli/internal/selfupdate/update_test.go`:
+    - With `~/.paircli/bin/.bootstrap.lock` held (the exact file `bootstrap.py` uses), the update is skipped
+      as a tolerated outcome and the binary is untouched.
+    - A manifest whose `min_plugin_version` is above the saved `plugin.json` version is refused.
+  - `--install-self` tests in `cli/cmd/paircli`:
+    - the rename seam fails with EXDEV, or the source is on another filesystem → the copy-then-rename path
+      still installs;
+    - `.bootstrap.lock` is held past the wait → exit 4, binary untouched;
+    - the `mktemp` directory is removed.
+  - `cli/cmd/paircli/maintain_test.go`:
+    - setup lock taken → skip, `maintain.json` not written;
+    - the update step reports "updated" → the lock is released before the re-exec seam is called, and
+      `--after-update` runs the hook and trust steps;
+    - no `plugin.json` → no plugin version passed; with it → the saved version is passed.
   - `cli/internal/claudecode/hooks_test.go` and `cli/internal/codex/hooks_test.go`, SessionStart case: no
     `init.json` → the maintain spawner seam isn't called. With `init.json` and a fresh timestamp → not called.
     With a stale one → called.
@@ -486,6 +518,11 @@ So the order a user takes them in doesn't matter:
 - `cli/internal/codex/hooks.go` `parseTrustedKeys` (used by `doctor`): compare against the trust keys as
   Codex reports them through `hooks/list` when Codex is available. Orca normalizes the path part. Fall back to
   today's raw-path parsing.
+- `cli/internal/claudecode/hooks.go` and `cli/internal/codex/hooks.go`: write only when something changed, and
+  keep the position of Pair's group (§5.1 coexistence requirements). Same entries, same events. This is in
+  **Phase 1** because the trust grant ships here: every move of Pair's group changes its Codex trust keys,
+  and the keys of the user's own hooks after it. Without `maintain` (Phase 2), nothing would grant the trust
+  again.
 - `cli/cmd/paircli/uninstall.go` (new): the full uninstall in §5.1. It also removes `init.json` and
   `maintain.json`. It doesn't shell out to detect the plugin. It always prints the two plugin uninstall
   commands as a reminder.
@@ -501,8 +538,6 @@ So the order a user takes them in doesn't matter:
 - `cli/cmd/paircli/maintain.go` (new, small): `TryLock("setup")` → update step → if updated, release the lock
   and re-exec `maintain --after-update` → `runSetupSteps` with `--no-login --grant-codex-trust` → write the
   timestamp. Logged to `~/.paircli/logs/maintain-*.log`.
-- `cli/internal/claudecode/hooks.go` and `cli/internal/codex/hooks.go`: write only when something changed, and
-  keep the position of Pair's group (§5.1 coexistence requirements). Same entries, same events.
 - `plugins/pair/hooks/bootstrap.py`: no change. It keeps working for every plugin user. The plugin and the
   installer write the same idempotent state, so a user who has both is fine (§5.1).
 - `cli/internal/deviceauth`: QR or plain URL when there's no browser. Prefill is already there.
@@ -553,7 +588,9 @@ So the order a user takes them in doesn't matter:
    - the CLI;
    - hooks in which agents;
    - Codex trust granted on the user's behalf (D1);
-   - that transcripts are uploaded after login.
+   - that transcripts are uploaded after login;
+   - that later, `maintain` adds hooks and grants Codex trust automatically if Codex is installed after
+     enrolment. The user isn't asked again at that point, so the up-front copy has to cover it.
 
    Is a printed summary enough, or do we need an explicit `[Y/n]` (skipped by `--yes`)? There are also wording
    questions for the "Done" line and for the `gh` prompt.
