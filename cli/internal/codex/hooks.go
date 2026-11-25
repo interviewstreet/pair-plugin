@@ -1,10 +1,11 @@
 // Package codex also manages paircli's Codex CLI hook integration ("Path A"):
 // installing/uninstalling hook commands in $CODEX_HOME/hooks.json and
 // handling the events those hooks invoke (`paircli hook codex <Event>`).
-// It deliberately never writes Codex's hook-trust approvals
-// (config.toml's [hooks.state."…"] entries): only Codex itself, after the
-// user reviews a new or changed hook, may do that. See
-// docs/plan/tasks/T20-codex-hooks.md.
+// Installing hooks never writes Codex's hook-trust approvals (config.toml's
+// [hooks.state."…"] entries). Trust is written only by GrantTrust, only when
+// `paircli init` or `paircli maintain` asks for it, and only through Codex's
+// own app-server trust RPCs with the hash Codex computed (trust.go); `paircli
+// setup`, which the plugin runs, never asks. See docs/plan/tasks/T20-codex-hooks.md.
 package codex
 
 import (
@@ -350,7 +351,8 @@ func parseTrustedKeys(path string) map[string]bool {
 // HookTrustState does a read-only scan of config.toml and reports how many
 // of paircli's current hooks.json hook entries Codex has recorded a
 // trusted_hash for (trusted), out of how many paircli hooks currently exist
-// in hooks.json (total). paircli never writes to config.toml itself.
+// in hooks.json (total). It is the fallback when no codex binary can answer
+// PairHookTrust; paircli never writes config.toml directly.
 func HookTrustState() (trusted, total int) {
 	positions, err := ourHookPositions()
 	if err != nil || len(positions) == 0 {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,9 +25,23 @@ import (
 // doctorRun and doctorLookPath are the only ways doctor touches the outside
 // world, so tests can run it without a gh binary or a claude CLI.
 var (
-	doctorRun      = func(name string, args ...string) error { return exec.Command(name, args...).Run() }
-	doctorLookPath = exec.LookPath
+	doctorRun        = func(name string, args ...string) error { return exec.Command(name, args...).Run() }
+	doctorLookPath   = exec.LookPath
+	doctorCodexTrust = codexTrustCount
 )
+
+// codexTrustCount reports how many of Pair's Codex hooks are trusted. It asks
+// Codex itself (hooks/list) when a codex binary is found, which matches the
+// trust keys exactly as Codex computes them, and otherwise reads config.toml.
+func codexTrustCount() (trusted, total int) {
+	if bin := codex.FindCodex(""); bin != "" {
+		home, _ := os.UserHomeDir()
+		if trusted, total, ok := codex.PairHookTrust(context.Background(), bin, home, version, 5*time.Second); ok {
+			return trusted, total
+		}
+	}
+	return codex.HookTrustState()
+}
 
 // runDoctor implements `paircli doctor`: one row per harness plus the state of
 // gh, the repo configuration and the LLM provider.
@@ -114,7 +129,7 @@ func doctorCodex(cfg *config.Config, since time.Time, hookDir string) doctorRow 
 	}
 	hooks := "not installed"
 	if codex.HooksInstalled() {
-		trusted, total := codex.HookTrustState()
+		trusted, total := doctorCodexTrust()
 		hooks = fmt.Sprintf("installed, %d/%d trusted", trusted, total)
 	}
 	return doctorRow{
