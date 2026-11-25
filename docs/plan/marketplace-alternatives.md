@@ -29,7 +29,9 @@ Date: 2026-11-25. Repo state: `main` @ `528b55c`.
   date whichever path installed it.
   - A new user on the installer path runs **one command** and clicks **Approve** once in the browser that
     opens.
-  - After that, Claude Code and Codex are both capturing evidence, and the install updates and repairs itself.
+  - After that, Claude Code and Codex are both capturing evidence.
+  - From Phase 2 on, the install also updates and repairs itself. After Phase 1 alone, installer users update
+    by re-running the one command.
   - Organizations get a **zero-step** managed rollout.
   - The plugin and its self-hosted marketplace stay a **supported path, long-term**. Both paths are documented
     side by side.
@@ -224,7 +226,19 @@ What happens automatically:
      - then it re-execs the installed copy.
    - So a plugin bootstrap and the installer can never both replace the binary. The shell script stays small,
      and needs no portable `flock(1)` (macOS doesn't ship one).
-   - If a migrated, current binary is already there, the install step is skipped.
+   - **Already installed:** `install.sh` first reads only `latest.json`. If the existing binary has the plugin's
+     migration marker and `~/.paircli/bin/paircli version` equals the manifest version, it skips the binary
+     download and execs the installed `init`. Otherwise (missing, unmigrated or older, including a plugin
+     user's binary from before `init` existed) it downloads, verifies and installs the new one.
+   - **Lock order** (used everywhere, so there's no deadlock):
+     - a process never holds `.bootstrap.lock` while waiting for the setup lock;
+     - `--install-self` takes `.bootstrap.lock`, installs, and **releases it** before any setup step runs;
+     - `selfupdate.Run`, which already runs under the setup lock, now also takes `.bootstrap.lock` with
+       `TryLock` before replacing the binary. If it's taken, the update step is skipped as a tolerated
+       outcome ("another install in progress").
+     - `bootstrap.py` already takes `.bootstrap.lock` alone and releases it before running `setup`.
+
+     So every binary replacement happens under `.bootstrap.lock`.
    - Truncation: the whole script is a `main` function called on its last line, so a partial download runs
      nothing.
 2. **Agent detection, through the existing setup.**
@@ -235,8 +249,14 @@ What happens automatically:
    - **Interactivity.** Under `curl … | sh`, stdin is the pipe. So `init` decides whether it's interactive by
      opening `/dev/tty`, never from stdin, and any prompt (Q1) reads `/dev/tty`. With no `/dev/tty` (CI, MDM),
      it runs non-interactively. The prompt behaviour there depends on the Q1 decision; `--yes` always works.
-   - **Setup lock.** If a plugin bootstrap or `maintain` holds it, `init` waits up to 120 s
-     (`state.WaitLock("setup", …)`). It does **not** use `setupRun`'s silent "setup already running" exit 0.
+   - **Setup lock: split, so nothing locks itself out.** `setupRun` today takes `TryLock("setup")` itself, and
+     a second flock on the same file conflicts even inside one process. So `setupRun` is split into argument
+     parsing plus `runSetupSteps(a, lock)`:
+     - `setup` keeps `TryLock` and its current "setup already running" exit 0, so the plugin path is unchanged;
+     - `init` uses `WaitLock("setup", initLockWait)`, which waits up to 120 s;
+     - `maintain` uses `TryLock`.
+
+     `initLockWait` is a package variable so tests can shorten it. `init` never uses the silent exit 0.
      If the lock stays taken, for example because the other run is waiting on a login, `init` exits 3 with
      "setup is already running in another process (log: <path>); approve the login there, then re-run". It
      never reports success without hooks, trust and a login.
@@ -248,12 +268,22 @@ What happens automatically:
    - **Find `codex`:** `$PATH` first, then the known bundled locations of the Codex desktop app. If it isn't
      found, record `codex_trust: "skipped: codex binary not found"` in `setup.json` and in `doctor`, and print
      today's `/hooks` message.
-   - **Scope:** start `codex app-server` and call `hooks/list` for `$CODEX_HOME`. Pick only entries whose
-     source file is Pair's `hooks.json` **and** whose `command` exactly equals the command `InstallHooks` just
-     wrote. The number picked must equal `len(hookEvents)`, keyed by event. Otherwise **refuse**: grant
+   - **Scope:** start `codex app-server` and call `hooks/list` for `$CODEX_HOME`. `hooks/list` has no
+     source-file field. So pick only entries whose trust key, after normalizing, starts with Pair's
+     `hooks.json` path (the same normalization Orca uses, compared through `expectedTrustKeys`) **and** whose
+     `command` exactly equals the per-event command `InstallHooks` just wrote. The number picked must equal `len(hookEvents)`, keyed by event. Otherwise **refuse**: grant
      nothing, and report "found N Pair hook entries, expected M".
    - **Grant:** call `config/batchWrite` with `trusted_hash = currentHash`, using the hash and key exactly as
-     Codex reported them, only for picked entries that aren't trusted yet. Already trusted means no write.
+     Codex reported them. Already trusted means no write.
+   - **Respect the user's own choices.** `init.json` records each granted `{key, hash}`.
+     - `maintain` grants only a picked entry whose `(key, currentHash)` isn't in that record, meaning this run
+       wrote it or changed it.
+     - It **never** grants an entry reported `enabled: false`. It also never re-grants an entry whose hash is
+       already in the record but which is untrusted now: the user revoked it.
+     - `doctor` and `status` report "Codex trust for Pair hooks was revoked in `/hooks`; run `paircli init`
+       to grant it again".
+     - An explicit `paircli init` re-run is the user asking again, so it grants anything picked that isn't
+       disabled.
    - **Verify:** call `hooks/list` again. Every picked entry must report trusted. If not, report
      `verify-failed: <reason>` (Orca's `post-grant-untrusted` class) and print the `/hooks` message.
    - **Old Codex:** a Codex whose `hooks/list` reports no hash or status (before the trust API, about 0.129)
@@ -280,10 +310,17 @@ What happens automatically:
      - self-updates;
      - adds hooks and trust for an agent installed after enrolment;
      - repairs removed or stale entries.
-   - After a self-update, `maintain` **re-execs the new binary** before installing hooks, so new hook formats
-     come from new code.
-   - It takes the setup lock with `TryLock`. If the lock is taken, it skips and leaves the timestamp unset, so
-     the next session retries.
+   - `maintain` takes `TryLock("setup")`. If the lock is taken, it skips and leaves the timestamp unset, so the
+     next session retries. Holding the lock, it runs only the update step.
+   - If that step installed a new binary, it **releases the lock and then re-execs** the new binary as
+     `paircli maintain --after-update`. (A Go flock doesn't survive `exec`, because files are `O_CLOEXEC`.)
+     The re-exec takes `TryLock` again and runs the hook and trust steps with the new code.
+   - If it loses the lock in that gap, the next session retries. Nothing is half-applied, because each step is
+     idempotent.
+   - **Trigger coverage:** `maintain` starts from Pair's own SessionStart hook in *any* enrolled agent, and it
+     repairs every detected agent. If an agent's Pair hooks are no longer trusted or have been removed, a
+     session in the *other* agent still repairs them. A user with only Codex whose Pair hooks became untrusted
+     has no trigger left. `doctor`/`status` flag that state, and re-running the one command fixes it.
    - It never blocks a session. Failures are recorded in `setup.json` and shown by `paircli status` and
      `doctor`, not swallowed.
 7. **Prerequisites.**
@@ -318,8 +355,9 @@ What happens automatically:
 So the order a user takes them in doesn't matter:
 
 - **Plugin first, then installer.**
-  - `install.sh` sees a binary that has already migrated and is up to date, so it doesn't download it again
-    (the same check as `uses_plugin_release`).
+  - `install.sh` reads `latest.json`. If the plugin's binary is migrated and at the latest version, it skips the
+    binary download. Otherwise (for example an older binary without `init`), it installs the newer verified
+    binary under `.bootstrap.lock` (step 1).
   - `init` → `setupRun` re-merges the hooks. This is a no-op: there's still exactly one Pair entry per event.
   - The login is already valid, so it's skipped.
   - The user ends up with what they already had, plus Codex trust granted by `init` (D1).
@@ -348,7 +386,9 @@ So the order a user takes them in doesn't matter:
 3. Setup runs one at a time (`state.TryLock("setup")`). `maintain` takes the same lock and runs only for
    enrolled machines, on its own 24 h timestamp. `init` waits on the lock rather than silently skipping. Binary
    replacement by the plugin bootstrap, the installer, or self-update happens only under `.bootstrap.lock` or
-   the setup lock. So a plugin session start, `maintain` and `init` never update at the same time.
+   the setup lock. With the lock order in step 1, every binary replacement (bootstrap, `--install-self`,
+   `selfupdate`) happens under `.bootstrap.lock`. Setup steps happen under the setup lock. So no two processes
+   replace the binary or rewrite hook config at the same time.
 
 **Coexistence requirements the new code must meet (Phases 1–2):**
 
@@ -379,8 +419,16 @@ So the order a user takes them in doesn't matter:
     byte and Pair's group keeps its index. This fails on `main`, because `installEvent` re-appends Pair's
     group. A file without a following user group would pass on `main` (`MarshalIndent` sorts keys), so that
     case alone proves nothing. Also: "install in either order → one Pair entry per event".
-  - `cli/cmd/paircli/setup_test.go`: with the lock held, `init` waits and then exits 3 with the log path.
-    Setup without `--grant-codex-trust` never calls the trust seam.
+  - `cli/cmd/paircli/setup_test.go`, with a short `initLockWait`:
+    - `init` with no contention completes all steps. This catches a lock that locks itself out.
+    - With the lock held elsewhere, `init` waits, then exits 3 with the log path.
+    - `setup` with the lock held still exits 0 with "already running" (unchanged).
+    - Setup without `--grant-codex-trust` never calls the trust seam.
+  - `cli/internal/codex/trust_test.go` (fake app-server): an entry the user revoked (hash recorded in
+    `init.json`, now untrusted) gets no write from `maintain`. An `enabled: false` entry is never granted.
+    An explicit `init` re-grants the revoked entry.
+  - `cli/internal/selfupdate/update_test.go`: with `.bootstrap.lock` held, the update is skipped as a
+    tolerated outcome and the binary is untouched.
   - `cli/internal/claudecode/hooks_test.go` and `cli/internal/codex/hooks_test.go`, SessionStart case: no
     `init.json` → the maintain spawner seam isn't called. With `init.json` and a fresh timestamp → not called.
     With a stale one → called.
@@ -417,10 +465,13 @@ So the order a user takes them in doesn't matter:
   It passes `--yes`, `--no-login`, `--token` and `--harness` through. Test-only overrides
   (`PAIR_INSTALL_MANIFEST_URL`, `PAIR_INSTALL_RELEASE_PREFIX`) let tests point at a fake server. They're
   documented as test-only, and they're refused unless `PAIR_INSTALL_TEST=1` is set.
-- `.github/workflows/release.yml`: attach `install.sh` and its checksum to each release. Serve
+- `.github/workflows/release.yml`: attach `install.sh` to each release, and include it in the existing
+  `SHA256SUMS` and build-provenance attestation. A checksum can't protect `curl | sh`: that path relies on
+  TLS and the GitHub release. So the README also shows the cautious form: download the script, run
+  `gh attestation verify install.sh -R interviewstreet/pair-plugin`, then `sh install.sh`. Serve
   `https://pair.sh/install` as a redirect to `releases/latest/download/install.sh` (pair.sh owners, Q4).
 - `tests/test_install_sh.py`: runs **`cat install.sh | sh`** against a fake manifest server. Cases: checksum
-  mismatch, revoked release, unsupported platform, truncated script runs nothing, and re-run is a no-op. It
+  mismatch, revoked release, unsupported platform, script truncated mid-`main` and mid-line runs nothing, and re-run is a no-op. It
   runs both under a pseudo-tty (Python `pty`) and with no tty, which proves prompts read `/dev/tty` and the
   no-tty path doesn't hang.
 - `cli/cmd/paircli/setup.go`: add the `--grant-codex-trust` and `--enroll` flags and the trust step. A new
