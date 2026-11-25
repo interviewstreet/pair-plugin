@@ -142,7 +142,24 @@ def record_release_source(binary: Path) -> None:
             staged.unlink()
 
 
+def managed_binary(home: Path):
+    """The paircli that ~/.paircli/state/install.json names (a Homebrew install), or None.
+
+    `paircli init` writes the file only for a Homebrew paircli; without it, everything below behaves as it
+    always has. Nothing is installed on this path, so it needs no .bootstrap.lock: setup takes its own lock.
+    """
+    try:
+        record = json.loads((home / ".paircli" / "state" / "install.json").read_text())
+        path = Path(record["binary"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return path if path.is_absolute() and is_installed(path) else None
+
+
 def run_child(harness: str, home: Path) -> int:
+    managed = managed_binary(home)
+    if managed:
+        return subprocess.run([str(managed), "setup", "--harness", harness, "--plugin-version", PLUGIN_VERSION]).returncode
     if fcntl is None:
         raise RuntimeError("Pair CLI bootstrap supports only macOS and Linux")
     binary = home / ".paircli" / "bin" / "paircli"
@@ -181,10 +198,10 @@ def preflight(installed: bool, which=None) -> tuple:
     return blocker, note
 
 
-def status_line(binary: Path, harness: str) -> str:
+def status_line(binary: Path, harness: str, managed: bool = False) -> str:
     if not is_installed(binary):
         return f"Pair setup started: installing the Pair CLI, then {LOGIN_HELP}"
-    if not uses_plugin_release(binary):
+    if not managed and not uses_plugin_release(binary):
         return f"Pair setup started: switching to this plugin's CLI release, then {LOGIN_HELP}"
     try:
         out = subprocess.run([str(binary), "status", "--json"], capture_output=True, text=True, timeout=3)
@@ -217,13 +234,14 @@ def main(argv=None, home: Path = None) -> int:
         return 0
     try:
         harness = detect_harness()
-        binary = home / ".paircli" / "bin" / "paircli"
-        blocker, note = preflight(uses_plugin_release(binary))
+        managed = managed_binary(home)
+        binary = managed or home / ".paircli" / "bin" / "paircli"
+        blocker, note = preflight(bool(managed) or uses_plugin_release(binary))
         if blocker:
             message = f"Pair setup did not start: {blocker}"
         else:
             start_child(harness, home)
-            message = status_line(binary, harness)
+            message = status_line(binary, harness, managed=bool(managed))
         if note:
             message += f". Note: {note}"
     except Exception as error:

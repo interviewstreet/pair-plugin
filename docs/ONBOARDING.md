@@ -128,6 +128,9 @@ updates the CLI, installs hooks for agents added since, repairs removed or stale
 new or changed Codex entries (never one you revoked), and opens the login if there is no credential. It logs
 to `~/.paircli/logs/maintain-*.log`. Machines that only have the plugin never run it.
 
+A `paircli` installed some other way (Homebrew) and set up with `paircli init` is recorded in
+`~/.paircli/state/install.json`; the plugin's bootstrap then runs that binary instead of downloading its own.
+
 ## Status and logs
 
 - `paircli status` (or `--json`) shows the version, server, login, installed

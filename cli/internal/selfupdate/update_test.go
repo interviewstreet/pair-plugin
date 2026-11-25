@@ -201,15 +201,20 @@ func TestRunRejectsHomebrewManagedBinary(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := Run(context.Background(), Options{
-		CurrentVersion: "0.1.0",
-		ManifestURL:    server.URL + "/latest.json",
-		ExecutablePath: "/opt/homebrew/Cellar/paircli/0.1.0/bin/paircli",
-		Platform:       "darwin-arm64",
-		AllowInsecure:  true,
-	})
-	if err == nil || !strings.Contains(err.Error(), "Homebrew") {
-		t.Fatalf("Run() error = %v, want Homebrew failure", err)
+	for _, keg := range []string{
+		"/opt/homebrew/Cellar/paircli/0.1.0/bin/paircli",
+		"/home/linuxbrew/.linuxbrew/Cellar/pair/0.1.0/bin/paircli",
+	} {
+		result, err := Run(context.Background(), Options{
+			CurrentVersion: "0.1.0",
+			ManifestURL:    server.URL + "/latest.json",
+			ExecutablePath: keg,
+			Platform:       "darwin-arm64",
+			AllowInsecure:  true,
+		})
+		if err != nil || result.Updated || !strings.Contains(result.SkippedReason, "Homebrew") {
+			t.Fatalf("Run(%s) = %+v, %v, want skipped for Homebrew", keg, result, err)
+		}
 	}
 }
 

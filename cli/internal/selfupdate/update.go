@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/interviewstreet/pair-plugin/cli/internal/binpath"
 	"github.com/interviewstreet/pair-plugin/cli/internal/state"
 )
 
@@ -129,7 +130,8 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		executable = resolved
 	}
 	if isHomebrewManaged(executable) {
-		return Result{}, fmt.Errorf("paircli is managed by Homebrew; update it with brew upgrade paircli")
+		result.SkippedReason = "paircli is managed by Homebrew; update it with brew upgrade"
+		return result, nil
 	}
 	// The plugin's bootstrap and `paircli init --install-self` replace the
 	// same binary under this lock; never race them.
@@ -472,7 +474,5 @@ func isDevelopmentVersion(value string) bool {
 	return false
 }
 
-func isHomebrewManaged(executable string) bool {
-	cleaned := filepath.Clean(executable)
-	return strings.HasPrefix(cleaned, "/opt/homebrew/Cellar/") || strings.HasPrefix(cleaned, "/usr/local/Cellar/")
-}
+// isHomebrewManaged reports a binary inside a Homebrew keg (macOS or Linuxbrew).
+func isHomebrewManaged(executable string) bool { return binpath.IsHomebrewKeg(executable) }

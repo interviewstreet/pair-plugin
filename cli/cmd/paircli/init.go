@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/interviewstreet/pair-plugin/cli/internal/binpath"
 	"github.com/interviewstreet/pair-plugin/cli/internal/claudecode"
 	"github.com/interviewstreet/pair-plugin/cli/internal/codex"
 	"github.com/interviewstreet/pair-plugin/cli/internal/deviceauth"
@@ -35,6 +36,7 @@ var (
 	installLockWait = 330 * time.Second
 	initExec        = syscall.Exec
 	initExecutable  = os.Executable
+	initBinaryPath  = binpath.Executable
 	initHasTTY      = hasTTY
 	initGhState     = ghState
 )
@@ -118,6 +120,9 @@ func initRun(args []string, w io.Writer) error {
 	}
 	defer lock.Release()
 
+	if err := recordInstallPath(); err != nil {
+		fmt.Fprintf(w, "Pair: could not record the installed binary: %v\n", err)
+	}
 	r := &initReporter{w: w}
 	err = runSetupSteps(setupArgs{
 		Harness: a.Harness, NoLogin: a.NoLogin,
@@ -175,14 +180,18 @@ func printInitSummary(w io.Writer, harness string) {
 	if codexToo {
 		hooks += ", approved in Codex on your behalf"
 	}
+	cli, updates := "the Pair CLI in ~/.paircli/bin", "automatic updates, and hooks for agents you install later"
+	if runningFromHomebrew() {
+		cli, updates = "the Pair CLI from Homebrew", "hooks for agents you install later (update Pair with brew upgrade)"
+	}
 	fmt.Fprintf(w, `Pair will set up:
-  - the Pair CLI in ~/.paircli/bin
+  - %s
   - %s
   - after you log in, PR evidence (including redacted agent transcripts) is uploaded to pair.sh
     when you create or push a PR
-  - automatic updates, and hooks for agents you install later
-Uninstall any time: ~/.paircli/bin/paircli uninstall
-`, hooks)
+  - %s
+Uninstall any time: %s uninstall
+`, cli, hooks, updates, installedBinaryHint())
 }
 
 var harnessDisplay = map[string]string{"claude-code": "Claude Code", "codex": "Codex", "pi": "Pi"}
@@ -261,9 +270,27 @@ func hookFileFor(name string) string {
 	return name
 }
 
-// installedBinaryHint is the full path of the installed binary for messages:
-// the installer puts nothing on PATH (D6).
-func installedBinaryHint() string { return "~/.paircli/bin/paircli" }
+// runningFromHomebrew reports whether init runs as a Homebrew paircli.
+func runningFromHomebrew() bool {
+	exe, err := initBinaryPath()
+	if err != nil {
+		return false
+	}
+	if real, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = real
+	}
+	return binpath.IsHomebrewKeg(exe)
+}
+
+// installedBinaryHint is how messages name the installed binary: the full
+// path for the installer's, which puts nothing on PATH (D6), and plain
+// `paircli` for Homebrew's, which brew puts on PATH.
+func installedBinaryHint() string {
+	if runningFromHomebrew() {
+		return "paircli"
+	}
+	return "~/.paircli/bin/paircli"
+}
 
 // installSelf copies the running binary, which the installer verified and
 // started from its temp directory srcDir, to ~/.paircli/bin/paircli under
@@ -373,4 +400,39 @@ func ghState() string {
 		return "logged-out"
 	}
 	return "ok"
+}
+
+// installRecord is ~/.paircli/state/install.json. It exists only when the
+// installed paircli is not ~/.paircli/bin/paircli (a Homebrew install), and
+// tells the plugin's bootstrap to use that binary instead of downloading a
+// second copy.
+type installRecord struct {
+	SchemaVersion int    `json:"schema_version"`
+	Binary        string `json:"binary"`
+}
+
+func installRecordPath() string { return filepath.Join(state.Dir(), "install.json") }
+
+// recordInstallPath writes install.json for a Homebrew paircli, and removes
+// it otherwise, so it names the binary init last ran as only when that is a
+// Homebrew one.
+func recordInstallPath() error {
+	exe, err := initBinaryPath()
+	if err != nil {
+		return err
+	}
+	real := exe
+	if r, err := filepath.EvalSymlinks(exe); err == nil {
+		real = r
+	}
+	// Only a Homebrew paircli is recorded: any other binary outside
+	// ~/.paircli/bin (a dev build, a copy in Downloads) must not become the
+	// one the plugin runs.
+	if !binpath.IsHomebrewKeg(real) {
+		if err := os.Remove(installRecordPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	return state.WriteJSONAtomic(installRecordPath(), installRecord{SchemaVersion: state.SchemaVersion, Binary: exe})
 }

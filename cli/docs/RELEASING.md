@@ -74,6 +74,21 @@ existing GitHub release-asset redirect policy. These checks do not make a
 checksum an independent signature; clients do not currently verify CI
 attestations. Anonymous downloads require the repository/assets to be public.
 
+## Homebrew (optional)
+
+Pair can also be offered as a Homebrew formula in a tap (`interviewstreet/homebrew-tap`, which does not exist
+yet). Users then run `brew install interviewstreet/tap/pair && paircli init`. After a release, render the
+formula from that release's manifest and commit it to the tap as `Formula/pair.rb`:
+
+```sh
+python3 scripts/render-homebrew-formula.py cli/dist/paircli/latest.json > Formula/pair.rb
+```
+
+The renderer applies the plugin bootstrap's checks to the manifest. A Homebrew `paircli` doesn't self-update
+(`brew upgrade` does), and its hooks call the brew bin link, which survives upgrades. When `paircli init` runs
+from a Homebrew keg (or its bin link), it writes `~/.paircli/state/install.json` naming that binary, and the plugin's
+bootstrap then uses it instead of downloading a second copy. Without the file, the bootstrap behaves as before.
+
 ## Notification assets
 
 macOS binaries retain the existing pinned universal notification executable,

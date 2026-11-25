@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/interviewstreet/pair-plugin/cli/internal/binpath"
 	"github.com/interviewstreet/pair-plugin/cli/internal/gitinfo"
 	"github.com/interviewstreet/pair-plugin/cli/internal/hooklog"
 	"github.com/interviewstreet/pair-plugin/cli/internal/maintain"
@@ -108,14 +109,12 @@ func configTomlPath() string {
 
 // pairCLIBinary returns the command prefix InstallHooks writes into
 // hooks.json: the absolute, symlink-resolved path to the running paircli
-// binary, single-quoted if it contains whitespace.
+// binary (for a Homebrew keg, the brew bin link, which survives an upgrade),
+// single-quoted if it contains whitespace.
 func pairCLIBinary() (string, error) {
-	exe, err := os.Executable()
+	exe, err := binpath.Executable()
 	if err != nil {
 		return "", err
-	}
-	if real, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = real
 	}
 	if strings.ContainsAny(exe, " \t") {
 		return "'" + exe + "'", nil

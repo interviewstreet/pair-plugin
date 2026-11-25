@@ -34,11 +34,12 @@ func initEnv(t *testing.T) (calls *[]string, trustCalls *[]bool) {
 	)
 	trustCalls = &[]bool{}
 	origTrust, origWait, origInstallWait := setupCodexTrust, initLockWait, installLockWait
-	origTTY, origGh, origExec, origExe := initHasTTY, initGhState, initExec, initExecutable
+	origTTY, origGh, origExec, origExe, origBin := initHasTTY, initGhState, initExec, initExecutable, initBinaryPath
 	t.Cleanup(func() {
 		setupCodexTrust, initLockWait, installLockWait = origTrust, origWait, origInstallWait
-		initHasTTY, initGhState, initExec, initExecutable = origTTY, origGh, origExec, origExe
+		initHasTTY, initGhState, initExec, initExecutable, initBinaryPath = origTTY, origGh, origExec, origExe, origBin
 	})
+	initBinaryPath = func() (string, error) { return filepath.Join(home, ".paircli", "bin", "paircli"), nil }
 	setupCodexTrust = func(r *initRecord, explicit bool) (string, bool) {
 		*trustCalls = append(*trustCalls, explicit)
 		r.CodexPath = "/usr/local/bin/codex"
@@ -446,5 +447,45 @@ func TestInit_InstallSelfRefusesADirectoryItDoesNotRunFrom(t *testing.T) {
 	}
 	if _, err := os.Stat(other); err != nil {
 		t.Errorf("directory removed: %v", err)
+	}
+}
+
+// A Homebrew paircli records itself in install.json, so the plugin's
+// bootstrap uses it instead of downloading a second copy; the installer's
+// own binary removes the record.
+func TestInit_RecordsOnlyAHomebrewBinary(t *testing.T) {
+	initEnv(t)
+	brew := "/opt/homebrew/Cellar/pair/0.6.0/bin/paircli" // no bin link in the test: the keg path itself
+	initBinaryPath = func() (string, error) { return brew, nil }
+	out, err := runInitArgs(t, "--no-login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "~/.paircli/bin") || !strings.Contains(out, "Uninstall any time: paircli uninstall") ||
+		!strings.Contains(out, "brew upgrade") || strings.Contains(out, "automatic updates") {
+		t.Errorf("output for a Homebrew paircli:\n%s", out)
+	}
+	var rec installRecord
+	data, err := os.ReadFile(installRecordPath())
+	if err != nil || json.Unmarshal(data, &rec) != nil || rec.Binary != brew {
+		t.Fatalf("install.json = %s (%v), want %s", data, err, brew)
+	}
+
+	home, _ := os.UserHomeDir()
+	initBinaryPath = func() (string, error) { return filepath.Join(home, ".paircli", "bin", "paircli"), nil }
+	if _, err := runInitArgs(t); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(installRecordPath()); !os.IsNotExist(err) {
+		t.Errorf("install.json kept for the binary in ~/.paircli/bin: %v", err)
+	}
+
+	// A binary that isn't Homebrew's (a dev build, a downloaded copy) is never recorded.
+	initBinaryPath = func() (string, error) { return filepath.Join(t.TempDir(), "paircli"), nil }
+	if _, err := runInitArgs(t); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(installRecordPath()); !os.IsNotExist(err) {
+		t.Errorf("install.json written for a non-Homebrew binary: %v", err)
 	}
 }
