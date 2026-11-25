@@ -3,20 +3,38 @@
 Status: plan, for review. No code changes are part of this document.
 Date: 2026-11-25. Repo state: `main` @ `528b55c`.
 
+> **This plan only adds things.** Nothing that exists today is removed or deprecated, and nothing behaves differently for existing users. These all stay
+> supported, and keep working as they do now:
+>
+> - the Pair plugin;
+> - the self-hosted Claude Code and Codex marketplace catalogs;
+> - `paircli setup`;
+> - the `/pair` skill;
+> - the plugin's SessionStart bootstrap;
+> - the hooks the CLI installs.
+>
+> The one-line installer and `paircli init` are a **second onboarding path next to the plugin**, not a
+> replacement. The two paths share the same binary, state and hooks, so a machine can use either one or both.
+> See §5.1.
+
 ## TL;DR
 
-- **The plugin is only a delivery vehicle.** Everything a user needs is already in `paircli setup`: it
-  detects which agents are installed, writes the hooks, self-updates, and runs the device login. The plugin's
-  only job is to download `paircli` and start `setup` once.
+- **Everything a user needs is already in `paircli setup`.** It detects which agents are installed, writes the
+  hooks, self-updates, and runs the device login. The plugin's job is to download `paircli` and start `setup`.
+  So a second path into the same CLI can live next to the plugin without changing it.
 - **Neither official directory will take the plugin as it is, whatever happens to Verified status.** Codex's
   docs say outright that plugins with lifecycle hooks can't be listed. On the Anthropic side, policy §1.G
   (no extracting chat history) is a separate risk that Verified status doesn't remove.
-- **Recommendation:** make a one-line installer the primary way in, and let the CLI own the whole lifecycle.
-  - A new user runs **one command** and clicks **Approve** once in the browser that opens.
+- **Recommendation:** add a one-line installer as a second onboarding path, and let the CLI keep itself up to
+  date whichever path installed it.
+  - A new user on the installer path runs **one command** and clicks **Approve** once in the browser that
+    opens.
   - After that, Claude Code and Codex are both capturing evidence, and the install updates and repairs itself.
   - Organizations get a **zero-step** managed rollout.
-  - The self-hosted marketplace stays as a secondary path. The directories become optional "discovery"
-    listings later, if they become possible at all.
+  - The plugin and its self-hosted marketplace stay a **supported path, long-term**. Both paths are documented
+    side by side.
+  - The directories become optional "discovery" listings for the plugin later, if they become possible at
+    all.
 
 ## 1. What is in this repo, and what review blocks
 
@@ -175,7 +193,8 @@ one step.
 
 **Ranking for the stated goal (fewest manual steps):** A (0, but only where an admin manages the machines) >
 **B (1)** > G and H (1 but weaker, or a habit change) > E (2) > C, D (3–8). So B is the default for everyone,
-A is the enterprise channel, and C stays for people who already use it.
+A is the enterprise channel, and C (the plugin) remains a fully supported path, documented side by side with B.
+A, B and C all end in the same CLI state, so a user can start with any of them.
 
 ## 5. Recommendation
 
@@ -223,9 +242,95 @@ What happens automatically:
    - If `gh` is missing or not signed in, `init` says so and offers `gh auth login --web` inline (another
      browser click, not a copy-paste).
    - `curl` is needed only by the installer.
-   - `python3` is no longer needed.
+   - `python3` isn't needed on the installer path. The plugin path still uses it to run `bootstrap.py`.
 
    *Whether Pair should keep depending on `gh` is Q4.*
+
+### 5.1 Compatibility: what stays, and how the two paths coexist
+
+**What stays, unchanged and supported long-term:**
+
+| Piece | Status |
+| --- | --- |
+| `plugins/pair/` (manifests, `hooks/hooks.json`, `hooks/bootstrap.py`, `skills/pair`, assets) | Kept. Same install commands, same SessionStart bootstrap, same status line |
+| `.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json` | Kept. Install identity `pair@pair` doesn't change |
+| `paircli setup` (flags, steps, `setup.json`, logs) | Kept. `init` *calls* `setupRun` and adds steps around it. `setup`'s own behaviour doesn't change |
+| `/pair` skill → `paircli publish` | Kept |
+| CLI hook entries in `~/.claude/settings.json` and `$CODEX_HOME/hooks.json` (events, matcher, command format, marker) | Kept. The installer writes exactly the same entries |
+| `~/.paircli/` layout (bin, `release-source.json`, state, locks, logs, credential) | Kept, and shared by both paths |
+| Manual uninstall sequence in the README | Kept, and still valid |
+
+**One machine, two paths.** Both paths end in the same place:
+
+- the same binary at `~/.paircli/bin/paircli`;
+- the same migration marker (`release-source.json` with the same `MANIFEST_URL`);
+- the same state directory;
+- the same hook entries.
+
+So the order a user takes them in doesn't matter:
+
+- **Plugin first, then installer.**
+  - `install.sh` sees a binary that has already migrated and is up to date, so it doesn't download it again
+    (the same check as `uses_plugin_release`).
+  - `init` → `setupRun` re-merges the hooks. This is a no-op: there's still exactly one Pair entry per event.
+  - The login is already valid, so it's skipped.
+  - The user ends up with what they already had, plus Codex trust (if Q1 is approved).
+- **Installer first, then plugin.**
+  - `bootstrap.py` sees the binary and the marker that `install.sh` wrote, so it downloads nothing.
+  - It runs `paircli setup --harness <h>`, which is the same no-op merge.
+  - The only new thing is the plugin's own bootstrap hook. In Codex the user reviews it once, which is the
+    normal cost of the plugin path.
+
+**Who owns what when both are present:**
+
+- **The CLI owns every capture and publish hook**, on both paths: the entries tagged `" hook claude-code "` /
+  `" hook codex "` in the user's agent config. `InstallHooks` first strips every entry carrying the marker,
+  then appends exactly one per event (`stripOurHooks` / `installEvent` in `cli/internal/claudecode/hooks.go`
+  and `cli/internal/codex/hooks.go`). That holds whichever path ran it, and however often.
+- **The plugin owns only its bootstrap hook** (`hooks/hooks.json` → `bootstrap.py`). That hook never
+  publishes. It only installs and starts `setup`.
+- So there's never a second set of publishing hooks.
+
+**No double uploads:**
+
+1. Only the CLI's PostToolUse hook triggers a publish, and there's one of those entries per agent.
+2. Even if two triggers fire, for example a Claude session and a Codex session pushing the same PR,
+   `paircli publish` takes a per-PR lock. A second run leaves a pending marker instead of uploading, and a
+   rerun whose head is already published does nothing (`cli/cmd/paircli/publish.go:215`, `:363`).
+3. Setup runs one at a time (`state.TryLock("setup")`). The new `maintain` takes the same lock, and skips if
+   `setup.json`'s `updated_at` is under 24 h old. So a plugin session start and a `maintain` run don't both
+   update.
+
+**Coexistence requirements the new code must meet (Phases 1–2):**
+
+- `install.sh` installs only to `~/.paircli/bin/paircli`, and writes the same `release-source.json` that
+  `bootstrap.py` checks. If the bootstrap didn't recognise the binary, it would download a second copy.
+- Hook install must stop rewriting the file when nothing changed, and keep Pair's group where it is.
+  - Today `installEvent` strips Pair's group and re-appends it at the end.
+  - Codex keys trust by `<file>:<event>:<group>:<index>`. If a user hook comes after Pair's, a no-op re-run
+    moves Pair's group to a new index and asks for a new review.
+  - This doesn't change *which* hooks are installed. It only avoids needless rewrites, so plugin sessions and
+    `maintain` can both run setup safely.
+- `paircli init` must not remove or edit the plugin's bootstrap hook.
+- `bootstrap.py` and `setup` keep working against a CLI that has `init` and `maintain`. `init` is purely
+  additive: a new subcommand.
+- **Homebrew installs (Phase 3 only).** A brew binary doesn't live in `~/.paircli/bin`, so today's bootstrap
+  would install a second copy.
+  - Before offering the tap, add an optional `~/.paircli/state/install.json` that records the
+    installer-managed binary path.
+  - `bootstrap.py` uses that path when the file exists, and behaves exactly as today when it doesn't.
+  - This is the only plugin change in the plan, and it's additive.
+- Tests: `tests/test_bootstrap.py` gains "binary installed by `install.sh` → no download, setup runs".
+  `cli/internal/{claudecode,codex}/hooks_test.go` gain "a second install leaves the file unchanged
+  byte for byte" and "mixed install order → one Pair entry per event".
+
+**Uninstall, per path:**
+
+| Goal | Steps |
+| --- | --- |
+| Remove the plugin, keep Pair working (switch to the installer path) | `claude plugin uninstall pair@pair` / `codex plugin remove pair@pair`. The CLI hooks, login and capture keep working. After Phase 2, `maintain` keeps the CLI updated; before that, re-run the installer or `paircli update` |
+| Keep the plugin, "remove the installer" | Nothing to remove. The installer leaves no state of its own beyond what the plugin path uses. Delete `install.json` if Phase 3 added it |
+| Remove Pair completely | 1. Uninstall the plugin **first**. Otherwise its bootstrap reinstalls Pair at the next session start. 2. Run the new `paircli uninstall` (Phase 1). It does `hook uninstall` (every harness) + `logout` + removes `~/.paircli`. If it detects that the plugin is still installed (`claude plugin list` / `codex plugin list` when those are on PATH), it stops and prints the exact plugin uninstall command; `--force` overrides. The existing three-command README sequence keeps working |
 
 ### Phases and concrete repo changes
 
@@ -234,13 +339,13 @@ What happens automatically:
 - Reply on Intercom #159791597 and use **Help and appeals → Request verified** in the portal. Send the
   existing §1.G question from `docs/DIRECTORY_SUBMISSION.md` to `directory@anthropic.com`. Neither of these
   is on the critical path.
-- README: put the self-hosted one-liners first. Use `claude plugin install pair --marketplace
-  interviewstreet/pair-plugin`, which is a single command on v2.1.292+.
+- README: add the single-command form `claude plugin install pair --marketplace interviewstreet/pair-plugin`
+  (v2.1.292+) next to the existing two-command plugin install. The existing commands stay.
 - Add `docs/ORG_ROLLOUT.md` with a `managed-settings.json` snippet (`extraKnownMarketplaces` +
   `enabledPlugins: {"pair@pair": true}`) for HackerRank's own engineers. That's the zero-step path for us
   right away.
 
-**Phase 1: one-command installer (1–2 weeks). This is the new primary path.**
+**Phase 1: one-command installer (1–2 weeks). This adds a path next to the plugin.**
 
 - `install.sh` (repo root). POSIX `sh`, `set -eu`. It:
   - detects the platform;
@@ -257,8 +362,10 @@ What happens automatically:
   release, unsupported platform, re-run is a no-op).
 - `cli/cmd/paircli/main.go`: add an `init` command, which is `setupRun` with TTY progress output. Without a
   TTY it exits non-zero with clear reasons. `setup` stays as is for the plugin.
-- `README.md`, `docs/ONBOARDING.md`: lead with the one command. Move the plugin to a "Plugin install
-  (alternative)" section.
+- `cli/cmd/paircli/uninstall.go` (new): the full uninstall in §5.1, with the plugin-present check.
+- `README.md`, `docs/ONBOARDING.md`: show the two supported paths side by side in "Install", "One command"
+  and "Plugin". The existing plugin instructions stay as they are. Add the coexistence and uninstall notes
+  from §5.1.
 
 **Phase 2: the CLI owns the lifecycle (2–3 weeks).**
 
@@ -269,8 +376,10 @@ What happens automatically:
 - `cli/cmd/paircli/maintain.go` (new): update → `installAllHarnesses` → trust, logged to
   `~/.paircli/logs/maintain-*.log`.
 - `cli/internal/selfupdate`: re-install hooks after a successful update.
-- `plugins/pair/hooks/bootstrap.py`: no change in behaviour. It keeps working for existing plugin users. The
-  plugin and the installer write the same idempotent state, so a user who has both is fine.
+- `cli/internal/claudecode/hooks.go` and `cli/internal/codex/hooks.go`: write only when something changed, and
+  keep the position of Pair's group (§5.1 coexistence requirements). Same entries, same events.
+- `plugins/pair/hooks/bootstrap.py`: no change. It keeps working for every plugin user. The plugin and the
+  installer write the same idempotent state, so a user who has both is fine (§5.1).
 - `cli/internal/deviceauth`: QR or plain URL when there's no browser. Prefill is already there.
 
 **Phase 3: zero-step channels (after Phase 2).**
@@ -281,7 +390,8 @@ What happens automatically:
   `requirements.toml` managed-hooks template and a Claude `managed-settings.json` template, both in
   `docs/ORG_ROLLOUT.md`.
 - Optional Homebrew tap (`brew install interviewstreet/tap/pair && pair init`). That's 2 steps, for users who
-  prefer brew. `selfupdate` already leaves brew installs alone.
+  prefer brew. `selfupdate` already leaves brew installs alone. It ships together with the additive
+  `install.json` lookup in `bootstrap.py` (§5.1), so a machine with both brew and the plugin has one binary.
 
 **Phase 4: directories, only if policy allows.**
 
@@ -312,9 +422,8 @@ What happens automatically:
    comments server-side so the CLI doesn't need `gh`?
 5. **Hosting and brand.** Who owns `pair.sh/install` (a redirect on the web app)? Is the user-facing command
    `pair` or `paircli` (that is, add a `pair` symlink)?
-6. **Plugin's future.** Keep the self-hosted plugin as a documented alternative for good, or deprecate it
-   once Phase 2 ships? What's the message for existing `pair@pair` users? They need no migration: state is
-   shared.
+6. ~~**Plugin's future.**~~ **Resolved: keep the plugin long-term.** It remains a supported path next to the
+   installer, with no deprecation in any phase. Existing `pair@pair` users need to do nothing.
 7. **Directory strategy.** After Verified status, do we still want a directory listing, given the §1.G risk?
    Who owns the conversation with Anthropic and with OpenAI?
 8. **Windows.** Still out of scope?
