@@ -10,13 +10,17 @@ import (
 
 // ensureLogin returns the credential for server, running the device login
 // first when there is none. A PAIRCLI_AUTH_TOKEN credential carries no server
-// and is accepted for any.
-func ensureLogin(server string, out, progress io.Writer) (deviceauth.StoredAuth, error) {
+// and is accepted for any. noBrowser prints the login URL without opening it.
+func ensureLogin(server string, out, progress io.Writer, noBrowser bool) (deviceauth.StoredAuth, error) {
 	server = strings.TrimRight(server, "/")
 	if a, ok := deviceauth.Resolve(); ok && (a.ServerURL == "" || strings.TrimRight(a.ServerURL, "/") == server) {
 		return a, nil
 	}
-	if err := loginRun([]string{"--server", server}, out, progress); err != nil {
+	args := []string{"--server", server}
+	if noBrowser {
+		args = append(args, "--no-browser")
+	}
+	if err := loginRun(args, out, progress); err != nil {
 		return deviceauth.StoredAuth{}, err
 	}
 	a, ok := deviceauth.Resolve()

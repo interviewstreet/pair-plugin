@@ -89,6 +89,9 @@ func setupNotes(steps map[string]string) []string {
 	if p := steps["plugin"]; p != "" {
 		notes = append(notes, p)
 	}
+	if strings.Contains(steps["codex_trust"], "revoked in /hooks") {
+		notes = append(notes, "Codex trust for Pair hooks was revoked in `/hooks`; run `~/.paircli/bin/paircli init` to grant it again")
+	}
 	for _, name := range harnessOrder {
 		if outcome := steps["hooks:"+name]; strings.HasPrefix(outcome, "failed") {
 			notes = append(notes, name+" hooks "+outcome)
@@ -308,7 +311,17 @@ func currentSetup() setupSummary {
 			s.State, s.Error = setupFailed, &msg
 		}
 	}
-	summary := setupSummary{State: s.State, Error: s.Error, Log: s.Log, Notes: setupNotes(s.Steps)}
+	steps := s.Steps
+	if steps["codex_trust"] == "" {
+		// The plugin's setup has no trust step; init's last word stands.
+		if rec, err := readInitRecord(); err == nil && rec.CodexTrust != "" {
+			steps = map[string]string{"codex_trust": rec.CodexTrust}
+			for k, v := range s.Steps {
+				steps[k] = v
+			}
+		}
+	}
+	summary := setupSummary{State: s.State, Error: s.Error, Log: s.Log, Notes: setupNotes(steps)}
 	if !s.UpdatedAt.IsZero() {
 		summary.UpdatedAt = &s.UpdatedAt
 	}

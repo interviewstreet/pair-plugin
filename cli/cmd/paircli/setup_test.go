@@ -46,7 +46,7 @@ func setupEnv(t *testing.T) *[]string {
 		*calls = append(*calls, "hooks:"+harness)
 		return "installed", nil
 	}
-	setupEnsureLogin = func(server string, out, progress io.Writer) (deviceauth.StoredAuth, error) {
+	setupEnsureLogin = func(server string, out, progress io.Writer, _ bool) (deviceauth.StoredAuth, error) {
 		*calls = append(*calls, "login:"+server)
 		io.WriteString(progress, "First copy your one-time code: WDJP-7Q2K\n")
 		return deviceauth.StoredAuth{}, nil
@@ -159,7 +159,7 @@ func TestSetup_NotificationFailureDoesNotBlockSetup(t *testing.T) {
 
 func TestSetup_FailureRecordsTheRealErrorAndTheNextRunRetries(t *testing.T) {
 	calls := setupEnv(t)
-	setupEnsureLogin = func(string, io.Writer, io.Writer) (deviceauth.StoredAuth, error) {
+	setupEnsureLogin = func(string, io.Writer, io.Writer, bool) (deviceauth.StoredAuth, error) {
 		return deviceauth.StoredAuth{}, errors.New("device code expired, run paircli login again")
 	}
 	stdout, _, err := runSetupArgs(t)
@@ -176,7 +176,7 @@ func TestSetup_FailureRecordsTheRealErrorAndTheNextRunRetries(t *testing.T) {
 
 	// Failure is not sticky: the next run goes through every step again.
 	*calls = nil
-	setupEnsureLogin = func(string, io.Writer, io.Writer) (deviceauth.StoredAuth, error) {
+	setupEnsureLogin = func(string, io.Writer, io.Writer, bool) (deviceauth.StoredAuth, error) {
 		return deviceauth.StoredAuth{}, nil
 	}
 	if _, _, err := runSetupArgs(t); err != nil {

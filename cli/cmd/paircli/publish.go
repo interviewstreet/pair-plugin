@@ -149,7 +149,7 @@ func defaultPublishEnv() publishEnv {
 // device login first when there is no usable credential.
 func loginCredential(out, progress io.Writer) (string, string, error) {
 	server := resolveServer("")
-	auth, err := ensureLogin(server, out, progress)
+	auth, err := ensureLogin(server, out, progress, false)
 	if err != nil {
 		return "", "", err
 	}

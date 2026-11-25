@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/interviewstreet/pair-plugin/cli/internal/codex"
 	"github.com/interviewstreet/pair-plugin/cli/internal/notify"
 	"github.com/interviewstreet/pair-plugin/cli/internal/selfupdate"
 	"github.com/interviewstreet/pair-plugin/cli/internal/state"
@@ -60,6 +61,7 @@ var (
 	setupSelfUpdate    = selfUpdateQuietly
 	setupInstallHooks  = installHooksFor
 	setupInstallEach   = installEachHarness
+	setupCodexTrust    = grantCodexTrust
 	setupEnsureLogin   = ensureLogin
 	setupNotifications = notify.Prepare
 )
@@ -77,10 +79,28 @@ type setupArgs struct {
 	NoLogin       bool
 	JSON          bool
 
+	// GrantCodexTrust approves Pair's Codex hooks inside Codex after
+	// installing them (D1). Only init and maintain pass it; the plugin's
+	// `setup --harness …` never does.
+	GrantCodexTrust bool
+	// Enroll writes ~/.paircli/state/init.json once the hooks and the login
+	// succeeded, which turns on maintain for this machine.
+	Enroll bool
+
 	// PerAgent records each detected agent's hook outcome as its own step
 	// ("hooks:<harness>") and fails the hooks step only when every detected
 	// agent failed. `setup` keeps the all-or-nothing hooks step.
 	PerAgent bool
+	// ExplicitTrust grants Codex trust the user revoked: they ran init.
+	ExplicitTrust bool
+	// NoBrowser prints the login URL without opening a browser.
+	NoBrowser bool
+	// Progress, when set, receives the login's code and URL and Report's
+	// lines instead of stderr (which then only feeds the log).
+	Progress io.Writer
+	// Report, when set, is called after each step with the step's name and
+	// every outcome recorded so far.
+	Report func(step string, steps map[string]string)
 }
 
 func parseSetupArgs(args []string) (setupArgs, error) {
@@ -91,6 +111,8 @@ func parseSetupArgs(args []string) (setupArgs, error) {
 	fs.StringVar(&a.PluginVersion, "plugin-version", "", "Pair plugin version (used by the plugin integration)")
 	fs.BoolVar(&a.NoLogin, "no-login", false, "skip the device login")
 	fs.BoolVar(&a.JSON, "json", false, "print the result as JSON")
+	fs.BoolVar(&a.GrantCodexTrust, "grant-codex-trust", false, "approve Pair's Codex hooks inside Codex")
+	fs.BoolVar(&a.Enroll, "enroll", false, "record this machine as set up by the installer (turns on maintain)")
 	if err := fs.Parse(args); err != nil {
 		return a, err
 	}
@@ -134,9 +156,16 @@ func setupRun(args []string, stdout, stderr io.Writer) error {
 // holds the setup lock: setup takes it with TryLock, init waits for it.
 func runSetupSteps(a setupArgs, stdout, stderr io.Writer) error {
 	logPath, logFile := openSetupLog()
+	progress := a.Progress
 	if logFile != nil {
 		defer logFile.Close()
 		stderr = io.MultiWriter(stderr, logFile)
+		if progress != nil {
+			progress = io.MultiWriter(progress, logFile)
+		}
+	}
+	if progress == nil {
+		progress = stderr
 	}
 	status := setupStatus{State: setupRunning, Log: logPath, Steps: map[string]string{}}
 	if err := writeSetupStatus(status); err != nil {
@@ -147,6 +176,11 @@ func runSetupSteps(a setupArgs, stdout, stderr io.Writer) error {
 	step := func(name string, run func() (string, error), tolerate bool) {
 		fmt.Fprintf(stderr, "paircli: setup: %s\n", name)
 		outcome, err := run()
+		defer func() {
+			if a.Report != nil {
+				a.Report(name, status.Steps)
+			}
+		}()
 		switch {
 		case err == nil:
 			status.Steps[name] = outcome
@@ -169,16 +203,73 @@ func runSetupSteps(a setupArgs, stdout, stderr io.Writer) error {
 	} else {
 		step("hooks", func() (string, error) { return setupInstallHooks(stderr, a.Harness) }, false)
 	}
+	var enrolment initRecord
+	var enrolmentErr error
+	if a.GrantCodexTrust || a.Enroll {
+		if enrolment, enrolmentErr = readInitRecord(); errors.Is(enrolmentErr, os.ErrNotExist) {
+			enrolmentErr = nil
+		}
+	}
+	if a.GrantCodexTrust && codexHooksInstalled(a, status.Steps) {
+		step("codex_trust", func() (string, error) {
+			outcome, trusted := setupCodexTrust(&enrolment, a.ExplicitTrust)
+			if !trusted && a.Report == nil { // init's report prints it in context
+				fmt.Fprintln(progress, codex.InstallMessage())
+			}
+			return outcome, nil
+		}, true)
+	}
 	step("notifications", setupNotifications, true)
 	if a.NoLogin {
 		status.Steps["login"] = "skipped: --no-login"
+		if a.Report != nil {
+			a.Report("login", status.Steps)
+		}
 	} else {
 		step("login", func() (string, error) {
-			if _, err := setupEnsureLogin(resolveServer(""), stderr, stderr); err != nil {
+			if _, err := setupEnsureLogin(resolveServer(""), progress, progress, a.NoBrowser); err != nil {
 				return "", err
 			}
 			return "logged in", nil
 		}, false)
+	}
+	switch {
+	case enrolmentErr != nil && (a.Enroll || initEnrolled()):
+		// Never replace an init.json we could not read: it holds the user's
+		// Codex revocations.
+		msg := fmt.Sprintf("init.json is unreadable (%v); remove %s and run init again", enrolmentErr, initRecordPath())
+		status.Steps["enroll"] = "failed: " + msg
+		if a.Enroll {
+			failures = append(failures, "enroll: "+msg)
+		}
+	case a.Enroll && len(failures) == 0:
+		if enrolment.Harnesses == nil {
+			enrolment.Harnesses = map[string]string{}
+		}
+		for _, name := range harnessOrder {
+			if outcome := status.Steps["hooks:"+name]; outcome != "" {
+				enrolment.Harnesses[name] = outcome
+			}
+		}
+		if a.Harness != "" {
+			enrolment.Harnesses[a.Harness] = status.Steps["hooks"]
+		}
+		if t := status.Steps["codex_trust"]; t != "" {
+			enrolment.CodexTrust = t
+		}
+		if err := writeInitRecord(enrolment); err != nil {
+			failures = append(failures, "enroll: "+err.Error())
+			status.Steps["enroll"] = "failed: " + err.Error()
+		} else {
+			status.Steps["enroll"] = "enrolled"
+		}
+	case a.GrantCodexTrust && initEnrolled():
+		// Keep what this run learned about Codex trust, even when another
+		// step failed.
+		enrolment.CodexTrust = status.Steps["codex_trust"]
+		if err := writeInitRecord(enrolment); err != nil {
+			fmt.Fprintf(stderr, "paircli: could not update init.json: %v\n", err)
+		}
 	}
 
 	status.State = setupIdle
@@ -198,6 +289,18 @@ func runSetupSteps(a setupArgs, stdout, stderr io.Writer) error {
 		return errors.New("setup failed")
 	}
 	return nil
+}
+
+// codexHooksInstalled reports whether this run installed Codex's hooks, the
+// precondition for granting their trust.
+func codexHooksInstalled(a setupArgs, steps map[string]string) bool {
+	if a.Harness != "" {
+		return a.Harness == "codex" && !strings.HasPrefix(steps["hooks"], "failed")
+	}
+	if a.PerAgent {
+		return steps["hooks:codex"] == "installed"
+	}
+	return harnessTable["codex"].Detect() && !strings.HasPrefix(steps["hooks"], "failed")
 }
 
 // pluginNote is the "plugin" step: a note when the plugin that started setup
