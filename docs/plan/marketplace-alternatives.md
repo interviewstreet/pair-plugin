@@ -576,7 +576,7 @@ So the order a user takes them in doesn't matter:
   `SHA256SUMS` and build-provenance attestation. A checksum can't protect `curl | sh`: that path relies on
   TLS and the GitHub release. So the README also shows the cautious form: download the script, run
   `gh attestation verify install.sh -R interviewstreet/pair-plugin`, then `sh install.sh`. Serve
-  `https://pair.sh/install` as a redirect to `releases/latest/download/install.sh` (pair.sh owners, Q4).
+  `https://pair.sh/install` as a redirect to `releases/latest/download/install.sh` (D6).
 - `tests/test_install_sh.py`: runs **`cat install.sh | sh`** against a fake manifest server. Cases: checksum
   mismatch, revoked release, unsupported platform, script truncated mid-`main` and mid-line runs nothing, and re-run is a no-op. It
   runs both under a pseudo-tty (Python `pty`) and with no tty, which proves `init` never reads stdin and the
@@ -676,13 +676,17 @@ So the order a user takes them in doesn't matter:
   - Everything else is still set up, and Pair keeps using the user's `gh` for PR reads and the PR comment, as
     today.
   - For users without `gh`, onboarding is 1 command + Approve + installing and logging in to `gh`.
+- **D6. Install URL and command name.**
+  - The one-liner is `curl -fsSL https://pair.sh/install | sh`. The pair.sh web app adds a redirect from
+    `/install` to `releases/latest/download/install.sh`.
+  - Until that redirect is live, docs use the GitHub release URL, which works with no server change.
+  - The command stays `paircli` at `~/.paircli/bin/paircli`. The installer doesn't edit shell rc files or add
+    anything to PATH, and there's no `pair` alias. Messages always show the full path.
 - **D2. Plugin's future: keep the plugin long-term.** It remains a supported path next to the installer, with
   no deprecation in any phase. Existing `pair@pair` users need to do nothing.
 
 ### Open (product, copy, policy: not decided here)
 
-4. **Hosting and brand.** Who owns `pair.sh/install` (a redirect on the web app)? Is the user-facing command
-   `pair` or `paircli` (that is, add a `pair` symlink)?
 5. **Directory strategy.** After Verified status, do we still want a directory listing, given the §1.G risk?
    Who owns the conversation with Anthropic and with OpenAI?
 6. **Windows.** Still out of scope?
