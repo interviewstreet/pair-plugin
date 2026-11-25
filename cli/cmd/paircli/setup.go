@@ -93,6 +93,9 @@ type setupArgs struct {
 	PerAgent bool
 	// ExplicitTrust grants Codex trust the user revoked: they ran init.
 	ExplicitTrust bool
+	// UpdateOutcome, when set, is recorded as the update step's outcome
+	// instead of running it (maintain ran the update itself).
+	UpdateOutcome string
 	// NoBrowser prints the login URL without opening a browser.
 	NoBrowser bool
 	// Progress, when set, receives the login's code and URL and Report's
@@ -197,7 +200,11 @@ func runSetupSteps(a setupArgs, stdout, stderr io.Writer) error {
 	if note := pluginNote(a.PluginVersion); note != "" {
 		status.Steps["plugin"] = note
 	}
-	step("update", func() (string, error) { return setupSelfUpdate(context.Background(), a.PluginVersion) }, true)
+	if a.UpdateOutcome != "" {
+		status.Steps["update"] = a.UpdateOutcome
+	} else {
+		step("update", func() (string, error) { return setupSelfUpdate(context.Background(), a.PluginVersion) }, true)
+	}
 	if a.PerAgent && a.Harness == "" {
 		step("hooks", func() (string, error) { return installHooksPerAgent(stderr, status.Steps) }, false)
 	} else {
@@ -265,7 +272,8 @@ func runSetupSteps(a setupArgs, stdout, stderr io.Writer) error {
 		}
 	case a.GrantCodexTrust && initEnrolled():
 		// Keep what this run learned about Codex trust, even when another
-		// step failed.
+		// step (a login, say) failed; harness outcomes wait for a run with
+		// no failure.
 		enrolment.CodexTrust = status.Steps["codex_trust"]
 		if err := writeInitRecord(enrolment); err != nil {
 			fmt.Fprintf(stderr, "paircli: could not update init.json: %v\n", err)

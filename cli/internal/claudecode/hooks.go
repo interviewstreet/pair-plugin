@@ -13,6 +13,7 @@ import (
 
 	"github.com/interviewstreet/pair-plugin/cli/internal/gitinfo"
 	"github.com/interviewstreet/pair-plugin/cli/internal/hooklog"
+	"github.com/interviewstreet/pair-plugin/cli/internal/maintain"
 	"github.com/interviewstreet/pair-plugin/cli/internal/model"
 	"github.com/interviewstreet/pair-plugin/cli/internal/prtrigger"
 )
@@ -439,6 +440,11 @@ type hookStdinPayload struct {
 func RunHookEvent(event string, stdin io.Reader) error {
 	if mapped, ok := legacyEventArgs[event]; ok {
 		event = mapped
+	}
+
+	if event == "SessionStart" {
+		// Installer-path machines only (init.json); a no-op otherwise.
+		maintain.MaybeStart()
 	}
 
 	var payload hookStdinPayload

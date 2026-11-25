@@ -5,7 +5,8 @@
 // [hooks.state."…"] entries). Trust is written only by GrantTrust, only when
 // `paircli init` or `paircli maintain` asks for it, and only through Codex's
 // own app-server trust RPCs with the hash Codex computed (trust.go); `paircli
-// setup`, which the plugin runs, never asks. See docs/plan/tasks/T20-codex-hooks.md.
+// setup`, which the plugin runs, never asks. The SessionStart hook starts
+// maintain only on machines init enrolled. See docs/plan/tasks/T20-codex-hooks.md.
 package codex
 
 import (
@@ -22,6 +23,7 @@ import (
 
 	"github.com/interviewstreet/pair-plugin/cli/internal/gitinfo"
 	"github.com/interviewstreet/pair-plugin/cli/internal/hooklog"
+	"github.com/interviewstreet/pair-plugin/cli/internal/maintain"
 	"github.com/interviewstreet/pair-plugin/cli/internal/model"
 	"github.com/interviewstreet/pair-plugin/cli/internal/prtrigger"
 )
@@ -584,6 +586,11 @@ type hookStdinPayload struct {
 // logged to ~/.paircli/hook-errors.log so a broken hook can never break the
 // calling agent.
 func RunHookEvent(event string, stdin io.Reader) error {
+	if event == "SessionStart" {
+		// Installer-path machines only (init.json); a no-op otherwise.
+		maintain.MaybeStart()
+	}
+
 	var payload hookStdinPayload
 	if err := json.NewDecoder(stdin).Decode(&payload); err != nil {
 		logHookError(fmt.Errorf("codex: decode hook stdin for %s: %w", event, err))

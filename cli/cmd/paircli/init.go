@@ -134,7 +134,7 @@ func initRun(args []string, w io.Writer) error {
 	}
 
 	if a.NoLogin {
-		fmt.Fprintf(w, "Pair: set up without logging in. Run %s login to log in.\n", installedBinaryHint())
+		fmt.Fprintf(w, "Pair: set up without logging in. The Pair login opens at your next agent session, or run %s login.\n", installedBinaryHint())
 	}
 	switch initGhState() {
 	case "missing":
@@ -180,6 +180,7 @@ func printInitSummary(w io.Writer, harness string) {
   - %s
   - after you log in, PR evidence (including redacted agent transcripts) is uploaded to pair.sh
     when you create or push a PR
+  - automatic updates, and hooks for agents you install later
 Uninstall any time: ~/.paircli/bin/paircli uninstall
 `, hooks)
 }

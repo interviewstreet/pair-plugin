@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/interviewstreet/pair-plugin/cli/internal/hooklog"
+	"github.com/interviewstreet/pair-plugin/cli/internal/maintain"
 	"github.com/interviewstreet/pair-plugin/cli/internal/model"
 	"github.com/interviewstreet/pair-plugin/cli/internal/prtrigger"
 )
@@ -1000,5 +1001,58 @@ func TestRunHookEvent_PostToolUse_StartFailureIsLoggedNotPrinted(t *testing.T) {
 	logData, err := os.ReadFile(filepath.Join(home, ".paircli", "hook-errors.log"))
 	if err != nil || !strings.Contains(string(logData), "fork failed") {
 		t.Errorf("hook-errors.log = %q, %v, want the start failure", logData, err)
+	}
+}
+
+// spawnRecorder replaces maintain.Spawn and counts its calls.
+func spawnRecorder(t *testing.T) *int {
+	t.Helper()
+	n := 0
+	orig := maintain.Spawn
+	t.Cleanup(func() { maintain.Spawn = orig })
+	maintain.Spawn = func() error { n++; return nil }
+	return &n
+}
+
+// SessionStart starts maintain only on an enrolled machine, at most once a day.
+func TestRunHookEvent_SessionStartStartsMaintainOnlyWhenDue(t *testing.T) {
+	setupHookEnv(t)
+	spawned := spawnRecorder(t)
+	start := func() {
+		if err := RunHookEvent("SessionStart", strings.NewReader(`{"session_id":"s1","cwd":"/tmp"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start()
+	if *spawned != 0 {
+		t.Fatal("maintain started without init.json")
+	}
+	if err := os.MkdirAll(filepath.Dir(maintain.InitPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(maintain.InitPath(), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := maintain.WriteStamp(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	start()
+	if *spawned != 0 {
+		t.Fatal("maintain started with a fresh stamp")
+	}
+	if err := maintain.WriteStamp(time.Now().Add(-25 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	start()
+	if *spawned == 0 {
+		t.Fatal("maintain not started with a stale stamp")
+	}
+	before := *spawned
+	if err := RunHookEvent("Stop", strings.NewReader(`{"session_id":"s1","cwd":"/tmp"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if *spawned != before {
+		t.Error("an event other than SessionStart started maintain")
 	}
 }

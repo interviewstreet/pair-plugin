@@ -283,8 +283,9 @@ claude plugin marketplace update pair && claude plugin update pair@pair   # Clau
 codex plugin marketplace upgrade                                          # Codex
 ```
 
-The CLI also checks for a newer `paircli` each time setup runs. If you installed with the one command, run it
-again to update.
+The CLI also checks for a newer `paircli` each time setup runs. If you installed with the one command, the
+CLI updates itself: at most once a day, a session start runs `paircli maintain` in the background, which
+updates the CLI, adds hooks for agents you installed since, and repairs removed ones.
 
 ## Uninstall
 

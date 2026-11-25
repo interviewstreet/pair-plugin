@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/interviewstreet/pair-plugin/cli/internal/codex"
+	"github.com/interviewstreet/pair-plugin/cli/internal/maintain"
 	"github.com/interviewstreet/pair-plugin/cli/internal/state"
 )
 
@@ -29,7 +29,7 @@ type initRecord struct {
 	UpdatedAt  time.Time         `json:"updated_at"`
 }
 
-func initRecordPath() string { return filepath.Join(state.Dir(), "init.json") }
+func initRecordPath() string { return maintain.InitPath() }
 
 // readInitRecord loads init.json. A missing file is os.ErrNotExist.
 func readInitRecord() (initRecord, error) {

@@ -44,6 +44,8 @@ func main() {
 		err = runUpdate(os.Args[2:])
 	case "uninstall":
 		err = runUninstall(os.Args[2:])
+	case "maintain":
+		err = runMaintain(os.Args[2:])
 	case "version":
 		fmt.Printf("paircli %s\n", version)
 		return
@@ -83,6 +85,8 @@ Usage:
                                             detected on this machine (claude-code | codex | pi)
   paircli hook uninstall [harness]          remove hooks; with no harness, all installed ones
   paircli hook <harness> <event>            internal: invoked BY the installed hook
+  paircli maintain                          internal: daily update and repair, started by the
+                                            SessionStart hook on machines set up with init
   paircli login [flags]                     log in to the pair backend with a device code
   paircli logout [flags]                    remove the stored credential
   paircli doctor                            report capture state per harness, gh, config and llm

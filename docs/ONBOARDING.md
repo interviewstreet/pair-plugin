@@ -122,6 +122,12 @@ and runs `paircli init --install-self <dir>`. init:
 init never re-approves a Codex hook you revoked or disabled in `/hooks`, except when you run
 `~/.paircli/bin/paircli init` yourself. Run it again at any time; it only fixes what is missing.
 
+On a machine init set up, Pair's own SessionStart hook (Claude Code or Codex) starts
+`paircli maintain` in the background at most once every 24 hours (`~/.paircli/state/maintain.json`). It
+updates the CLI, installs hooks for agents added since, repairs removed or stale entries, approves Pair's
+new or changed Codex entries (never one you revoked), and opens the login if there is no credential. It logs
+to `~/.paircli/logs/maintain-*.log`. Machines that only have the plugin never run it.
+
 ## Status and logs
 
 - `paircli status` (or `--json`) shows the version, server, login, installed
