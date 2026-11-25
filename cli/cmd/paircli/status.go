@@ -77,6 +77,24 @@ type setupSummary struct {
 	Error     *string    `json:"error"`
 	Log       string     `json:"log,omitempty"`
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+	// Notes are things the user should do that did not fail setup, such as
+	// updating an old Pair plugin.
+	Notes []string `json:"notes,omitempty"`
+}
+
+// setupNotes picks the step outcomes of the last setup run that ask the user
+// to do something without having failed setup.
+func setupNotes(steps map[string]string) []string {
+	var notes []string
+	if p := steps["plugin"]; p != "" {
+		notes = append(notes, p)
+	}
+	for _, name := range harnessOrder {
+		if outcome := steps["hooks:"+name]; strings.HasPrefix(outcome, "failed") {
+			notes = append(notes, name+" hooks "+outcome)
+		}
+	}
+	return notes
 }
 
 var prRefRe = regexp.MustCompile(`^https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)/?$`)
@@ -290,7 +308,7 @@ func currentSetup() setupSummary {
 			s.State, s.Error = setupFailed, &msg
 		}
 	}
-	summary := setupSummary{State: s.State, Error: s.Error, Log: s.Log}
+	summary := setupSummary{State: s.State, Error: s.Error, Log: s.Log, Notes: setupNotes(s.Steps)}
 	if !s.UpdatedAt.IsZero() {
 		summary.UpdatedAt = &s.UpdatedAt
 	}
@@ -327,6 +345,9 @@ func printStatus(w io.Writer, r statusReport) error {
 		fmt.Fprintf(&b, "\n        log: %s", r.Setup.Log)
 	}
 	b.WriteString("\n")
+	for _, note := range r.Setup.Notes {
+		fmt.Fprintf(&b, "note:   %s\n", note)
+	}
 
 	if len(r.Publications) == 0 {
 		b.WriteString("publications: none\n")

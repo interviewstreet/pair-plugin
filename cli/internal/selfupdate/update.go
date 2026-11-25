@@ -362,6 +362,15 @@ func comparePrerelease(candidate, current string) int {
 	return 0
 }
 
+// VersionAtLeast reports whether actual is required or newer. An unparsable
+// version is never at least anything.
+func VersionAtLeast(actual, required string) bool {
+	if _, _, ok := parseVersion(actual); !ok {
+		return false
+	}
+	return versionAtLeast(actual, required)
+}
+
 func versionAtLeast(actual, required string) bool {
 	return actual == required || isNewer(actual, required)
 }

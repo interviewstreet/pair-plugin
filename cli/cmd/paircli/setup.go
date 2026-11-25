@@ -59,16 +59,28 @@ func writeSetupStatus(s setupStatus) error {
 var (
 	setupSelfUpdate    = selfUpdateQuietly
 	setupInstallHooks  = installHooksFor
+	setupInstallEach   = installEachHarness
 	setupEnsureLogin   = ensureLogin
 	setupNotifications = notify.Prepare
 )
 
-// setupArgs is a parsed `paircli setup` invocation.
+// minPluginVersion is the oldest Pair plugin this CLI recommends. An older
+// plugin still gets every setup step (the bootstrap contract is stable); setup
+// only records a note that status and doctor show.
+var minPluginVersion = "0.4.0"
+
+// setupArgs is a parsed `paircli setup` invocation, plus the options only
+// init and maintain set.
 type setupArgs struct {
 	Harness       string
 	PluginVersion string
 	NoLogin       bool
 	JSON          bool
+
+	// PerAgent records each detected agent's hook outcome as its own step
+	// ("hooks:<harness>") and fails the hooks step only when every detected
+	// agent failed. `setup` keeps the all-or-nothing hooks step.
+	PerAgent bool
 }
 
 func parseSetupArgs(args []string) (setupArgs, error) {
@@ -115,7 +127,12 @@ func setupRun(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	defer lock.Release()
+	return runSetupSteps(a, stdout, stderr)
+}
 
+// runSetupSteps runs setup's steps and records them in setup.json. The caller
+// holds the setup lock: setup takes it with TryLock, init waits for it.
+func runSetupSteps(a setupArgs, stdout, stderr io.Writer) error {
 	logPath, logFile := openSetupLog()
 	if logFile != nil {
 		defer logFile.Close()
@@ -143,8 +160,15 @@ func setupRun(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 
+	if note := pluginNote(a.PluginVersion); note != "" {
+		status.Steps["plugin"] = note
+	}
 	step("update", func() (string, error) { return setupSelfUpdate(context.Background(), a.PluginVersion) }, true)
-	step("hooks", func() (string, error) { return setupInstallHooks(stderr, a.Harness) }, false)
+	if a.PerAgent && a.Harness == "" {
+		step("hooks", func() (string, error) { return installHooksPerAgent(stderr, status.Steps) }, false)
+	} else {
+		step("hooks", func() (string, error) { return setupInstallHooks(stderr, a.Harness) }, false)
+	}
 	step("notifications", setupNotifications, true)
 	if a.NoLogin {
 		status.Steps["login"] = "skipped: --no-login"
@@ -174,6 +198,43 @@ func setupRun(args []string, stdout, stderr io.Writer) error {
 		return errors.New("setup failed")
 	}
 	return nil
+}
+
+// pluginNote is the "plugin" step: a note when the plugin that started setup
+// is older than this CLI recommends, "" otherwise. It never fails setup.
+func pluginNote(pluginVersion string) string {
+	if pluginVersion == "" || selfupdate.VersionAtLeast(pluginVersion, minPluginVersion) {
+		return ""
+	}
+	return fmt.Sprintf("update the Pair plugin (have %s, recommended >= %s)", pluginVersion, minPluginVersion)
+}
+
+// installHooksPerAgent installs every detected agent's hooks, recording each
+// one as a "hooks:<harness>" step. One agent failing does not fail the step
+// while another succeeded: maintain retries the failed one later.
+func installHooksPerAgent(w io.Writer, steps map[string]string) (string, error) {
+	var installed, failed []string
+	for _, r := range setupInstallEach(w) {
+		switch {
+		case !r.Detected:
+			continue
+		case r.Err != nil:
+			steps["hooks:"+r.Name] = "failed: " + r.Err.Error()
+			failed = append(failed, r.Name)
+		default:
+			steps["hooks:"+r.Name] = "installed"
+			installed = append(installed, r.Name)
+		}
+	}
+	switch {
+	case len(installed) == 0 && len(failed) == 0:
+		return "", errNoHarnesses
+	case len(installed) == 0:
+		return "", fmt.Errorf("hook install failed for %s", strings.Join(failed, ", "))
+	case len(failed) > 0:
+		return fmt.Sprintf("installed for %s; failed for %s", strings.Join(installed, ", "), strings.Join(failed, ", ")), nil
+	}
+	return "installed for " + strings.Join(installed, ", "), nil
 }
 
 // readSetupRunning is the status reported to a run that lost the lock race.

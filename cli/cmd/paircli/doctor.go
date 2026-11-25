@@ -73,6 +73,9 @@ func doctorReport(w io.Writer, now time.Time) error {
 	fmt.Fprintf(w, "%-8s %s\n", "scan", doctorScanDir(cwd))
 	fmt.Fprintf(w, "%-8s %s\n", "llm", doctorLLM(cfg))
 	fmt.Fprintf(w, "%-8s %s\n", "pair", doctorPair())
+	for _, note := range currentSetup().Notes {
+		fmt.Fprintf(w, "%-8s %s\n", "note", note)
+	}
 	return nil
 }
 

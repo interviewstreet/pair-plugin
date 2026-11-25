@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/interviewstreet/pair-plugin/cli/internal/deviceauth"
 	"github.com/interviewstreet/pair-plugin/cli/internal/state"
@@ -276,5 +277,120 @@ func TestSetup_RunningIsWrittenBeforeTheSteps(t *testing.T) {
 	}
 	if during != setupRunning {
 		t.Errorf("state during the run = %q, want running", during)
+	}
+}
+
+// An older plugin still gets every step; setup only records a note, which
+// status and doctor show.
+func TestSetup_OldPluginRunsEveryStepAndRecordsANote(t *testing.T) {
+	calls := setupEnv(t)
+	orig := minPluginVersion
+	t.Cleanup(func() { minPluginVersion = orig })
+	minPluginVersion = "0.9.0"
+
+	if _, _, err := runSetupArgs(t, "--harness", "codex", "--plugin-version", "0.4.1"); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if got := strings.Join(*calls, ","); got != "update:0.4.1,hooks:codex,login:https://pair.example" {
+		t.Errorf("calls = %s, want every step", got)
+	}
+	want := "update the Pair plugin (have 0.4.1, recommended >= 0.9.0)"
+	if got := readSetupStatus(); got.State != setupIdle || got.Steps["plugin"] != want {
+		t.Errorf("setup.json = %+v, want idle with plugin %q", got, want)
+	}
+	var out bytes.Buffer
+	if err := statusRun(nil, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), want) {
+		t.Errorf("status = %q, want the plugin note", out.String())
+	}
+}
+
+// fakeInstallEach replaces the per-agent hook install with fixed outcomes.
+func fakeInstallEach(t *testing.T, results ...harnessResult) {
+	t.Helper()
+	orig := setupInstallEach
+	t.Cleanup(func() { setupInstallEach = orig })
+	setupInstallEach = func(io.Writer) []harnessResult { return results }
+}
+
+func TestSetupSteps_PerAgentToleratesOneFailedAgent(t *testing.T) {
+	setupEnv(t)
+	fakeInstallEach(t,
+		harnessResult{Name: "claude-code", Detected: true},
+		harnessResult{Name: "codex", Detected: true, Err: errors.New("hooks.json is not valid JSON")},
+		harnessResult{Name: "pi"},
+	)
+	var out, errOut bytes.Buffer
+	if err := runSetupSteps(setupArgs{PerAgent: true}, &out, &errOut); err != nil {
+		t.Fatalf("one failed agent failed setup: %v", err)
+	}
+	got := readSetupStatus()
+	if got.State != setupIdle || got.Steps["hooks:claude-code"] != "installed" ||
+		!strings.Contains(got.Steps["hooks:codex"], "not valid JSON") || got.Steps["hooks:pi"] != "" {
+		t.Errorf("setup.json = %+v", got)
+	}
+	stubDoctor(t, nil, errors.New("not found"))
+	var doctor bytes.Buffer
+	if err := doctorReport(&doctor, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(doctor.String(), "codex hooks failed") {
+		t.Errorf("doctor does not show the failed agent:\n%s", doctor.String())
+	}
+}
+
+func TestSetupSteps_PerAgentFailsWhenEveryAgentFails(t *testing.T) {
+	setupEnv(t)
+	fakeInstallEach(t, harnessResult{Name: "codex", Detected: true, Err: errors.New("read-only file system")})
+	var out, errOut bytes.Buffer
+	if err := runSetupSteps(setupArgs{PerAgent: true}, &out, &errOut); err == nil {
+		t.Fatal("setup succeeded with every agent failing")
+	}
+	if got := readSetupStatus(); got.State != setupFailed || !strings.Contains(*got.Error, "codex") {
+		t.Errorf("setup.json = %+v", got)
+	}
+}
+
+func TestSetupSteps_PerAgentFailsWithNoAgent(t *testing.T) {
+	setupEnv(t)
+	fakeInstallEach(t, harnessResult{Name: "claude-code"}, harnessResult{Name: "codex"})
+	var out, errOut bytes.Buffer
+	if err := runSetupSteps(setupArgs{PerAgent: true}, &out, &errOut); err == nil {
+		t.Fatal("setup succeeded with no agent detected")
+	}
+}
+
+// The plugin's bootstrap.py drives every CLI version this way. A change that
+// breaks this test breaks every released plugin (0.4.0 and later).
+func TestBootstrapContract_SetupAndStatusJSON(t *testing.T) {
+	setupEnv(t)
+	if _, _, err := runSetupArgs(t, "--harness", "claude-code", "--plugin-version", "0.4.0"); err != nil {
+		t.Fatalf("setup --harness claude-code --plugin-version 0.4.0: %v", err)
+	}
+	var out bytes.Buffer
+	if err := statusRun([]string{"--json"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	// The fields plugins/pair/hooks/bootstrap.py status_line() reads.
+	var status struct {
+		LoggedIn   *bool            `json:"logged_in"`
+		Hooks      map[string]*bool `json:"hooks"`
+		CLIVersion *string          `json:"cli_version"`
+		Setup      *struct {
+			Log *string `json:"log"`
+		} `json:"setup"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		t.Fatalf("status --json: %v\n%s", err, out.String())
+	}
+	if got := readSetupStatus().Steps["plugin"]; got != "" {
+		t.Errorf("plugin 0.4.0 got a note: %q", got)
+	}
+	if status.LoggedIn == nil || status.CLIVersion == nil || *status.CLIVersion == "" ||
+		status.Hooks["claude-code"] == nil || status.Hooks["codex"] == nil ||
+		status.Setup == nil || status.Setup.Log == nil || *status.Setup.Log == "" {
+		t.Errorf("status --json is missing a field bootstrap.py reads:\n%s", out.String())
 	}
 }
