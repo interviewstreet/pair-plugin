@@ -7,11 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/interviewstreet/pair-plugin/cli/internal/codex"
 )
+
+// uninstallOwnedTrustKeys picks the recorded keys still approved at Pair's
+// hash; a test seam.
+var uninstallOwnedTrustKeys = codex.OwnedTrustKeys
 
 // uninstallRevokeTrust removes Codex hook-trust entries; a test seam.
 var uninstallRevokeTrust = func(codexPath string, keys []string) error {
@@ -36,11 +39,13 @@ func uninstallRun(args []string, w io.Writer) error {
 	case err != nil:
 		fmt.Fprintf(w, "paircli: could not read %s (%v), so any hook approvals Pair added are left in Codex's config.toml; they match no hook and do nothing\n", initRecordPath(), err)
 	case len(rec.Trust) > 0:
-		keys := make([]string, 0, len(rec.Trust))
-		for k := range rec.Trust {
-			keys = append(keys, k)
+		// Only approvals that are still Pair's: a recorded key is a position
+		// in hooks.json and may now hold another tool's hook and approval.
+		keys := uninstallOwnedTrustKeys(rec.Trust)
+		if len(keys) == 0 {
+			fmt.Fprintln(w, "paircli: no hook approvals of Pair's left in Codex")
+			break
 		}
-		sort.Strings(keys)
 		err := errors.New("codex binary not found")
 		if bin := codex.FindCodex(rec.CodexPath); bin != "" {
 			err = uninstallRevokeTrust(bin, keys)
@@ -52,14 +57,19 @@ func uninstallRun(args []string, w io.Writer) error {
 		}
 	}
 
-	if err := uninstallAllHarnesses(w); err != nil {
-		failed = append(failed, err.Error())
+	hooksErr := uninstallAllHarnesses(w)
+	if hooksErr != nil {
+		failed = append(failed, hooksErr.Error())
 	}
 	if err := logoutRun(nil, w, w); err != nil {
 		failed = append(failed, "logout: "+err.Error())
 	}
 	home, err := os.UserHomeDir()
-	if err != nil {
+	if hooksErr != nil {
+		// The hooks left behind run ~/.paircli/bin/paircli; removing it would
+		// leave them failing at every agent event.
+		fmt.Fprintln(w, "paircli: kept ~/.paircli, since some hooks are still installed and run its binary; fix the error above and run uninstall again")
+	} else if err != nil {
 		failed = append(failed, "remove ~/.paircli: "+err.Error())
 	} else if err := os.RemoveAll(filepath.Join(home, ".paircli")); err != nil {
 		failed = append(failed, "remove ~/.paircli: "+err.Error())

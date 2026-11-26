@@ -173,21 +173,50 @@ func UninstallHooks() error {
 	if hooksRaw == nil {
 		return nil
 	}
-	for _, spec := range hookEvents {
-		existing, ok := hooksRaw[spec.Event]
-		if !ok {
+	// Every event, not only today's hookEvents: an older Pair may have
+	// installed one this version no longer uses.
+	changed := false
+	for event, existing := range hooksRaw {
+		if !eventHasHookCommand(existing, hookMarker) {
 			continue
 		}
-		remaining := removeOurHooks(existing)
-		if len(remaining) == 0 {
-			delete(hooksRaw, spec.Event)
+		changed = true
+		if remaining := removeOurHooks(existing); len(remaining) == 0 {
+			delete(hooksRaw, event)
 		} else {
-			hooksRaw[spec.Event] = remaining
+			hooksRaw[event] = remaining
 		}
+	}
+	if !changed {
+		return nil
 	}
 	settings["hooks"] = hooksRaw
 
 	return writeSettings(path, settings)
+}
+
+// AnyHooksPresent reports whether any of Pair's hooks, for any event, is in
+// the config file: a partial set too, which HooksInstalled does not count.
+func AnyHooksPresent() bool {
+	path, err := SettingsPath()
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return false
+	}
+	hooksRaw, _ := settings["hooks"].(map[string]interface{})
+	for _, existing := range hooksRaw {
+		if eventHasHookCommand(existing, hookMarker) {
+			return true
+		}
+	}
+	return false
 }
 
 // HooksInstalled reports whether every event in hookEvents has a hook whose

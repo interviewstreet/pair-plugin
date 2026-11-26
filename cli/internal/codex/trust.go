@@ -156,6 +156,7 @@ func GrantTrust(ctx context.Context, opts GrantOptions) GrantResult {
 
 	grants := map[string]any{}
 	grantHash := map[string]string{}
+	var onDisk map[string]string // config.toml's trusted hashes, read on demand
 	for _, p := range picked {
 		key, hash, label := p.Key, *p.CurrentHash, p.label
 		memo := res.Record[key]
@@ -165,14 +166,17 @@ func GrantTrust(ctx context.Context, opts GrantOptions) GrantResult {
 			refused++
 		case *p.TrustStatus == "trusted":
 			res.Record[key] = TrustMemo{Hash: hash}
-		case !opts.Explicit && memo.Revoked:
+			clearRevoked(res.Record, key)
+		case !opts.Explicit && (memo.Revoked || revokedElsewhere(res.Record, key)):
 			res.Notes = append(res.Notes, "revoked in /hooks: "+label)
 			refused++
-		case !opts.Explicit && memo.Hash != "" && memo.Hash == hash:
-			// Trusted before at this very hash, untrusted now: the user revoked
-			// it. A Codex that rewrote config.toml from a stale copy looks the
-			// same; that too is left alone, and status names the one command
-			// (`paircli init`) that grants it again.
+		case !opts.Explicit && !stillApproved(res.Record, key, hash, *p.TrustStatus, &onDisk):
+			// Pair trusted this event before and Codex no longer holds that
+			// approval: the user revoked it in /hooks, maybe before Pair
+			// rewrote or moved its entry. A Codex that rewrote config.toml
+			// from a stale copy looks the same; that too is left alone, and
+			// status names the one command (`paircli init`) that grants it
+			// again.
 			res.Record[key] = TrustMemo{Hash: hash, Revoked: true}
 			res.Notes = append(res.Notes, "revoked in /hooks: "+label)
 			refused++
@@ -207,6 +211,7 @@ func GrantTrust(ctx context.Context, opts GrantOptions) GrantResult {
 				bad = append(bad, keyLabel(key)+" changed")
 			default:
 				res.Record[key] = TrustMemo{Hash: hash}
+				clearRevoked(res.Record, key)
 				res.Granted++
 			}
 		}
@@ -224,6 +229,89 @@ func GrantTrust(ctx context.Context, opts GrantOptions) GrantResult {
 		res.Outcome = "not trusted"
 	}
 	return res
+}
+
+// stillApproved reports whether Pair may grant key (not trusted now) without
+// the user asking: either Pair never trusted this event before, or the
+// approval Pair recorded is still in Codex and only Pair's entry changed.
+//
+//   - key itself was trusted before: Codex must report it "modified" (its
+//     trusted_hash is still there, for an older entry). "untrusted" means
+//     the approval is gone: revoked.
+//   - key is new but Pair trusted the same event under another key (its
+//     entry moved): config.toml must still hold that key's trusted_hash.
+func stillApproved(rec TrustRecord, key, hash, status string, onDisk *map[string]string) bool {
+	if memo, ok := rec[key]; ok && memo.Hash != "" {
+		return status == "modified" && memo.Hash != hash
+	}
+	prior := sameEventKeys(rec, key)
+	if len(prior) == 0 {
+		return true // first grant for this event
+	}
+	if *onDisk == nil {
+		*onDisk = parseTrustedHashes(configTomlPath())
+	}
+	for _, k := range prior {
+		if h := rec[k].Hash; h != "" && (*onDisk)[k] == h {
+			return true
+		}
+	}
+	return false
+}
+
+// sameEventKeys lists the other recorded keys for key's event in the same
+// hooks.json: where Pair's entry for that event used to be.
+func sameEventKeys(rec TrustRecord, key string) []string {
+	path, label, _, _, ok := parseTrustKey(key)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for k := range rec {
+		if p, l, _, _, ok := parseTrustKey(k); ok && k != key && p == path && l == label {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// revokedElsewhere reports whether the user revoked key's event under
+// another key: a revocation follows Pair's entry when it moves.
+func revokedElsewhere(rec TrustRecord, key string) bool {
+	for _, k := range sameEventKeys(rec, key) {
+		if rec[k].Revoked {
+			return true
+		}
+	}
+	return false
+}
+
+// clearRevoked forgets revocations of key's event under other keys, once the
+// event is trusted again (the user re-trusted it, or ran `paircli init`).
+func clearRevoked(rec TrustRecord, key string) {
+	for _, k := range sameEventKeys(rec, key) {
+		if m := rec[k]; m.Revoked {
+			m.Revoked = false
+			rec[k] = m
+		}
+	}
+}
+
+// OwnedTrustKeys returns the recorded keys whose approval in Codex's
+// config.toml is still the one Pair recorded (same trusted_hash). Hook-trust
+// keys are positions in hooks.json, so a recorded key can by now hold
+// another tool's hook and its approval; uninstall removes only these.
+func OwnedTrustKeys(rec TrustRecord) []string {
+	onDisk := parseTrustedHashes(configTomlPath())
+	var out []string
+	for k, m := range rec {
+		if m.Hash != "" && onDisk[k] == m.Hash {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // RevokeTrust deletes hooks.state entries for keys through Codex's
