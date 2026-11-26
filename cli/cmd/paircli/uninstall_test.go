@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -40,6 +41,8 @@ func installedMachine(t *testing.T) (home string, revoked *[][]string) {
 	if err := writeInitRecord(initRecord{CodexPath: codexBin, Trust: codex.TrustRecord{"k:stop:0:0": {Hash: "h1"}, "k:session_start:0:0": {Hash: "h2"}}}); err != nil {
 		t.Fatal(err)
 	}
+	// Codex still holds both approvals at the hashes Pair recorded.
+	writeCodexConfig(t, home, map[string]string{"k:stop:0:0": "h1", "k:session_start:0:0": "h2"})
 	revoked = &[][]string{}
 	orig := uninstallRevokeTrust
 	t.Cleanup(func() { uninstallRevokeTrust = orig })
@@ -119,5 +122,95 @@ func TestUninstall_PluginOnlyMachine(t *testing.T) {
 	}
 	if len(*revoked) != 0 || claudecode.HooksInstalled() {
 		t.Errorf("revoked = %v, hooks installed = %v", *revoked, claudecode.HooksInstalled())
+	}
+}
+
+// writeCodexConfig writes config.toml with one hooks.state section per key.
+func writeCodexConfig(t *testing.T, home string, trusted map[string]string) {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("model = \"x\"\n")
+	for k, h := range trusted {
+		b.WriteString("\n[hooks.state.\"" + k + "\"]\ntrusted_hash = \"" + h + "\"\n")
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A recorded key is a position in hooks.json: once another tool's hook sits
+// there (its own approval, another hash), uninstall must leave it alone.
+func TestUninstall_LeavesAnotherToolsApprovalAtARecordedKey(t *testing.T) {
+	home, revoked := installedMachine(t)
+	writeCodexConfig(t, home, map[string]string{"k:stop:0:0": "other-tool-hash", "k:session_start:0:0": "h2"})
+	var out bytes.Buffer
+	if err := uninstallRun(nil, &out); err != nil {
+		t.Fatalf("uninstall: %v\n%s", err, out.String())
+	}
+	if len(*revoked) != 1 || strings.Join((*revoked)[0], ",") != "k:session_start:0:0" {
+		t.Errorf("revoked = %v, want only Pair's own session_start approval", *revoked)
+	}
+}
+
+// A partial install (an event removed by hand, or an older Pair's set) still
+// has Pair hooks; uninstall removes them before deleting the binary they run.
+func TestUninstall_RemovesAPartialHookSet(t *testing.T) {
+	home, _ := installedMachine(t)
+	path, _ := claudecode.SettingsPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatal(err)
+	}
+	delete(settings["hooks"].(map[string]any), "Stop")
+	data, _ = json.Marshal(settings)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if claudecode.HooksInstalled() || !claudecode.AnyHooksPresent() {
+		t.Fatal("fixture: want a partial Claude Code install")
+	}
+	var out bytes.Buffer
+	if err := uninstallRun(nil, &out); err != nil {
+		t.Fatalf("uninstall: %v\n%s", err, out.String())
+	}
+	if claudecode.AnyHooksPresent() {
+		t.Errorf("Pair hooks left in settings.json:\n%s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".paircli")); !os.IsNotExist(err) {
+		t.Errorf("~/.paircli still exists: %v", err)
+	}
+}
+
+// When a harness's hooks cannot be removed, the binary they run stays.
+func TestUninstall_KeepsTheBinaryWhenHooksRemain(t *testing.T) {
+	home, _ := installedMachine(t)
+	path, _ := claudecode.SettingsPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unparsable settings.json: UninstallHooks refuses to touch it.
+	if err := os.WriteFile(path, append(data, []byte("\n{")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := harnessTable["claude-code"]
+	t.Cleanup(func() { harnessTable["claude-code"] = orig })
+	h := orig
+	h.Present = func() bool { return true }
+	harnessTable["claude-code"] = h
+
+	var out bytes.Buffer
+	if err := uninstallRun(nil, &out); err == nil {
+		t.Fatalf("uninstall succeeded with hooks left:\n%s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".paircli")); err != nil {
+		t.Errorf("~/.paircli removed while hooks still run its binary: %v", err)
+	}
+	if !strings.Contains(out.String(), "kept ~/.paircli") {
+		t.Errorf("output = %s", out.String())
 	}
 }

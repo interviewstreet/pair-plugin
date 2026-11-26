@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -201,21 +202,50 @@ func UninstallHooks() error {
 	if hooksRaw == nil {
 		return nil
 	}
-	for _, spec := range hookEvents {
-		existing, ok := hooksRaw[spec.Event]
-		if !ok {
+	// Every event, not only today's hookEvents: an older Pair may have
+	// installed one this version no longer uses.
+	changed := false
+	for event, existing := range hooksRaw {
+		if !eventHasHookCommand(existing, hookMarker) {
 			continue
 		}
-		remaining := removeOurHooks(existing)
-		if len(remaining) == 0 {
-			delete(hooksRaw, spec.Event)
+		changed = true
+		if remaining := removeOurHooks(existing); len(remaining) == 0 {
+			delete(hooksRaw, event)
 		} else {
-			hooksRaw[spec.Event] = remaining
+			hooksRaw[event] = remaining
 		}
+	}
+	if !changed {
+		return nil
 	}
 	settings["hooks"] = hooksRaw
 
 	return writeHooksFile(path, settings)
+}
+
+// AnyHooksPresent reports whether any of Pair's hooks, for any event, is in
+// the config file: a partial set too, which HooksInstalled does not count.
+func AnyHooksPresent() bool {
+	path := HooksPath()
+	if path == "" {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return false
+	}
+	hooksRaw, _ := settings["hooks"].(map[string]interface{})
+	for _, existing := range hooksRaw {
+		if eventHasHookCommand(existing, hookMarker) {
+			return true
+		}
+	}
+	return false
 }
 
 // HooksInstalled reports whether every event in hookEvents has a hook whose
@@ -317,6 +347,16 @@ var trustedHashLineRe = regexp.MustCompile(`^trusted_hash\s*=`)
 // missing or unparsable file (returns an empty set).
 func parseTrustedKeys(path string) map[string]bool {
 	trusted := map[string]bool{}
+	for k := range parseTrustedHashes(path) {
+		trusted[k] = true
+	}
+	return trusted
+}
+
+// parseTrustedHashes is parseTrustedKeys with each key's trusted_hash value
+// ("" when it is not a plain string).
+func parseTrustedHashes(path string) map[string]string {
+	trusted := map[string]string{}
 	if path == "" {
 		return trusted
 	}
@@ -343,7 +383,18 @@ func parseTrustedKeys(path string) map[string]bool {
 			continue
 		}
 		if inHooksState && trustedHashLineRe.MatchString(line) {
-			trusted[current] = true
+			value := strings.TrimSpace(line[strings.Index(line, "=")+1:])
+			if i := strings.Index(value, " #"); i >= 0 {
+				value = strings.TrimSpace(value[:i])
+			}
+			if v, err := strconv.Unquote(value); err == nil {
+				value = v
+			} else if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+				value = value[1 : len(value)-1]
+			} else {
+				value = ""
+			}
+			trusted[current] = value
 		}
 	}
 	return trusted

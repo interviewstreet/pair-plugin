@@ -17,9 +17,12 @@ import (
 // to. Every harness package (claudecode, codex, pi) implements this same
 // shape so the CLI never needs to change when a new harness's hooks land.
 type harnessHooks struct {
-	Install        func() error
-	Uninstall      func() error
-	Installed      func() bool
+	Install   func() error
+	Uninstall func() error
+	Installed func() bool
+	// Present reports whether any of Pair's hooks is in the harness config,
+	// even an incomplete set; uninstall removes them whenever it is true.
+	Present        func() bool
 	Run            func(event string, stdin io.Reader) error
 	InstallMessage func() string // optional: extra line printed after install
 	// Detect reports whether this harness looks present on this machine: the
@@ -35,6 +38,7 @@ var harnessTable = map[string]harnessHooks{
 		Install:   claudecode.InstallHooks,
 		Uninstall: claudecode.UninstallHooks,
 		Installed: claudecode.HooksInstalled,
+		Present:   claudecode.AnyHooksPresent,
 		Run:       claudecode.RunHookEvent,
 		Detect:    func() bool { return dirOfSettings(claudecode.SettingsPath) },
 	},
@@ -42,6 +46,7 @@ var harnessTable = map[string]harnessHooks{
 		Install:        codex.InstallHooks,
 		Uninstall:      codex.UninstallHooks,
 		Installed:      codex.HooksInstalled,
+		Present:        codex.AnyHooksPresent,
 		Run:            codex.RunHookEvent,
 		InstallMessage: codex.InstallMessage,
 		Detect:         func() bool { return dirOf(codex.HooksPath()) },
@@ -50,6 +55,7 @@ var harnessTable = map[string]harnessHooks{
 		Install:        pi.InstallHooks,
 		Uninstall:      pi.UninstallHooks,
 		Installed:      pi.HooksInstalled,
+		Present:        pi.HooksInstalled,
 		Run:            pi.RunHookEvent,
 		InstallMessage: pi.InstallMessage,
 		Detect:         func() bool { return dirExists(pi.DefaultDir()) },
@@ -195,7 +201,11 @@ func uninstallAllHarnesses(w io.Writer) error {
 		failed  []string
 	)
 	for _, name := range harnessOrder {
-		if !harnessTable[name].Installed() {
+		// Uninstall every harness, not only fully installed ones: a partial
+		// install (an event removed by hand, an older Pair's event set) still
+		// leaves Pair hooks that would run a deleted binary. Each Uninstall is
+		// a no-op when nothing of Pair's is there.
+		if !harnessTable[name].Present() {
 			fmt.Fprintf(w, "paircli: skipped %s (not installed)\n", name)
 			continue
 		}

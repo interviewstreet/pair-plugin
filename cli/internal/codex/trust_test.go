@@ -296,6 +296,108 @@ func TestGrantTrust_ChangedPairEntryIsGrantedAgain(t *testing.T) {
 	}
 }
 
+// The user revokes Stop, then Pair rewrites its entry (a moved binary)
+// before any maintain run sees the revocation: Codex reports the new hash
+// "untrusted" (no approval at all), not "modified". Maintain must not grant.
+func TestGrantTrust_RevokedThenChangedIsNotGrantedAgain(t *testing.T) {
+	f := newTrustFixture(t)
+	first := f.grant(false, nil)
+	f.edit("stop", func(h map[string]any) { h["currentHash"], h["trustStatus"] = "sha256:new", "untrusted" })
+	f.save(fakeState{Hooks: f.load().Hooks})
+
+	r := f.grant(false, first.Record)
+	if r.Trusted || !hasResultNote(r, "revoked in /hooks: stop") || len(f.grantedKeys()) != 0 {
+		t.Fatalf("result = %+v, grants = %v, want stop refused as revoked", r, f.grantedKeys())
+	}
+	if explicit := f.grant(true, r.Record); !explicit.Trusted {
+		t.Errorf("explicit init = %+v, want stop granted", explicit)
+	}
+}
+
+// moveStop renumbers Pair's Stop entry (another group now sits before it), as
+// if hooks.json was edited, and returns the old and new keys.
+func (f *trustFixture) moveStop() (oldKey, newKey string) {
+	f.t.Helper()
+	st := f.load()
+	for _, h := range st.Hooks {
+		if h["eventName"] == "stop" {
+			oldKey = h["key"].(string)
+			newKey = fmt.Sprintf("%s:stop:1:0", HooksPath())
+			h["key"], h["trustStatus"] = newKey, "untrusted"
+		}
+	}
+	st.Writes = nil
+	f.save(st)
+	// hooks.json must agree: Pair's Stop entry is now group 1.
+	doc := map[string]any{}
+	data, _ := os.ReadFile(HooksPath())
+	_ = json.Unmarshal(data, &doc)
+	hooks := doc["hooks"].(map[string]any)
+	hooks["Stop"] = append([]any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": "other-tool"}}}}, hooks["Stop"].([]any)...)
+	data, _ = json.Marshal(doc)
+	if err := os.WriteFile(HooksPath(), data, 0o600); err != nil {
+		f.t.Fatal(err)
+	}
+	return oldKey, newKey
+}
+
+func writeConfigToml(t *testing.T, trusted map[string]string) {
+	t.Helper()
+	var b strings.Builder
+	for k, h := range trusted {
+		fmt.Fprintf(&b, "[hooks.state.%q]\ntrusted_hash = %q\n\n", k, h)
+	}
+	if err := os.WriteFile(configTomlPath(), []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A revocation follows Pair's entry to its new key.
+func TestGrantTrust_RevokedThenMovedIsNotGrantedAgain(t *testing.T) {
+	f := newTrustFixture(t)
+	first := f.grant(false, nil)
+	// Revoked: config.toml holds no approval for the old key.
+	writeConfigToml(t, map[string]string{})
+	f.moveStop()
+
+	r := f.grant(false, first.Record)
+	if r.Trusted || !hasResultNote(r, "revoked in /hooks: stop") || len(f.grantedKeys()) != 0 {
+		t.Fatalf("result = %+v, grants = %v, want stop refused as revoked", r, f.grantedKeys())
+	}
+	// And stays refused on the next run.
+	if again := f.grant(false, r.Record); !hasResultNote(again, "revoked in /hooks: stop") || len(f.grantedKeys()) != 0 {
+		t.Errorf("re-run = %+v, want still revoked", again)
+	}
+}
+
+// A move while the old approval is still Pair's is not a revocation.
+func TestGrantTrust_MovedWhileTrustedIsGrantedAgain(t *testing.T) {
+	f := newTrustFixture(t)
+	first := f.grant(false, nil)
+	var oldKey string
+	for k := range first.Record {
+		if keyLabel(k) == "stop" {
+			oldKey = k
+		}
+	}
+	writeConfigToml(t, map[string]string{oldKey: first.Record[oldKey].Hash})
+	_, newKey := f.moveStop()
+
+	r := f.grant(false, first.Record)
+	if !r.Trusted || strings.Join(f.grantedKeys(), ",") != "stop" || r.Record[newKey].Hash == "" {
+		t.Errorf("result = %+v, grants = %v, want stop granted at its new key", r, f.grantedKeys())
+	}
+}
+
+func TestOwnedTrustKeys_OnlyApprovalsStillAtPairsHash(t *testing.T) {
+	codexHomeIn(t, t.TempDir())
+	writeConfigToml(t, map[string]string{"a:stop:0:0": "h1", "a:session_start:0:0": "someone-else"})
+	got := OwnedTrustKeys(TrustRecord{"a:stop:0:0": {Hash: "h1"}, "a:session_start:0:0": {Hash: "h2"}, "a:pre_compact:0:0": {Hash: "h3"}})
+	if strings.Join(got, ",") != "a:stop:0:0" {
+		t.Errorf("owned = %v, want only a:stop:0:0", got)
+	}
+}
+
 func TestGrantTrust_NeverGrantsADisabledHook(t *testing.T) {
 	f := newTrustFixture(t)
 	f.edit("stop", func(h map[string]any) { h["enabled"] = false })
